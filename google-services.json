@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "185692647198",
+    "project_id": "fliponex",
+    "storage_bucket": "fliponex.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:185692647198:android:3f0636ed68e7c6cd4d230f",
+        "android_client_info": {
+          "package_name": "com.nishanth_jada.customerandroidapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB0VHLVJzgceX-L8D4BSaXneUYptXrMAWQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

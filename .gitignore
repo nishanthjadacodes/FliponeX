@@ -9,6 +9,12 @@ dist/
 web-build/
 expo-env.d.ts
 
+# Firebase
+# google-services.json is safe to commit — it contains Firebase project IDs,
+# not secrets. Security is enforced by the SHA-1 fingerprint registered in
+# the Firebase Console, not by keeping this file private. This matches
+# Expo's official recommendation: https://docs.expo.dev/guides/using-firebase/
+
 # Native
 .kotlin/
 *.orig.*

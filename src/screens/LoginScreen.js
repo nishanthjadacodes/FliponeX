@@ -16,7 +16,8 @@ import {
 } from 'react-native';
 
 const Logo = require('../assets/logo.jpeg');
-import { sendOTP, verifyOTP, signup } from '../services/api';
+import auth from '@react-native-firebase/auth';
+import { firebaseLogin } from '../services/api';
 import { storeToken, storeUser, storeMobile } from '../utils/storage';
 import HapticButton from '../components/HapticButton';
 import * as haptics from '../utils/haptics';
@@ -31,6 +32,9 @@ const LoginScreen = ({ navigation }) => {
   const [email, setEmail] = useState('');
   const [mobile, setMobile] = useState('');
   const [otp, setOtp] = useState(['', '', '', '', '', '']);
+  // Firebase confirmation result returned from signInWithPhoneNumber.
+  // Held in a ref so re-renders don't clobber it between send & verify steps.
+  const confirmationRef = useRef(null);
   const [timer, setTimer] = useState(0);
   const [loading, setLoading] = useState(false);
   const otpRefs = useRef([]);
@@ -108,6 +112,14 @@ const LoginScreen = ({ navigation }) => {
     ]).start();
   };
 
+  // Kick off Firebase phone-auth. Firebase handles SMS delivery + reCAPTCHA.
+  // The returned `confirmation` object is held in a ref for the verify step.
+  const requestFirebaseOTP = async () => {
+    const e164 = `+91${mobile}`;
+    const confirmation = await auth().signInWithPhoneNumber(e164);
+    confirmationRef.current = confirmation;
+  };
+
   // ─── Login flow: mobile → OTP → done ───
   const handleLoginSendOTP = async () => {
     if (!/^[6-9]\d{9}$/.test(mobile)) {
@@ -117,24 +129,24 @@ const LoginScreen = ({ navigation }) => {
     }
     setLoading(true);
     try {
-      const response = await sendOTP(mobile);
+      await requestFirebaseOTP();
       await storeMobile(mobile);
       haptics.success();
       setTimer(60);
       animateMode('otp');
       setTimeout(() => otpRefs.current[0]?.focus(), 400);
-      if (response?.devOtp) {
-        Alert.alert('OTP (Dev Mode)', `Your OTP: ${response.devOtp}`);
-      }
     } catch (error) {
       triggerErrorShake();
-      Alert.alert('Error', error.message || 'Failed to send OTP');
+      Alert.alert('Could not send OTP', error?.message || 'Please try again');
     } finally {
       setLoading(false);
     }
   };
 
-  // ─── Signup flow: name + email + mobile → register → OTP → done ───
+  // ─── Signup flow: name + email + mobile → OTP → backend upsert on verify ───
+  // With Firebase there is no separate /signup call; we just capture name/email
+  // locally and pass them to /auth/firebase-login on a successful verify so
+  // the backend can upsert the row with those fields.
   const handleSignup = async () => {
     if (!name.trim() || name.trim().length < 2) {
       triggerErrorShake();
@@ -154,28 +166,15 @@ const LoginScreen = ({ navigation }) => {
 
     setLoading(true);
     try {
-      // 1. Register user (creates account, unverified)
-      try {
-        await signup({ mobile, name: name.trim(), email: email.trim(), role: 'agent' });
-      } catch (e) {
-        // If user already exists, that's OK — proceed to OTP
-        if (!String(e?.message).toLowerCase().includes('exist')) {
-          throw e;
-        }
-      }
-      // 2. Send OTP
-      const response = await sendOTP(mobile);
+      await requestFirebaseOTP();
       await storeMobile(mobile);
       haptics.success();
       setTimer(60);
       animateMode('otp');
       setTimeout(() => otpRefs.current[0]?.focus(), 400);
-      if (response?.devOtp) {
-        Alert.alert('OTP (Dev Mode)', `Your OTP: ${response.devOtp}`);
-      }
     } catch (error) {
       triggerErrorShake();
-      Alert.alert('Signup Failed', error.message || 'Failed to create account');
+      Alert.alert('Signup Failed', error?.message || 'Could not send OTP');
     } finally {
       setLoading(false);
     }
@@ -206,16 +205,41 @@ const LoginScreen = ({ navigation }) => {
       triggerErrorShake();
       return;
     }
+    if (!confirmationRef.current) {
+      Alert.alert('Session expired', 'Please request a new OTP.');
+      setOtp(['', '', '', '', '', '']);
+      animateMode(tab); // back to the tab the user was on
+      return;
+    }
     setLoading(true);
     try {
-      const response = await verifyOTP(mobile, code);
+      // 1. Ask Firebase to verify the SMS code; returns UserCredential on success.
+      const credential = await confirmationRef.current.confirm(code);
+      const idToken = await credential.user.getIdToken();
+
+      // 2. Exchange the Firebase ID token for our backend JWT. The backend
+      //    verifies the token with firebase-admin, upserts the User row, and
+      //    returns { token, user } just like the old verifyOTP did.
+      const response = await firebaseLogin({
+        idToken,
+        name: tab === 'signup' ? name.trim() : undefined,
+        email: tab === 'signup' ? email.trim() : undefined,
+      });
+
       await storeToken(response.token);
       await storeUser(response.user);
+      confirmationRef.current = null;
       haptics.success();
       navigation.replace('HomeTabs');
     } catch (error) {
       triggerErrorShake();
-      Alert.alert('Verification Failed', error.message || 'Invalid OTP');
+      const msg = error?.message || '';
+      // Firebase's 'auth/invalid-verification-code' is the wrong-OTP case.
+      const isWrongCode = /invalid-verification-code|invalid code|wrong/i.test(msg);
+      Alert.alert(
+        'Verification Failed',
+        isWrongCode ? 'That OTP is incorrect. Please try again.' : (msg || 'Verification failed')
+      );
       setOtp(['', '', '', '', '', '']);
       otpRefs.current[0]?.focus();
     } finally {
@@ -228,14 +252,14 @@ const LoginScreen = ({ navigation }) => {
     haptics.tap();
     setLoading(true);
     try {
-      await sendOTP(mobile);
+      await requestFirebaseOTP();
       haptics.success();
       setTimer(60);
       setOtp(['', '', '', '', '', '']);
       Alert.alert('OTP Resent', `A new OTP was sent to +91 ${mobile}`);
     } catch (error) {
       triggerErrorShake();
-      Alert.alert('Error', error.message || 'Failed to resend OTP');
+      Alert.alert('Error', error?.message || 'Failed to resend OTP');
     } finally {
       setLoading(false);
     }

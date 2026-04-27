@@ -43,7 +43,9 @@ export const sendOTP = async (mobile) => {
     await AsyncStorage.removeItem(`otp_${mobile}`);
     return response.data;
   } catch (error) {
-    // Network unreachable — generate a local OTP so the user can still log in offline
+    // Network unreachable — generate a local OTP so the user can still log in offline.
+    // Return under the same `devOtp` field the backend uses in dev mode so the
+    // LoginScreen Alert fires consistently in both paths.
     if (!error.response) {
       console.log('Network unavailable, falling back to offline OTP mode');
       const localOTP = Math.floor(100000 + Math.random() * 900000).toString();
@@ -56,8 +58,9 @@ export const sendOTP = async (mobile) => {
       await AsyncStorage.setItem(`otp_${mobile}`, JSON.stringify(offlineOTPData));
       return {
         success: true,
-        message: `Offline OTP: ${localOTP} (no network)`,
-        otp: localOTP,
+        message: `Offline OTP (backend unreachable): ${localOTP}`,
+        devOtp: localOTP,
+        otp: localOTP, // kept for back-compat with any callers reading .otp
         offlineMode: true,
       };
     }
@@ -766,6 +769,22 @@ export const cancelEnquiry = async (id) => {
     return data;
   } catch (error) {
     throw error.response?.data || { message: 'Failed to cancel enquiry' };
+  }
+};
+
+// ─── Firebase phone-auth flow ──────────────────────────────────────────────
+// Replaces the old /auth/send-otp + /auth/verify-otp endpoints with Firebase.
+// Flow:
+//   1. firebaseSendOtp(mobile)   → SMS delivered by Google, returns confirmation
+//   2. firebaseConfirmOtp(conf, code) → Firebase ID token
+//   3. firebaseLogin({ idToken, name, email })
+//        → backend verifies with admin-sdk, upserts User, issues OUR JWT
+export const firebaseLogin = async ({ idToken, name, email }) => {
+  try {
+    const { data } = await api.post('/auth/firebase-login', { idToken, name, email });
+    return data;
+  } catch (error) {
+    throw error.response?.data || { message: 'Failed to sign in with Firebase' };
   }
 };
 
