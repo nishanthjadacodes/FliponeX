@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "customerandroidapp",
+    "name": "FliponeX",
     "slug": "customerandroidapp",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -21,8 +21,8 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
+      "softwareKeyboardLayoutMode": "resize",
       "package": "com.nishanth_jada.customerandroidapp",
-      "googleServicesFile": "./google-services.json",
       "permissions": [
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
@@ -36,19 +36,39 @@
     },
     "extra": {
       "eas": {
-        "projectId": "a1ef638e-d3a4-45db-8170-e068ee6352e4"
+        "projectId": "b218656e-1386-4996-b985-6f29049bf832"
       }
     },
     "plugins": [
-      "@react-native-firebase/app",
-      "@react-native-firebase/auth",
+      "expo-build-properties",
       [
-        "expo-build-properties",
+        "expo-camera",
         {
-          "ios": { "useFrameworks": "static" },
-          "android": { "minSdkVersion": 24 }
+          "cameraPermission": "FliponeX needs camera access to capture documents during booking."
         }
-      ]
-    ]
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "FliponeX needs access to your photos to upload documents.",
+          "cameraPermission": "FliponeX needs camera access to capture documents."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "FliponeX uses your location to detect your service address.",
+          "locationWhenInUsePermission": "FliponeX uses your location to detect your service address."
+        }
+      ],
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Production"
+        }
+      ],
+      "expo-notifications"
+    ],
+    "owner": "nishanthbannu"
   }
 }
