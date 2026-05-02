@@ -16,6 +16,7 @@ import {
   getReferrals,
   trackReferralClick,
   getReferralStats,
+  backfillReferralRewards,
   type ReferralResponse,
   type ReferralStats,
 } from '../../services/agent/api';
@@ -82,6 +83,7 @@ const ReferralScreen: React.FC = () => {
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<string>('overview');
   const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
+  const [syncingRewards, setSyncingRewards] = useState<boolean>(false);
 
   // Animated counter for the "Current Month Royalty (Est.)" headline. We
   // tween from 0 → server-provided value whenever the data refreshes so
@@ -154,6 +156,31 @@ const ReferralScreen: React.FC = () => {
     setRefreshing(true);
     await loadReferralData();
     setRefreshing(false);
+  };
+
+  const handleSyncRewards = async (): Promise<void> => {
+    if (syncingRewards) return;
+    setSyncingRewards(true);
+    try {
+      const res = await backfillReferralRewards();
+      if (res?.success) {
+        const credited = res?.credited || 0;
+        const total = res?.totalAmount || 0;
+        Alert.alert(
+          credited > 0 ? 'Rewards synced' : 'Nothing to sync',
+          credited > 0
+            ? `Credited Rs.${total} across ${credited} previously-missed referral${credited === 1 ? '' : 's'}.`
+            : res?.message || 'No referrals were eligible — your downlines haven\'t completed a paid service yet.',
+          [{ text: 'OK', onPress: () => loadReferralData() }],
+        );
+      } else {
+        Alert.alert('Sync failed', res?.message || 'Try again in a moment.');
+      }
+    } catch (e: any) {
+      Alert.alert('Sync failed', e?.message || 'Network error');
+    } finally {
+      setSyncingRewards(false);
+    }
   };
 
   const handleShareReferral = async (type: ShareType = 'general'): Promise<void> => {
@@ -280,6 +307,24 @@ const ReferralScreen: React.FC = () => {
             <Text style={styles.earningLabel}>Used Credits</Text>
           </View>
         </View>
+
+        {/* One-tap sync — credits any referral rewards that should have
+            fired but didn't (legacy completions from before the agent-side
+            trigger landed). Idempotent on the backend, so tapping more
+            than once is safe. */}
+        <TouchableOpacity
+          style={styles.syncButton}
+          disabled={syncingRewards}
+          onPress={handleSyncRewards}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.syncButtonText}>
+            {syncingRewards ? 'Syncing…' : '🔄 Sync missed rewards'}
+          </Text>
+        </TouchableOpacity>
+        <Text style={styles.syncHint}>
+          Tap if a downline completed a job but your credit didn't appear.
+        </Text>
       </View>
 
       {referralStats && (
@@ -1240,6 +1285,29 @@ const styles = StyleSheet.create({
     width: 1,
     backgroundColor: '#1E293B',
     marginHorizontal: SIZES.padding,
+  },
+
+  syncButton: {
+    marginTop: SIZES.padding,
+    backgroundColor: COLORS.lightGray,
+    paddingVertical: SIZES.base + 2,
+    borderRadius: SIZES.radius,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  syncButtonText: {
+    fontSize: SIZES.font,
+    fontWeight: '700',
+    color: COLORS.text,
+    letterSpacing: 0.3,
+  },
+  syncHint: {
+    fontSize: SIZES.h6,
+    color: COLORS.textSecondary,
+    textAlign: 'center',
+    marginTop: 6,
+    fontStyle: 'italic',
   },
 });
 

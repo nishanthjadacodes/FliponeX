@@ -14,26 +14,32 @@ import {
 } from '../services/api';
 
 /**
- * Home-screen Red Alert banner for industrial customers.
+ * Home-screen Smart Alert banner.
  *
- * Pulls the user's compliance docs and surfaces a sticky red banner when any
- * doc is in the critical (<30 days to expiry) bucket. Tapping the banner
- * jumps to the Compliance Vault screen.
+ * Always renders on Home so every user sees that the FliponeX Smart Alert
+ * system exists. Three visual states based on the user's compliance docs:
  *
- * Spec — 30-day tier: "Action Required Immediately to avoid penalties!"
+ *   1. RED — at least one doc in the critical (<30 days) bucket. Sticky
+ *      red banner with one-click "Renew via FliponeX" CTA.
+ *   2. ACTIVE — has compliance docs but none are red. Soft blue banner
+ *      reading "✓ Smart Alert active — monitoring N documents".
+ *   3. SETUP — no compliance docs uploaded yet (or user not signed in).
+ *      Friendly tan banner inviting them to upload docs to activate the
+ *      30-60-90 day expiry alerts.
  *
- * Renders nothing if:
- *   • Compliance API call fails (e.g., user not signed in yet)
- *   • User has no company profile (industrial customer hasn't filled it)
- *   • No docs are red-tier
+ * The banner is informational + functional; it never disappears just
+ * because the logged-in user changed.
  */
 export interface ComplianceRedAlertBannerProps {
   onPress?: () => void;
 }
 
+type BannerState = 'loading' | 'red' | 'active' | 'setup';
+
 const ComplianceRedAlertBanner: React.FC<ComplianceRedAlertBannerProps> = ({ onPress }) => {
   const [redDocs, setRedDocs] = useState<ComplianceDoc[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [totalDocs, setTotalDocs] = useState<number>(0);
+  const [state, setState] = useState<BannerState>('loading');
   const [renewing, setRenewing] = useState<boolean>(false);
 
   useEffect(() => {
@@ -42,12 +48,19 @@ const ComplianceRedAlertBanner: React.FC<ComplianceRedAlertBannerProps> = ({ onP
       try {
         const res = await getComplianceDocs();
         if (!alive) return;
-        const list = (res?.data || []).filter((d) => d.status === 'red');
-        setRedDocs(list);
+        const all = res?.data || [];
+        const red = all.filter((d) => d.status === 'red');
+        setRedDocs(red);
+        setTotalDocs(all.length);
+        setState(red.length > 0 ? 'red' : all.length > 0 ? 'active' : 'setup');
       } catch (_) {
-        // Silent — empty list is the same as "nothing to alert about".
-      } finally {
-        if (alive) setLoading(false);
+        // API failed (no auth, network, etc.) — show the setup invite
+        // rather than disappearing entirely.
+        if (alive) {
+          setRedDocs([]);
+          setTotalDocs(0);
+          setState('setup');
+        }
       }
     })();
     return () => { alive = false; };
@@ -84,50 +97,90 @@ const ComplianceRedAlertBanner: React.FC<ComplianceRedAlertBannerProps> = ({ onP
     }
   };
 
-  if (loading) {
-    // Skip showing a spinner — this banner is a peripheral signal. We just
-    // wait silently and render once we know the answer.
-    return null;
+  if (state === 'loading') return null;
+
+  // ─── RED state — critical: at least one doc <30 days from expiry ───
+  if (state === 'red') {
+    const headline =
+      redDocs.length === 1
+        ? `${redDocs[0].label} expires in ${Math.max(redDocs[0].daysLeft ?? 0, 0)} days`
+        : `${redDocs.length} compliance documents are nearing expiry`;
+
+    return (
+      <View style={styles.banner} accessibilityRole="alert">
+        <TouchableOpacity style={styles.bannerBody} activeOpacity={0.85} onPress={onPress}>
+          <View style={styles.iconWrap}>
+            <Text style={styles.icon}>🚨</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title}>Action Required Immediately</Text>
+            <Text style={styles.subtitle} numberOfLines={2}>
+              {headline} — avoid penalties, renew via FliponeX now.
+            </Text>
+          </View>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.cta, renewing && styles.ctaDisabled]}
+          onPress={handleRenewViaFliponex}
+          disabled={renewing}
+        >
+          {renewing ? (
+            <ActivityIndicator size="small" color="#E63946" />
+          ) : (
+            <Text style={styles.ctaText}>Renew via FliponeX</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+    );
   }
-  if (redDocs.length === 0) return null;
 
-  const headline =
-    redDocs.length === 1
-      ? `${redDocs[0].label} expires in ${Math.max(redDocs[0].daysLeft ?? 0, 0)} days`
-      : `${redDocs.length} compliance documents are nearing expiry`;
-
-  return (
-    <View style={styles.banner} accessibilityRole="alert">
+  // ─── ACTIVE state — has docs, none red. Reassuring "we're watching" tile ───
+  if (state === 'active') {
+    return (
       <TouchableOpacity
-        style={styles.bannerBody}
+        style={[styles.banner, styles.bannerActive]}
         activeOpacity={0.85}
         onPress={onPress}
+        accessibilityRole="button"
       >
-        <View style={styles.iconWrap}>
-          <Text style={styles.icon}>🚨</Text>
+        <View style={styles.bannerBody}>
+          <View style={[styles.iconWrap, styles.iconWrapActive]}>
+            <Text style={styles.icon}>✅</Text>
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.title}>Smart Alert active</Text>
+            <Text style={styles.subtitle} numberOfLines={2}>
+              Monitoring {totalDocs} compliance document{totalDocs === 1 ? '' : 's'}.
+              We'll notify you 90 / 60 / 30 days before any expiry.
+            </Text>
+          </View>
+        </View>
+      </TouchableOpacity>
+    );
+  }
+
+  // ─── SETUP state — invite the user to upload their first compliance doc ───
+  return (
+    <TouchableOpacity
+      style={[styles.banner, styles.bannerSetup]}
+      activeOpacity={0.85}
+      onPress={onPress}
+      accessibilityRole="button"
+    >
+      <View style={styles.bannerBody}>
+        <View style={[styles.iconWrap, styles.iconWrapSetup]}>
+          <Text style={styles.icon}>🛡️</Text>
         </View>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Action Required Immediately</Text>
-          <Text style={styles.subtitle} numberOfLines={2}>
-            {headline} — avoid penalties, renew via FliponeX now.
+          <Text style={[styles.title, styles.titleSetup]}>FliponeX Smart Alert system</Text>
+          <Text style={[styles.subtitle, styles.subtitleSetup]} numberOfLines={3}>
+            Never miss a compliance renewal. Upload your Factory Licence,
+            Fire NOC, GST cert, etc. — we'll alert you 90 / 60 / 30 days
+            before each expires.
           </Text>
         </View>
-      </TouchableOpacity>
-
-      {/* Spec — One-Click Renewal: button right under the alert. Single tap
-          books the lead and an agent is auto-assigned to call back. */}
-      <TouchableOpacity
-        style={[styles.cta, renewing && styles.ctaDisabled]}
-        onPress={handleRenewViaFliponex}
-        disabled={renewing}
-      >
-        {renewing ? (
-          <ActivityIndicator size="small" color="#E63946" />
-        ) : (
-          <Text style={styles.ctaText}>Renew via FliponeX</Text>
-        )}
-      </TouchableOpacity>
-    </View>
+      </View>
+    </TouchableOpacity>
   );
 };
 
@@ -189,6 +242,27 @@ const styles = StyleSheet.create({
     fontSize: 13,
     letterSpacing: 0.4,
   },
+
+  // Active variant — has docs, all healthy. Muted teal so it reads as
+  // "informational" rather than "act now".
+  bannerActive: {
+    backgroundColor: '#0D5E5E',
+    shadowColor: '#0A3F3F',
+  },
+  iconWrapActive: { backgroundColor: 'rgba(255,255,255,0.18)' },
+
+  // Setup variant — no docs yet. Friendly tan, invites action without
+  // shouting. Distinct from the red urgency variant so users learn the
+  // colour code over time.
+  bannerSetup: {
+    backgroundColor: '#FFF7ED',
+    shadowColor: '#7C2D12',
+    borderWidth: 1,
+    borderColor: '#FED7AA',
+  },
+  iconWrapSetup: { backgroundColor: 'rgba(124,45,18,0.08)' },
+  titleSetup: { color: '#7C2D12' },
+  subtitleSetup: { color: '#9A3412' },
 });
 
 export default ComplianceRedAlertBanner;

@@ -117,14 +117,29 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           return;
         }
 
+        // Old build used auto-guest-login. Guest accounts are identified
+        // by their well-known mobile numbers — when we spot one, wipe
+        // the session and force the user through the real login flow.
+        const isGuestUser = (raw: string | null, guestMobile: string): boolean => {
+          if (!raw) return false;
+          try {
+            const u = JSON.parse(raw);
+            return u?.mobile === guestMobile;
+          } catch {
+            return false;
+          }
+        };
+
         if (mode === 'agent') {
           const existing = await AsyncStorage.getItem('agent_token');
+          const userRaw = await AsyncStorage.getItem('agent_data');
           const demoOrOffline =
             existing &&
             typeof existing === 'string' &&
             (existing.startsWith('demo_token_') || existing.startsWith('offline_token_'));
-          if (!existing || demoOrOffline) {
-            if (demoOrOffline) await AsyncStorage.multiRemove(['agent_token', 'agent_data']);
+          const guest = isGuestUser(userRaw, '1111111111');
+          if (!existing || demoOrOffline || guest) {
+            await AsyncStorage.multiRemove(['agent_token', 'agent_data']);
             navigation.replace?.('AgentLogin');
             return;
           }
@@ -134,7 +149,10 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
 
         if (mode === 'customer') {
           const existing = await getToken();
-          if (!existing) {
+          const userRaw = await AsyncStorage.getItem('user');
+          const guest = isGuestUser(userRaw, '0000000000');
+          if (!existing || guest) {
+            await AsyncStorage.multiRemove(['token', 'user', 'auth_token']);
             navigation.replace?.('Login');
             return;
           }

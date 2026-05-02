@@ -9,16 +9,10 @@ import {
   StatusBar,
   ScrollView,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   setUserMode,
   getUserMode,
-  getToken,
-  storeToken,
-  storeUser,
 } from '../utils/storage';
-import { guestLogin } from '../services/api';
-import { getApiBaseUrl as getAgentApiBaseUrl } from '../config/agent';
 import { ADMIN_DASHBOARD_URL, CUSTOMER_WEBSITE_URL } from '../config';
 
 interface ModeSelectScreenProps {
@@ -57,50 +51,27 @@ type MobileMode = 'customer' | 'agent';
 const ModeSelectScreen: React.FC<ModeSelectScreenProps> = ({ navigation }) => {
   const [busy, setBusy] = useState<boolean>(false);
 
-  // If a mobile mode is already persisted, skip this screen and go straight
-  // to the chosen tab stack (same behaviour as before the web options).
+  // If a mobile mode is already persisted, skip this screen — splash
+  // already routes returning users to the right tab stack via the token
+  // check. We mirror that here only as a safety net (e.g. user navigated
+  // back to ModeSelect after picking once).
   useEffect(() => {
     (async () => {
       const existing = await getUserMode();
-      if (existing === 'customer') navigation.replace('HomeTabs');
-      else if (existing === 'agent') navigation.replace('AgentTabs');
+      if (existing === 'customer') navigation.replace('Login');
+      else if (existing === 'agent') navigation.replace('AgentLogin');
     })();
   }, [navigation]);
 
+  // Picking a mode now routes to the corresponding LOGIN screen — no
+  // more silent guest-login. The user verifies their identity via OTP,
+  // gets a real JWT for their actual role, and lands in the tabs after
+  // verification.
   const pickMobile = async (mode: MobileMode): Promise<void> => {
     if (busy) return;
     setBusy(true);
     await setUserMode(mode);
-
-    // Provision the right kind of guest token for the chosen mode.
-    try {
-      if (mode === 'agent') {
-        const haveToken = await AsyncStorage.getItem('agent_token');
-        if (!haveToken) {
-          const res = await fetch(`${getAgentApiBaseUrl()}/auth/agent-guest-login?_t=${Date.now()}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
-            body: JSON.stringify({}),
-          });
-          const data: any = await res.json().catch(() => ({}));
-          if (data?.success && data?.token) {
-            await AsyncStorage.setItem('agent_token', data.token);
-            if (data.user) await AsyncStorage.setItem('agent_data', JSON.stringify(data.user));
-          }
-        }
-      } else {
-        const haveToken = await getToken();
-        if (!haveToken) {
-          const res: any = await guestLogin();
-          if (res?.token) await storeToken(res.token);
-          if (res?.user) await storeUser(res.user);
-        }
-      }
-    } catch (e: any) {
-      console.log('[modeselect] guest-login failed:', e?.message);
-    }
-
-    navigation.replace(mode === 'agent' ? 'AgentTabs' : 'HomeTabs');
+    navigation.replace(mode === 'agent' ? 'AgentLogin' : 'Login');
   };
 
   const openWeb = (url: string, title: string): void => {

@@ -616,33 +616,12 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           )}
 
-        {/* OTP Verification Section */}
-        {booking?.status === 'completed' && !booking?.verified && (
-          <View style={styles.section}>
-            <Text style={styles.sectionTitle}>Verify Completion</Text>
-            <View style={styles.otpContainer}>
-              <TextInput
-                style={styles.otpInput}
-                placeholder="Enter OTP"
-                value={otp}
-                onChangeText={setOtp}
-                keyboardType="numeric"
-                maxLength={6}
-              />
-              <TouchableOpacity
-                style={[styles.verifyButton, !otp.trim() && styles.disabledButton]}
-                onPress={handleVerifyCompletion}
-                disabled={!otp.trim() || verificationLoading}
-              >
-                {verificationLoading ? (
-                  <ActivityIndicator size="small" color={COLORS.WHITE} />
-                ) : (
-                  <Text style={styles.verifyButtonText}>Verify</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          </View>
-        )}
+        {/* "Verify Completion" used to live here. Removed because the OTP
+            handshake is owned by the rep — the customer reads the OTP off
+            the dev banner / SMS and tells it to the rep, who enters it on
+            the rep app. By the time the booking shows up here as
+            'completed', verification has already happened. The customer's
+            only remaining action is the rating below. */}
 
         {/* Rate & Review (only for completed bookings without rating yet) */}
         {booking?.status === 'completed' && !booking?.customer_rating && (

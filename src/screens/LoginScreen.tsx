@@ -129,20 +129,33 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
       if (res.user) await storeUser(res.user);
       await AsyncStorage.setItem('user_mode', 'customer');
 
-      // If the user came in via a referral deep link, apply it now. The
-      // backend silently no-ops if the user has already been referred.
+      // Apply referral code if entered or prefilled from deep link.
+      // Surface the result so the user has visible confirmation.
+      let referralStatus: string | null = null;
       if (referralCode.trim()) {
         try {
           const { applyReferralCode }: any = await import('../services/api');
           if (typeof applyReferralCode === 'function') {
-            await applyReferralCode(referralCode.trim());
+            const r: any = await applyReferralCode(referralCode.trim());
+            if (r?.success) {
+              referralStatus = `✓ Referral code ${referralCode.trim()} applied.`;
+            } else {
+              referralStatus = `Referral code not applied: ${r?.message || 'unknown reason'}`;
+            }
           }
         } catch (refErr: any) {
+          referralStatus = `Referral code not applied: ${refErr?.message || 'network error'}`;
           console.log('[login] referral apply non-fatal:', refErr?.message);
         }
       }
 
-      navigation.replace?.('HomeTabs');
+      if (referralStatus) {
+        Alert.alert('Welcome to FliponeX', referralStatus, [
+          { text: 'OK', onPress: () => navigation.replace?.('HomeTabs') },
+        ]);
+      } else {
+        navigation.replace?.('HomeTabs');
+      }
     } catch (e: any) {
       Alert.alert('Verification failed', e?.message || 'Try again.');
     } finally {
@@ -230,6 +243,33 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
               textAlign="center"
             />
 
+            {devOtp ? (
+              <View style={styles.devBanner}>
+                <Text style={styles.devBannerLabel}>DEV MODE OTP</Text>
+                <Text style={styles.devBannerCode}>{devOtp}</Text>
+                <TouchableOpacity onPress={() => setOtp(devOtp)}>
+                  <Text style={styles.devBannerFill}>Tap to autofill</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+
+            <View style={styles.referralBox}>
+              <Text style={styles.referralLabel}>Have a referral code? (optional)</Text>
+              <TextInput
+                style={styles.referralInput}
+                value={referralCode}
+                onChangeText={(v) => setReferralCode(v.toUpperCase().substring(0, 16))}
+                placeholder="FLIPXXXX"
+                placeholderTextColor="#94A3B8"
+                autoCapitalize="characters"
+              />
+              {referralCode.trim().length > 0 && (
+                <Text style={styles.referralHint}>
+                  ✓ Will be applied automatically when you verify.
+                </Text>
+              )}
+            </View>
+
             <TouchableOpacity
               style={[styles.btn, otp.length !== 6 && styles.btnDisabled]}
               disabled={otp.length !== 6 || loading}
@@ -238,7 +278,13 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
               {loading ? (
                 <ActivityIndicator color="#0D3B66" />
               ) : (
-                <Text style={styles.btnText}>Verify & Continue</Text>
+                <Text style={styles.btnText}>
+                  {otp.length !== 6
+                    ? `Enter all 6 digits (${otp.length}/6)`
+                    : referralCode.trim().length > 0
+                    ? 'Verify & Apply Referral'
+                    : 'Verify & Continue'}
+                </Text>
               )}
             </TouchableOpacity>
 
@@ -256,34 +302,6 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
                     : 'Resend'}
                 </Text>
               </TouchableOpacity>
-            </View>
-
-            {/* Dev banner — visible only when the backend returns a devOtp.
-                Production with a real SMS gateway returns null here and the
-                banner stays hidden. */}
-            {devOtp ? (
-              <View style={styles.devBanner}>
-                <Text style={styles.devBannerLabel}>DEV MODE OTP</Text>
-                <Text style={styles.devBannerCode}>{devOtp}</Text>
-                <TouchableOpacity onPress={() => setOtp(devOtp)}>
-                  <Text style={styles.devBannerFill}>Tap to autofill</Text>
-                </TouchableOpacity>
-              </View>
-            ) : null}
-
-            {/* Optional referral code — primarily used at first signup;
-                returning users can leave it blank. Backend silently
-                ignores it if the account already has a referral edge. */}
-            <View style={styles.referralBox}>
-              <Text style={styles.referralLabel}>Have a referral code? (optional)</Text>
-              <TextInput
-                style={styles.referralInput}
-                value={referralCode}
-                onChangeText={(v) => setReferralCode(v.toUpperCase().substring(0, 16))}
-                placeholder="FLIPXXXX"
-                placeholderTextColor="#94A3B8"
-                autoCapitalize="characters"
-              />
             </View>
           </View>
         )}
@@ -360,6 +378,9 @@ const styles = StyleSheet.create({
   referralInput: {
     borderWidth: 1, borderColor: '#E2E8F0', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10,
     fontSize: 14, color: '#0F172A', fontWeight: '700', letterSpacing: 1, backgroundColor: '#F8FAFC',
+  },
+  referralHint: {
+    color: '#16A34A', fontSize: 11, fontWeight: '700', marginTop: 6, letterSpacing: 0.3,
   },
 });
 

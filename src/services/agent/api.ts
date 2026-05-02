@@ -722,6 +722,20 @@ export const applyReferralCode = async (referralCode: string): Promise<FetchAPIR
   });
 };
 
+// Re-run the referral reward credit for any of the rep's downlines whose
+// first paid service has already been completed but never credited
+// (legacy completions from before the trigger covered the agent-side
+// path). Idempotent — safe to tap multiple times.
+export interface BackfillResult {
+  success: boolean;
+  credited?: number;
+  totalAmount?: number;
+  message?: string;
+}
+export const backfillReferralRewards = async (): Promise<BackfillResult> => {
+  return await fetchAPI('/referrals/backfill', { method: 'POST' });
+};
+
 // ─── Profile ──────────────────────────────────────────────────────────────
 export const getProfile = async (): Promise<User | Record<string, unknown>> => {
   const response = await fetchAPI('/profile');

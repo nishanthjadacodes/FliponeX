@@ -219,7 +219,14 @@ export const verifyOTP = async (mobile: string, otp: string): Promise<VerifyOTPR
     }
 
     try {
-      const response = await api.post<VerifyOTPResponse>('/auth/verify-otp', { mobile, otp });
+      // Explicit role='customer' so new accounts created via this app get
+      // the customer role. Backend defaults to 'agent' otherwise, which
+      // would then trip the role gate on the customer login screen.
+      const response = await api.post<VerifyOTPResponse>('/auth/verify-otp', {
+        mobile,
+        otp,
+        role: 'customer',
+      });
       console.log('API OTP verification successful');
       return response.data;
     } catch (apiError: any) {
