@@ -12,6 +12,8 @@ import {
   Easing,
 } from 'react-native';
 import * as Clipboard from 'expo-clipboard';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useNavigation } from '@react-navigation/native';
 import {
   getReferrals,
   trackReferralClick,
@@ -77,6 +79,8 @@ interface TabDef {
 type ShareType = 'whatsapp' | 'general' | string;
 
 const ReferralScreen: React.FC = () => {
+  const navigation = useNavigation<any>();
+  const insets = useSafeAreaInsets();
   const [referralData, setReferralData] = useState<ReferralData | null>(null);
   const [referralStats, setReferralStats] = useState<ReferralStats | null>(null);
   const [, setLoading] = useState<boolean>(true);
@@ -253,7 +257,20 @@ const ReferralScreen: React.FC = () => {
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Your Referral Code</Text>
         <View style={styles.referralCodeContainer}>
-          <Text style={styles.referralCode}>{referralData?.referralCode || 'FLIPON2026'}</Text>
+          {/* Compact, single-line, auto-fit. Long server codes used to
+              wrap and dominate the card; numberOfLines + adjustsFontSizeToFit
+              keep them on one line and shrink to fit. We never truncate
+              the displayed string because Copy / Share / WhatsApp all use
+              the same value — display and clipboard must match. */}
+          <Text
+            style={styles.referralCode}
+            numberOfLines={1}
+            adjustsFontSizeToFit
+            minimumFontScale={0.55}
+            ellipsizeMode="middle"
+          >
+            {referralData?.referralCode || 'FLIPON2026'}
+          </Text>
           <TouchableOpacity style={styles.copyButton} onPress={handleCopyCode}>
             <Text style={styles.copyButtonText}>Copy</Text>
           </TouchableOpacity>
@@ -324,6 +341,22 @@ const ReferralScreen: React.FC = () => {
         </TouchableOpacity>
         <Text style={styles.syncHint}>
           Tap if a downline completed a job but your credit didn't appear.
+        </Text>
+
+        {/* Open the per-downline income breakdown screen. Lives outside the
+            tab navigator so the user can dive in/out without losing the
+            referral context. */}
+        <TouchableOpacity
+          style={styles.teamTreeButton}
+          onPress={() => navigation.navigate('TeamTreeIncome')}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.teamTreeButtonText}>
+            🌳 Team Tree View & Income Summary
+          </Text>
+        </TouchableOpacity>
+        <Text style={styles.syncHint}>
+          See per-downline this-month income, with date / level / gross / TDS / net details.
         </Text>
       </View>
 
@@ -817,7 +850,7 @@ const ReferralScreen: React.FC = () => {
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
+      <View style={[styles.header, { paddingTop: insets.top + SIZES.padding }]}>
         <Text style={styles.headerTitle}>Referral Program</Text>
       </View>
 
@@ -884,7 +917,10 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.white,
     padding: SIZES.padding,
     borderRadius: SIZES.radius,
-    marginBottom: SIZES.base,
+    // Cards stacked back-to-back used base (8) which felt cramped — bump
+    // to padding (16) so each card reads as its own block on long
+    // sections like Terms / Royalty Governance.
+    marginBottom: SIZES.padding - 4,
     shadowColor: COLORS.shadow,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
@@ -895,13 +931,16 @@ const styles = StyleSheet.create({
     fontSize: SIZES.h3,
     fontWeight: 'bold',
     color: COLORS.text,
-    marginBottom: SIZES.base,
+    marginBottom: SIZES.base + 4,
   },
   cardDescription: {
     fontSize: SIZES.font,
     color: COLORS.textSecondary,
     marginBottom: SIZES.padding,
-    lineHeight: SIZES.base * 1.5,
+    // Comfortable reading line-height (~1.55× font size). Previously set
+    // to base*1.5 = 12px which was smaller than the font itself, jamming
+    // wrapped lines together.
+    lineHeight: 22,
   },
   referralCodeContainer: {
     flexDirection: 'row',
@@ -912,7 +951,16 @@ const styles = StyleSheet.create({
     borderRadius: SIZES.radius,
     marginBottom: SIZES.base,
   },
-  referralCode: { fontSize: SIZES.h2, fontWeight: 'bold', color: COLORS.primary },
+  referralCode: {
+    fontSize: SIZES.h2,
+    fontWeight: 'bold',
+    color: COLORS.primary,
+    flex: 1,
+    marginRight: SIZES.base,
+    // Wider letter-spacing reads as a typed code, not a word, so even
+    // shortened to fit it doesn't get mistaken for a generic label.
+    letterSpacing: 0.5,
+  },
   copyButton: {
     backgroundColor: COLORS.primary,
     paddingHorizontal: SIZES.padding,
@@ -921,7 +969,9 @@ const styles = StyleSheet.create({
   },
   copyButtonText: { color: COLORS.white, fontSize: SIZES.font, fontWeight: '600' },
   referralLink: { fontSize: SIZES.h6, color: COLORS.textSecondary, marginBottom: SIZES.base },
-  shareButtons: { gap: SIZES.base },
+  // Slightly larger gap between the WhatsApp + General share buttons so
+  // they don't read as one merged block.
+  shareButtons: { gap: SIZES.base + 4 },
   shareButton: { padding: SIZES.padding, borderRadius: SIZES.radius, alignItems: 'center' },
   whatsappButton: { backgroundColor: '#25D366' },
   generalButton: { backgroundColor: COLORS.primary },
@@ -930,7 +980,8 @@ const styles = StyleSheet.create({
     fontSize: SIZES.h6,
     color: COLORS.textSecondary,
     fontStyle: 'italic',
-    marginTop: SIZES.base,
+    marginTop: SIZES.base + 4,
+    lineHeight: 18,
   },
   earningsGrid: { flexDirection: 'row', gap: SIZES.base },
   earningItem: {
@@ -1007,14 +1058,17 @@ const styles = StyleSheet.create({
     fontSize: SIZES.h3,
     fontWeight: 'bold',
     color: COLORS.success,
-    marginBottom: SIZES.base / 2,
+    // Was base/2 (4px) — bumped so the bonus amount + "Priority User
+    // Status" subtitle don't sit on top of each other on the Gold card.
+    marginBottom: 6,
+    lineHeight: 22,
   },
   rewardDate: {
     fontSize: SIZES.h6,
     color: COLORS.textSecondary,
     marginBottom: SIZES.base / 4,
   },
-  rewardStatus: { fontSize: SIZES.h6, color: COLORS.textSecondary },
+  rewardStatus: { fontSize: SIZES.h6, color: COLORS.textSecondary, lineHeight: 18 },
   expiryDate: { fontSize: SIZES.h6, color: COLORS.warning },
   pendingInfo: {
     backgroundColor: COLORS.background,
@@ -1031,7 +1085,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.white,
     padding: SIZES.padding,
     borderRadius: SIZES.radius,
-    marginBottom: SIZES.base,
+    // Was base (8) — bumped so milestone cards don't visually merge
+    // with each other on the long Milestones tab.
+    marginBottom: SIZES.padding - 4,
     shadowColor: COLORS.shadow,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
@@ -1041,30 +1097,41 @@ const styles = StyleSheet.create({
   milestoneHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: SIZES.base,
+    alignItems: 'flex-start',
+    // Bumped from base (8) → 14 so the header (title + requirement) is
+    // clearly separated from the description paragraph below it.
+    marginBottom: 14,
   },
   achievedHeader: {
     backgroundColor: COLORS.success + '20',
     padding: SIZES.padding,
     borderRadius: SIZES.radius,
   },
-  milestoneInfo: { flex: 1 },
+  milestoneInfo: { flex: 1, paddingRight: SIZES.base },
   milestoneTitle: {
     fontSize: SIZES.h3,
     fontWeight: 'bold',
     color: COLORS.text,
-    marginBottom: SIZES.base / 4,
+    // Was base/4 (2px) — too tight, the requirement line crashed into
+    // the title. Bumped to 6 + lineHeight for proper title spacing.
+    marginBottom: 6,
+    lineHeight: 24,
   },
-  milestoneRequirement: { fontSize: SIZES.h6, color: COLORS.textSecondary },
+  milestoneRequirement: {
+    fontSize: SIZES.h6,
+    color: COLORS.textSecondary,
+    lineHeight: 18,
+  },
   milestoneReward: { alignItems: 'flex-end' },
   milestoneDescription: {
     fontSize: SIZES.font,
     color: COLORS.textSecondary,
-    lineHeight: SIZES.base * 1.5,
+    // Was base * 1.5 = 12px — actively negative leading on a 14px font,
+    // so wrapped lines collided. Bump to 22 = ~1.55× for readable rhythm.
+    lineHeight: 22,
   },
   achievedText: { fontSize: SIZES.h6, color: COLORS.success, fontWeight: 'bold' },
-  progressText: { fontSize: SIZES.font, color: COLORS.text, lineHeight: SIZES.base * 1.5 },
+  progressText: { fontSize: SIZES.font, color: COLORS.text, lineHeight: 22 },
   royaltyGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: SIZES.base },
   royaltyItem: {
     width: '48%',
@@ -1084,15 +1151,21 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: SIZES.base,
+    // Bumped from base (8) → padding (16) so each requirement row has
+    // proper breathing room. Was reading as a tight cluster previously.
+    marginBottom: SIZES.padding - 4,
+    paddingVertical: 4,
   },
-  requirementText: { fontSize: SIZES.font, color: COLORS.text, flex: 1 },
+  requirementText: { fontSize: SIZES.font, color: COLORS.text, flex: 1, lineHeight: 22 },
   requirementStatus: { fontSize: SIZES.h6, fontWeight: '600', marginLeft: SIZES.base },
   met: { color: COLORS.success },
   notMet: { color: COLORS.error },
-  calculationText: { fontSize: SIZES.font, color: COLORS.text, marginBottom: SIZES.base },
-  payoutInfo: { fontSize: SIZES.h6, color: COLORS.textSecondary },
-  termsText: { fontSize: SIZES.font, color: COLORS.text, lineHeight: SIZES.base * 1.8 },
+  calculationText: { fontSize: SIZES.font, color: COLORS.text, marginBottom: SIZES.base + 4, lineHeight: 22 },
+  payoutInfo: { fontSize: SIZES.h6, color: COLORS.textSecondary, lineHeight: 18 },
+  // Bullets / multi-paragraph terms need a generous line-height — readers
+  // skim these, so cramming the lines together makes the section feel
+  // dense. 24px on 14px font = ~1.7× — comfortable reading rhythm.
+  termsText: { fontSize: SIZES.font, color: COLORS.text, lineHeight: 24 },
   termsHighlight: { fontWeight: 'bold', color: COLORS.primary },
   termsStep: { fontWeight: 'bold', color: COLORS.text },
 
@@ -1308,6 +1381,19 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 6,
     fontStyle: 'italic',
+  },
+  teamTreeButton: {
+    marginTop: SIZES.padding,
+    backgroundColor: '#0F172A',
+    paddingVertical: SIZES.base + 4,
+    borderRadius: SIZES.radius,
+    alignItems: 'center',
+  },
+  teamTreeButtonText: {
+    fontSize: SIZES.font,
+    fontWeight: '800',
+    color: '#FCD34D',
+    letterSpacing: 0.3,
   },
 });
 

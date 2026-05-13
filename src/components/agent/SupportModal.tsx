@@ -9,6 +9,8 @@ import {
   ScrollView,
   Alert,
   TextInput,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -101,6 +103,10 @@ const SupportModal: React.FC<SupportModalProps> = ({ visible, onClose }) => {
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
       <View style={styles.overlay}>
         <View style={styles.sheet}>
           <View style={styles.header}>
@@ -217,6 +223,7 @@ const SupportModal: React.FC<SupportModalProps> = ({ visible, onClose }) => {
           </ScrollView>
         </View>
       </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 };

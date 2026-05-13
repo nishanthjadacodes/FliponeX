@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
   TextInput,
   TouchableOpacity,
+  Pressable,
   StyleSheet,
   ScrollView,
   Alert,
@@ -13,25 +14,22 @@ import {
   Modal,
   FlatList,
   Image,
+  KeyboardAvoidingView,
+  Keyboard,
+  findNodeHandle,
+  UIManager,
+  Dimensions,
+  BackHandler,
 } from 'react-native';
 
-// Indian states + UTs — used by the Domicile / address forms below as a
-// dropdown so users don't have to type / typo the state name.
-const INDIAN_STATES: string[] = [
-  'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh',
-  'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka',
-  'Kerala', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram',
-  'Nagaland', 'Odisha', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu',
-  'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
-  // Union Territories
-  'Andaman and Nicobar Islands', 'Chandigarh', 'Dadra and Nagar Haveli and Daman and Diu',
-  'Delhi', 'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry',
-];
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { INDIAN_DISTRICTS, INDIAN_STATES } from '../constants/districts';
 import { formatBookingId, nextLocalBookingNumber } from '../utils/bookingId';
 import * as Location from 'expo-location';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
+import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
+import Icon from 'react-native-vector-icons/MaterialIcons';
 // Defensive load: expo-document-picker is a native module. If the dev-client
 // APK predates the install, require() works but calls throw at runtime.
 // We probe for the native binding at load time and fall back to image-only
@@ -49,7 +47,7 @@ try {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getUser } from '../utils/storage';
 import RazorpayCheckout from 'react-native-razorpay';
-import { createBooking, getLocationFromAddress, uploadDocument, getProfile, processPayment, createPaymentOrder, verifyPayment, applyReferralCode } from '../services/api';
+import { createBooking, getLocationFromAddress, uploadDocument, getProfile, processPayment, createPaymentOrder, verifyPayment, applyReferralCode, updateMyLocation } from '../services/api';
 import SuccessToast from '../components/SuccessToast';
 
 interface Props {
@@ -67,12 +65,115 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   // form's "Select State" button.
   const [showStatePicker, setShowStatePicker] = useState<boolean>(false);
   const [stateSearch, setStateSearch] = useState<string>('');
+  // District picker — same searchable-modal pattern as the state picker.
+  // Replaces free-text typing so govt forms get a canonical district name.
+  const [showDistrictPicker, setShowDistrictPicker] = useState<boolean>(false);
+  const [districtSearch, setDistrictSearch] = useState<string>('');
   const { serviceData } = route.params;
 
   // State for multi-step form
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [loading, setLoading] = useState<boolean>(false);
   const [userMobile, setUserMobile] = useState<string>('');
+
+  // Step-by-step back navigation. The booking form has 6 internal
+  // steps; without this guard, the user taps back on Step 4 and the
+  // entire screen unmounts → they land on Home. Two interception
+  // paths covered:
+  //   • beforeRemove   — fires for header back button + swipe-back
+  //                      gesture + any programmatic goBack()
+  //   • BackHandler    — fires for the Android hardware back button
+  // Both check currentStep > 1 and decrement instead of popping the
+  // screen. We intercept ONLY when the action is a back/pop (action
+  // type GO_BACK or POP) — programmatic forward navigation (e.g.
+  // navigate('MyBookings') after a successful booking) is allowed
+  // through untouched.
+  useEffect(() => {
+    const nav: any = navigation as any;
+    const beforeRemoveSub =
+      nav?.addListener?.('beforeRemove', (e: any) => {
+        const actionType = e?.data?.action?.type;
+        const isBackAction = actionType === 'GO_BACK' || actionType === 'POP';
+        if (!isBackAction) return; // forward navigation — allow
+        if (currentStep > 1) {
+          e.preventDefault?.();
+          setCurrentStep(currentStep - 1);
+        }
+      }) || (() => {});
+
+    const hwSub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (currentStep > 1) {
+        setCurrentStep(currentStep - 1);
+        return true;
+      }
+      return false;
+    });
+
+    return () => {
+      hwSub.remove();
+      if (typeof beforeRemoveSub === 'function') beforeRemoveSub();
+    };
+  }, [navigation, currentStep]);
+
+  // Ref + scroll-position tracking for the auto-scroll-to-focused-input
+  // logic below. Without it, when the keyboard opens on a long form the
+  // focused field ends up hidden beneath it (Android edge-to-edge mode
+  // doesn't shrink the ScrollView's inner content). The Keyboard listener
+  // measures the focused TextInput and scrolls so it sits above the
+  // keyboard with a small breathing-room margin.
+  const stepScrollRef = useRef<ScrollView | null>(null);
+  const stepScrollYRef = useRef<number>(0);
+
+  // Scroll the step view back to the top on every step transition.
+  // Without this, advancing from step 3 (documents) to step 4 left
+  // the ScrollView at the bottom of step 3 — so step 4's first
+  // section (Service Mode) was below the visible fold, "covered"
+  // until the user manually scrolled up.
+  useEffect(() => {
+    const scroller: any = stepScrollRef.current;
+    if (!scroller?.scrollTo) return;
+    // requestAnimationFrame so the scroll fires AFTER React commits
+    // the new step's content. Without the deferral the call lands
+    // on the previous step's content height and silently no-ops.
+    requestAnimationFrame(() => {
+      scroller.scrollTo({ y: 0, animated: false });
+      stepScrollYRef.current = 0;
+    });
+  }, [currentStep]);
+
+  useEffect(() => {
+    const evtName = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const sub = Keyboard.addListener(evtName, (e: any) => {
+      // The currently-focused TextInput exposes its native node via
+      // TextInput.State.currentlyFocusedInput(). We measure it on the
+      // window and compare against the keyboard's top edge.
+      const focused = (TextInput as any).State?.currentlyFocusedInput?.();
+      const handle = focused ? findNodeHandle(focused) : null;
+      const scroller: any = stepScrollRef.current;
+      if (!handle || !scroller) return;
+      try {
+        UIManager.measureInWindow(handle, (_x, y, _w, h) => {
+          if (typeof y !== 'number' || typeof h !== 'number') return;
+          const screenH = Dimensions.get('window').height;
+          const kbHeight = e?.endCoordinates?.height || 0;
+          const kbTop = screenH - kbHeight;
+          const inputBottom = y + h;
+          // Pad by 24px so the input sits visibly above the keyboard
+          // edge — looks more natural than flush against the top edge.
+          const overlap = inputBottom - kbTop + 24;
+          if (overlap > 0) {
+            scroller.scrollTo({
+              y: stepScrollYRef.current + overlap,
+              animated: true,
+            });
+          }
+        });
+      } catch (_err) {
+        // Best-effort — never crash the screen on a measurement failure.
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   // Toast for upload feedback
   const [toast, setToast] = useState<any>({ visible: false, title: '', subtitle: '', variant: 'success' });
@@ -104,7 +205,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   const [fullName, setFullName] = useState<string>('');
   const [applicantName, setApplicantName] = useState<string>('');
   const [aadhaarNumber, setAadhaarNumber] = useState<string>('');
-  const [dateOfBirth, setDateOfBirth] = useState<Date>(new Date());
+  const [dateOfBirth, setDateOfBirth] = useState<Date | null>(null);
   const [showDatePicker, setShowDatePicker] = useState<boolean>(false);
   const [gender, setGender] = useState<string>('Male');
   const [email, setEmail] = useState<string>('');
@@ -130,6 +231,31 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   const [ifscCode, setIfscCode] = useState<string>('');
   const [workingPlatforms, setWorkingPlatforms] = useState<string>('');
   const [mobile, setMobile] = useState<string>('');
+
+  // ─── Aadhaar-only fields (new spec) ───────────────────────────────────────
+  // The Aadhaar enrollment / update form needs more granular personal +
+  // address fields than the generic intake. These are only rendered when
+  // the selected service is an Aadhaar service. Husband's Name only
+  // surfaces when the applicant marks Married + Female (UIDAI form rule).
+  const [fatherName, setFatherName] = useState<string>('');
+  const [husbandName, setHusbandName] = useState<string>('');
+  const [motherName, setMotherName] = useState<string>('');
+  // Voter-ID-only fields (per ECI Form 6/7/8 intake)
+  const [disabilityType, setDisabilityType] = useState<string>('');
+  const [assemblyConstituency, setAssemblyConstituency] = useState<string>('');
+  const [parliamentaryConstituency, setParliamentaryConstituency] = useState<string>('');
+  // Ration-Card-only fields (per state PDS intake form)
+  const [headOfFamily, setHeadOfFamily] = useState<string>('');
+  const [hofMobile, setHofMobile] = useState<string>('');
+  const [rationDealerName, setRationDealerName] = useState<string>('');
+  const [houseNo, setHouseNo] = useState<string>('');
+  const [streetArea, setStreetArea] = useState<string>('');
+  const [wardName, setWardName] = useState<string>('');
+  const [townVillage, setTownVillage] = useState<string>('');
+  const [postOffice, setPostOffice] = useState<string>('');
+  const [panchayat, setPanchayat] = useState<string>('');
+  const [talukaTehsil, setTalukaTehsil] = useState<string>('');
+  const [block, setBlock] = useState<string>('');
 
   // Generic bag for backend-defined form fields (service.form_fields.fields).
   // Keyed by field.name → string value. We submit the whole map alongside
@@ -396,13 +522,16 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.dateButton}
             onPress={() => setShowDatePicker(true)}
           >
-            <Text>{dateOfBirth.toLocaleDateString()}</Text>
+            <Text style={{ color: dateOfBirth ? '#1F2937' : '#94A3B8' }}>
+              {dateOfBirth ? dateOfBirth.toLocaleDateString('en-IN') : 'Select date of birth'}
+            </Text>
           </TouchableOpacity>
           {showDatePicker && (
             <DateTimePicker
-              value={dateOfBirth}
+              value={dateOfBirth || new Date(2000, 0, 1)}
               mode="date"
               display="default"
+              maximumDate={new Date()}
               onChange={(event: any, selectedDate: any) => {
                 setShowDatePicker(false);
                 if (selectedDate) {
@@ -629,12 +758,16 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       fields.push(
         <View key="district" style={styles.inputGroup}>
           <Text style={styles.label}>District *</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="Enter your district"
-            value={district}
-            onChangeText={setDistrict}
-          />
+          <TouchableOpacity
+            style={[styles.input, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }] as any}
+            onPress={() => setShowDistrictPicker(true)}
+            activeOpacity={0.7}
+          >
+            <Text style={{ color: district ? '#212121' : '#9E9E9E', fontSize: 15 }}>
+              {district || 'Tap to select your district'}
+            </Text>
+            <Text style={{ color: '#9E9E9E', fontSize: 18, marginLeft: 8 }}>▾</Text>
+          </TouchableOpacity>
         </View>
       );
     }
@@ -1086,6 +1219,399 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
     return fields;
   };
 
+  // ─── Personal-details form (UIDAI-style) ────────────────────────────
+  // Four variants:
+  //   'aadhaar'    → Husband's Name conditional (Married + Female)
+  //   'pan'        → always shows Mother's Name (PAN Form 49A)
+  //   'voterid'    → Husband's Name conditional + Disability Type +
+  //                  Assembly / Parliamentary Constituency (ECI Form 6/7/8)
+  //   'rationcard' → Husband's Name conditional + Disability Type +
+  //                  Head of Family + HOF Mobile + Ration Dealer Name
+  // The DOB, address block, marital status, etc. are identical across
+  // variants — only the parental + form-specific fields differ.
+  const renderAadhaarPersonalDetails = (
+    variant: 'aadhaar' | 'pan' | 'voterid' | 'rationcard' = 'aadhaar',
+  ): any => {
+    const showHusbandField =
+      (variant === 'aadhaar' || variant === 'voterid' || variant === 'rationcard') &&
+      maritalStatus === 'Married' &&
+      (gender === 'Female' || gender === 'female');
+    const showMotherField = variant === 'pan';
+    const showVoterIdExtras = variant === 'voterid';
+    // Disability Type is on both Voter ID and Ration Card forms.
+    const showDisabilityType = variant === 'voterid' || variant === 'rationcard';
+    const showRationCardExtras = variant === 'rationcard';
+    // Aadhaar number is required across every ID-form variant. For an
+    // Aadhaar update the user obviously has one; for PAN it's needed for
+    // PAN-Aadhaar linking (mandatory since 2023); for Voter ID and Ration
+    // Card most state portals now ask for the Aadhaar reference too.
+    const aadhaarRequired = true;
+    return (
+      <View>
+        <Text style={styles.aadhaarSectionLabel}>Applicant Information</Text>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Applicant Name *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="As per supporting documents"
+            value={applicantName || fullName}
+            onChangeText={(v) => { setApplicantName(v); setFullName(v); }}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>
+            Aadhaar Number{aadhaarRequired ? ' *' : ''}
+          </Text>
+          <TextInput
+            style={styles.input}
+            placeholder="1234 5678 9012"
+            // Display the 12 digits in three space-separated groups of 4
+            // (UIDAI's standard print format) while the underlying state
+            // stays as the raw 12-digit string for validation + payload.
+            value={aadhaarNumber.replace(/(\d{4})(?=\d)/g, '$1 ')}
+            onChangeText={(v) => setAadhaarNumber(v.replace(/\D/g, '').substring(0, 12))}
+            keyboardType="number-pad"
+            // 14 = 12 digits + 2 spaces between the three groups
+            maxLength={14}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Father's Name *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Enter father's full name"
+            value={fatherName}
+            onChangeText={setFatherName}
+          />
+        </View>
+
+        {showMotherField && (
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Mother's Name *</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Enter mother's full name"
+              value={motherName}
+              onChangeText={setMotherName}
+            />
+          </View>
+        )}
+
+        {showHusbandField && (
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Husband's Name *</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Enter husband's full name"
+              value={husbandName}
+              onChangeText={setHusbandName}
+            />
+          </View>
+        )}
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Date of Birth *</Text>
+          <TouchableOpacity style={styles.input} onPress={() => setShowDatePicker(true)}>
+            <Text style={{ color: dateOfBirth ? '#1F2937' : '#94A3B8' }}>
+              {dateOfBirth ? new Date(dateOfBirth).toLocaleDateString('en-IN') : 'Select date of birth'}
+            </Text>
+          </TouchableOpacity>
+          {showDatePicker && (
+            <DateTimePicker
+              value={dateOfBirth || new Date(2000, 0, 1)}
+              mode="date"
+              display="default"
+              maximumDate={new Date()}
+              onChange={(event: any, selectedDate: any) => {
+                setShowDatePicker(false);
+                if (selectedDate) {
+                  setDateOfBirth(selectedDate);
+                }
+              }}
+            />
+          )}
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Gender *</Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            {['Male', 'Female', 'Other'].map((g) => (
+              <TouchableOpacity
+                key={g}
+                style={[
+                  styles.aadhaarChip,
+                  gender === g && styles.aadhaarChipActive,
+                ]}
+                onPress={() => setGender(g)}
+              >
+                <Text style={[
+                  styles.aadhaarChipText,
+                  gender === g && styles.aadhaarChipTextActive,
+                ]}>{g}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Mobile Number *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="10-digit mobile"
+            value={mobile}
+            onChangeText={(v) => setMobile(v.replace(/\D/g, '').substring(0, 10))}
+            keyboardType="number-pad"
+            maxLength={10}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>E-mail</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="you@example.com"
+            value={email}
+            onChangeText={setEmail}
+            keyboardType="email-address"
+            autoCapitalize="none"
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Marital Status *</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {['Single', 'Married', 'Divorced', 'Widowed'].map((m) => (
+              <TouchableOpacity
+                key={m}
+                style={[
+                  styles.aadhaarChip,
+                  maritalStatus === m && styles.aadhaarChipActive,
+                ]}
+                onPress={() => setMaritalStatus(m)}
+              >
+                <Text style={[
+                  styles.aadhaarChipText,
+                  maritalStatus === m && styles.aadhaarChipTextActive,
+                ]}>{m}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {showDisabilityType && (
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Disability Type</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {['None', 'Visual', 'Speech & Hearing', 'Locomotor', 'Other'].map((d) => (
+                <TouchableOpacity
+                  key={d}
+                  style={[
+                    styles.aadhaarChip,
+                    disabilityType === d && styles.aadhaarChipActive,
+                  ]}
+                  onPress={() => setDisabilityType(d)}
+                >
+                  <Text style={[
+                    styles.aadhaarChipText,
+                    disabilityType === d && styles.aadhaarChipTextActive,
+                  ]}>{d}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        )}
+
+        {showRationCardExtras && (
+          <>
+            <Text style={[styles.aadhaarSectionLabel, { marginTop: 14 }]}>
+              Family / Ration Details
+            </Text>
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>Head of Family *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Name of head of household"
+                value={headOfFamily}
+                onChangeText={setHeadOfFamily}
+              />
+            </View>
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>HOF Mobile *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Head of Family's mobile"
+                value={hofMobile}
+                onChangeText={(v) => setHofMobile(v.replace(/\D/g, '').substring(0, 10))}
+                keyboardType="number-pad"
+                maxLength={10}
+              />
+            </View>
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>Ration Dealer Name *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Authorised FPS / dealer name"
+                value={rationDealerName}
+                onChangeText={setRationDealerName}
+              />
+            </View>
+          </>
+        )}
+
+        <Text style={[styles.aadhaarSectionLabel, { marginTop: 18 }]}>Address</Text>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>House No. *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Door / flat number"
+            value={houseNo}
+            onChangeText={setHouseNo}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Street / Area / Locality *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Street name, area, landmark"
+            value={streetArea || addressLine1}
+            onChangeText={(v) => { setStreetArea(v); setAddressLine1(v); }}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Ward Name</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Ward / sector"
+            value={wardName}
+            onChangeText={setWardName}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Town / Village *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Town or village"
+            value={townVillage}
+            onChangeText={setTownVillage}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Post Office *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Nearest post office"
+            value={postOffice}
+            onChangeText={setPostOffice}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Panchayat</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Gram panchayat (rural)"
+            value={panchayat}
+            onChangeText={setPanchayat}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Taluqa / Tehsil / Mandal *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Taluk / Tehsil / Mandal"
+            value={talukaTehsil || subdivision}
+            onChangeText={(v) => { setTalukaTehsil(v); setSubdivision(v); }}
+          />
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Block</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="Revenue block"
+            value={block}
+            onChangeText={setBlock}
+          />
+        </View>
+
+        {showVoterIdExtras && (
+          <>
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>Name of Assembly Constituency *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g. 152 - Madhapur"
+                value={assemblyConstituency}
+                onChangeText={setAssemblyConstituency}
+              />
+            </View>
+            <View style={styles.inputGroup}>
+              <Text style={styles.label}>Name of Parliamentary Constituency *</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g. Hyderabad"
+                value={parliamentaryConstituency}
+                onChangeText={setParliamentaryConstituency}
+              />
+            </View>
+          </>
+        )}
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>District *</Text>
+          <TouchableOpacity
+            style={[styles.input, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }] as any}
+            onPress={() => setShowDistrictPicker(true)}
+            activeOpacity={0.7}
+          >
+            <Text style={{ color: district ? '#212121' : '#9E9E9E', fontSize: 15 }}>
+              {district || 'Tap to select your district'}
+            </Text>
+            <Text style={{ color: '#9E9E9E', fontSize: 18, marginLeft: 8 }}>▾</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>State *</Text>
+          {/* Searchable picker (28 states + 8 UTs) — replaces the free-
+              text input so users can't typo the state name and govt
+              forms get a clean canonical value. */}
+          <TouchableOpacity
+            style={[styles.input, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }] as any}
+            onPress={() => setShowStatePicker(true)}
+            activeOpacity={0.7}
+          >
+            <Text style={{ color: state ? '#212121' : '#9E9E9E', fontSize: 15 }}>
+              {state || 'Tap to select your state'}
+            </Text>
+            <Text style={{ color: '#9E9E9E', fontSize: 18, marginLeft: 8 }}>▾</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>Pin Code *</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="6-digit PIN"
+            value={pincode}
+            onChangeText={(v) => setPincode(v.replace(/\D/g, '').substring(0, 6))}
+            keyboardType="number-pad"
+            maxLength={6}
+          />
+        </View>
+      </View>
+    );
+  };
+
   // Step 3: Documents
   const [uploadedDocuments, setUploadedDocuments] = useState<any[]>([]);
   // Tap-to-preview a previously uploaded image. PDFs/non-images skip the
@@ -1142,11 +1668,187 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   // alone, since the user could have abandoned/failed the gateway flow.
   const [paymentCompleted, setPaymentCompleted] = useState<boolean>(false);
 
-  // Calculate pricing — parse as numbers since API returns decimal strings
-  const userCost = parseFloat(serviceData?.user_cost) || 0;
-  const govtFees = parseFloat(serviceData?.govt_fees) || 0;
-  const additionalFee = serviceMode === 'fast_track' ? priorityFee : 0;
-  const totalAmount = Math.max(0, userCost + govtFees + additionalFee - referralDiscount);
+  // Payment Summary state — each service's price is broken into mandatory
+  // base charges (govt + doorstep) plus four opt-in add-ons (processing,
+  // consultancy, taxes, fast-track). Wallet credits + refund balance can
+  // shave off up to 50% of the subtotal per policy.
+  const [optProcessing, setOptProcessing] = useState<boolean>(false);
+  const [optConsultancy, setOptConsultancy] = useState<boolean>(false);
+  const [optTaxes, setOptTaxes] = useState<boolean>(false);
+  const [optFastTrack, setOptFastTrack] = useState<boolean>(serviceMode === 'fast_track');
+  const [useRewardPoints, setUseRewardPoints] = useState<boolean>(false);
+  const [useRefundWallet, setUseRefundWallet] = useState<boolean>(false);
+  const [acceptedTerms, setAcceptedTerms] = useState<boolean>(false);
+  const [walletBalance, setWalletBalance] = useState<number>(0);
+  const [refundBalance, setRefundBalance] = useState<number>(0);
+
+  // Fast-track checkbox should mirror the urgency picker on step 2 — if
+  // the user changes urgency mid-flow, sync the checkbox.
+  useEffect(() => {
+    setOptFastTrack(serviceMode === 'fast_track');
+  }, [serviceMode]);
+
+  // Fetch the customer's wallet + refund balance once so the Payment
+  // Summary can show real "Use Reward Points" / "Use Refund Wallet" caps.
+  useEffect(() => {
+    (async () => {
+      try {
+        const { getWalletBalance } = await import('../services/api');
+        const wallet: any = await getWalletBalance();
+        const balance = Number(wallet?.balance || 0);
+        // Split: anything from referral_reward / referral_milestone is
+        // "reward points"; anything from refund / cancellation is "refund
+        // wallet". Until the backend tags them separately we treat the
+        // whole balance as reward points and leave refund at 0.
+        setWalletBalance(balance);
+        const refundCredits = Array.isArray(wallet?.transactions)
+          ? wallet.transactions
+              .filter((t: any) => t.type === 'credit' && /refund|cancel/i.test(t.source || ''))
+              .reduce((s: number, t: any) => s + Number(t.amount || 0), 0)
+          : 0;
+        setRefundBalance(refundCredits);
+      } catch (e: any) {
+        console.log('[booking] wallet balance fetch failed:', e?.message);
+      }
+    })();
+  }, []);
+
+  // ─── Rate-chart safety override ────────────────────────────────────────
+  // The DB should already match the rate chart (run scripts/update-rate-chart.js
+  // on the backend), but this client-side override guarantees a customer
+  // who books before the backend deploy still sees correct prices. Match
+  // by service category + name keywords, mirror values from the chart.
+  const RATE_CHART: Array<{
+    category: RegExp; name: RegExp;
+    user_cost: number; govt_fees: number; partner_earning: number;
+    total_expense: number; company_margin: number; expected_timeline: string;
+  }> = [
+    // Aadhaar
+    { category: /aadhaar|aadhar/i, name: /new\s+aadhaar\s+enrolment/i,        user_cost:  200, govt_fees:    0, partner_earning: 100, total_expense:  100, company_margin: 100, expected_timeline: '1 week' },
+    { category: /aadhaar|aadhar/i, name: /husband\s+name\s+update/i,           user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '3 weeks' },
+    { category: /aadhaar|aadhar/i, name: /address\s+update/i,                  user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '4 weeks' },
+    { category: /aadhaar|aadhar/i, name: /date\s+of\s+birth\s+update/i,        user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '5 weeks' },
+    { category: /aadhaar|aadhar/i, name: /gender\s+update/i,                   user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '6 weeks' },
+    { category: /aadhaar|aadhar/i, name: /biometric/i,                         user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '7 weeks' },
+    { category: /aadhaar|aadhar/i, name: /mobile\s*no\.?\s+update/i,           user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '8 weeks' },
+    { category: /aadhaar|aadhar/i, name: /email\s+id\s+update/i,               user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '9 weeks' },
+    { category: /aadhaar|aadhar/i, name: /order\s+aadhaar\s+pvc/i,             user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '10 weeks' },
+    { category: /aadhaar|aadhar/i, name: /download\s+aadhaar/i,                user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '11 weeks' },
+    { category: /aadhaar|aadhar/i, name: /verify\s+email\/?mobile/i,           user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '12 weeks' },
+    { category: /aadhaar|aadhar/i, name: /name\s+update/i,                     user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '2 weeks' },
+    // PAN
+    { category: /pan/i, name: /link\s+pan\s+to\s+aadhaar/i,                    user_cost: 1100, govt_fees: 1000, partner_earning:  75, total_expense: 1075, company_margin:  25, expected_timeline: '48-72 hrs' },
+    { category: /pan/i, name: /new\s+pan/i,                                    user_cost:  220, govt_fees:  107, partner_earning:  75, total_expense:  182, company_margin:  38, expected_timeline: '24-48 hrs' },
+    { category: /pan/i, name: /(name|address|date\s+of\s+birth|gender|mobile|email)/i, user_cost: 220, govt_fees: 107, partner_earning: 75, total_expense: 182, company_margin: 38, expected_timeline: '48-72 hrs' },
+    { category: /pan/i, name: /(order|download|verify)/i,                      user_cost:  220, govt_fees:  107, partner_earning:  75, total_expense:  182, company_margin:  38, expected_timeline: '48-72 hrs' },
+    // Voter ID — flat ₹150 for every variant per the rate chart.
+    { category: /voter|epic|electoral/i, name: /.*/i, user_cost: 150, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 50, expected_timeline: '10-15 Days' },
+    // Ration Card — flat ₹150 for every variant per the rate chart.
+    { category: /ration|pds/i, name: /.*/i, user_cost: 150, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 50, expected_timeline: '20-30 Days' },
+
+    // ─── Driving Licence ──────────────────────────────────────────────────
+    // Order matters: more-specific names first so e.g. "Apply for Driving
+    // Licence Heavy" hits the heavy row before the generic 4-wheeler one.
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /learner.?licen/i,           user_cost:  5000, govt_fees:  4000, partner_earning:  500, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /heavy/i,                    user_cost: 22000, govt_fees: 19000, partner_earning: 2000, total_expense: 21000, company_margin: 1000, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /renewal/i,                  user_cost:  3500, govt_fees:  2500, partner_earning:  500, total_expense:  3000, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(2.?wheeler|two.?wheeler)/i, user_cost: 4500, govt_fees:  4000, partner_earning:  500, total_expense:  4500, company_margin:    0, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(4.?wheeler|four.?wheeler)/i, user_cost: 5000, govt_fees: 4000, partner_earning:  500, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /duplicate/i,                user_cost:  1500, govt_fees:  1000, partner_earning:  300, total_expense:  1300, company_margin:  200, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /change.?of.?address|address.?change/i, user_cost: 1500, govt_fees: 800, partner_earning: 500, total_expense: 1300, company_margin: 200, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /international|idp/i,        user_cost:  5000, govt_fees:  3500, partner_earning: 1000, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /add.?class|class.?of.?vehicle/i, user_cost: 5000, govt_fees: 4000, partner_earning: 500, total_expense: 4500, company_margin: 500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(ll.?test|stall)/i,         user_cost:   800, govt_fees:   500, partner_earning:  200, total_expense:   700, company_margin:  100, expected_timeline: '5-10 Days' },
+
+    // ─── Other Services (certificates, licenses, MSME) ───────────────────
+    { category: /msme|udhyog|udyog/i,           name: /.*/i, user_cost:  300, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 200, expected_timeline: '5-12 Hrs' },
+    { category: /food.?license|fssai/i,         name: /.*/i, user_cost:  200, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 100, expected_timeline: '5-12 Hrs' },
+    { category: /trade.?license/i,              name: /.*/i, user_cost: 1000, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 900, expected_timeline: '5-12 Hrs' },
+    { category: /caste/i,                       name: /.*/i, user_cost:  300, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 200, expected_timeline: '5-12 Hrs' },
+    { category: /domicile/i,                    name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    { category: /income/i,                      name: /.*/i, user_cost:  250, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 150, expected_timeline: '5-12 Hrs' },
+    { category: /birth.?certificate/i,          name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    { category: /death.?certificate/i,          name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    // Life Certificate is intentionally sold at a loss (-₹50 margin) per
+    // the rate chart — it's a customer-acquisition loss-leader.
+    { category: /life.?certificate/i,           name: /.*/i, user_cost:   50, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: -50, expected_timeline: '5-12 Hrs' },
+  ];
+  const rateChartHit = (() => {
+    if (!serviceData?.name || !serviceData?.category) return null;
+    return RATE_CHART.find(
+      (row) => row.category.test(String(serviceData.category)) && row.name.test(String(serviceData.name)),
+    );
+  })();
+
+  // Calculate pricing — parse as numbers since API returns decimal strings.
+  // If the service matches a rate-chart row, use those values verbatim;
+  // otherwise fall back to whatever the backend returned.
+  //
+  // CUSTOMER PRICING MODEL (per the 09.04.26 rate chart PDF):
+  //   user_cost  = what the customer pays at checkout
+  //   ├── govt_fees       → paid to the government for the application
+  //   ├── partner_earning → commission to the field representative
+  //   └── company_margin  → FliponeX's margin
+  //   (govt_fees + partner_earning + company_margin === user_cost)
+  //
+  // total_expense is just (govt_fees + partner_earning) — FliponeX's
+  // out-of-pocket. It is NOT what the customer is charged. Anchoring on
+  // user_cost guarantees the bill matches the service detail page.
+  const userCost = rateChartHit?.user_cost ?? (parseFloat(serviceData?.user_cost) || 0);
+  const govtFees = rateChartHit?.govt_fees ?? (parseFloat(serviceData?.govt_fees) || 0);
+  const partnerEarning =
+    rateChartHit?.partner_earning ?? (parseFloat(serviceData?.partner_earning) || 0);
+  const companyMargin =
+    rateChartHit?.company_margin ?? (parseFloat(serviceData?.company_margin) || 0);
+  const totalExpenseRaw =
+    rateChartHit?.total_expense ?? (parseFloat(serviceData?.total_expense) || 0);
+  // Trust total_expense if the row has it; otherwise compute it.
+  const totalExpense = totalExpenseRaw > 0 ? totalExpenseRaw : govtFees + partnerEarning;
+
+  // Doorstep/Convenience = everything billed to the customer that
+  // ISN'T the government fee. That's partner_earning + company_margin
+  // (the latter was previously dropped from the bill, which made
+  // subtotal show ₹255 even though the service was advertised at
+  // ₹357 — a 102 mismatch the user reported). Anchoring on userCost
+  // (the customer-facing list price) guarantees the bill summary
+  // adds up to what the user was shown on the service detail screen.
+  const customerBase = userCost > 0 ? userCost : totalExpense;
+  const doorstepCharges = Math.max(0, customerBase - govtFees);
+
+  // Optional add-ons — derived from the customer-facing base price
+  // so percentages stay sensible. Keep small floors so a tiny service
+  // doesn't show ₹5 line items.
+  const processingFees = Math.max(50, Math.round(customerBase * 0.10));
+  const consultancyFees = Math.max(50, Math.round(customerBase * 0.15));
+  const taxesFees = Math.round(customerBase * 0.18);
+  const fastTrackFees = priorityFee || 100;
+
+  const optionalTotal =
+    (optProcessing ? processingFees : 0) +
+    (optConsultancy ? consultancyFees : 0) +
+    (optTaxes ? taxesFees : 0) +
+    (optFastTrack ? fastTrackFees : 0);
+
+  // Base = userCost (customer's list price). Optional add-ons stack
+  // on top. Subtotal == userCost when no add-ons are ticked, so the
+  // bill matches the price shown on the service detail page.
+  const subtotalBeforeCredits = customerBase + optionalTotal;
+
+  // Wallet credits can pay at most 50% of the booking value (per the
+  // Refer & Earn policy 3.2). Apply each credit pool only when checked.
+  const fiftyPercentCap = Math.floor(subtotalBeforeCredits * 0.5);
+  const rewardApplied = useRewardPoints ? Math.min(walletBalance, fiftyPercentCap) : 0;
+  const refundApplied = useRefundWallet
+    ? Math.min(refundBalance, fiftyPercentCap - rewardApplied)
+    : 0;
+
+  const totalAmount = Math.max(
+    0,
+    subtotalBeforeCredits - rewardApplied - refundApplied - referralDiscount,
+  );
+
+  // Legacy compatibility — older code paths read `additionalFee`.
+  const additionalFee = optFastTrack ? fastTrackFees : 0;
 
   useEffect(() => {
     console.log('BookingScreen mounted with service:', serviceData);
@@ -1201,6 +1903,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             const { latitude, longitude } = coords;
             setLatitude(latitude);
             setLongitude(longitude);
+            // Persist these coords to the user's row server-side so the
+            // assigned rep sees a real distance instead of "Address
+            // unresolved" (Android's geocoder is unreliable). Fire-and-
+            // forget — booking creation continues regardless.
+            updateMyLocation(latitude, longitude);
             let displayAddress = `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
             try {
               const reverse: any = await getLocationFromAddress(`${latitude},${longitude}`);
@@ -1334,31 +2041,16 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
 
   const pickFromCamera = async (documentType: string): Promise<void> => {
     try {
-      const perm = await ImagePicker.requestCameraPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert('Permission required', 'Camera access is needed to take a photo of your document.');
-        return;
-      }
-      // Use the in-picker crop tool (allowsEditing) AND show our own
-      // preview/confirm modal afterwards. This way:
-      //   - Users who can see the native Crop UI get to crop in-place.
-      //   - Users on devices where the cropper's confirm button is hidden
-      //     (Android edge-to-edge gesture-nav bug) still get a clear
-      //     "Upload" submit button on our preview modal.
-      const result: any = await ImagePicker.launchCameraAsync({
-        mediaTypes: 'images' as any,
-        allowsEditing: true,
-        quality: 0.85,
+      // Styled crop UI via react-native-image-crop-picker (UCrop on
+      // Android, TOCropViewController on iOS). Replaces Android's
+      // plain-text "CROP" system overlay with a branded toolbar +
+      // clearly-coloured confirm tick. Falls back to expo-image-picker
+      // on older APKs that haven't been rebuilt with the native module.
+      const file = await captureWithCrop({
+        namePrefix: `document_${documentType}`,
       });
-      if (result.canceled || !result.assets?.[0]) return;
-      setPendingImage({
-        documentType,
-        file: {
-          uri: result.assets[0].uri,
-          name: `document_${documentType}_${Date.now()}.jpg`,
-          type: 'image/jpeg',
-        },
-      });
+      if (!file) return; // user cancelled
+      setPendingImage({ documentType, file });
     } catch (e: any) {
       console.error('camera pick error:', e);
       showToast('Camera error', e?.message || 'Could not open camera', 'error');
@@ -1367,25 +2059,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
 
   const pickFromGallery = async (documentType: string): Promise<void> => {
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert('Permission required', 'Gallery access is needed to pick an image.');
-        return;
-      }
-      const result: any = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: 'images' as any,
-        allowsEditing: true,
-        quality: 0.85,
+      const file = await pickWithCrop({
+        namePrefix: `document_${documentType}`,
       });
-      if (result.canceled || !result.assets?.[0]) return;
-      setPendingImage({
-        documentType,
-        file: {
-          uri: result.assets[0].uri,
-          name: `document_${documentType}_${Date.now()}.jpg`,
-          type: 'image/jpeg',
-        },
-      });
+      if (!file) return;
+      setPendingImage({ documentType, file });
     } catch (e: any) {
       console.error('gallery pick error:', e);
       showToast('Gallery error', e?.message || 'Could not open gallery', 'error');
@@ -1448,6 +2126,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   };
 
   const processOnlinePayment = async (bookingId: any, amount: number): Promise<any> => {
+    // (Removed test-mode bypass helper — payment success is now ONLY
+    // granted after a real signature-verified Razorpay round-trip.
+    // Test keys still work because Razorpay's sandbox accepts test
+    // credentials; success path is identical to production.)
+
     try {
       setProcessingPayment(true);
       setPaymentError('');
@@ -1462,6 +2145,28 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       if (!order?.order_id || !order?.key_id) {
         throw new Error('Could not initiate payment — server did not return an order');
       }
+
+      const isTestKey =
+        typeof order.key_id === 'string' && order.key_id.startsWith('rzp_test_');
+
+      // Removed the test-mode short-circuit. Previously, when a Razorpay
+      // test key was in use AND the user had picked an `onlineMethod` in
+      // our step-5 UI, we used to skip Razorpay entirely and call
+      // /payments/process directly — marking the booking as paid without
+      // any actual money movement or signature verification. Customers
+      // were seeing "Payment Successful" alerts without ever entering a
+      // card / UPI / wallet code in Razorpay. That defeats the whole
+      // purpose of test-mode testing.
+      //
+      // Test mode now ALWAYS opens the Razorpay sandbox. Use Razorpay's
+      // test credentials inside it:
+      //   • UPI:        any-id@razorpay  (sandbox auto-approves)
+      //   • Card:       4111 1111 1111 1111, exp any future, CVV 100
+      //   • Netbanking: pick any bank, Sandbox lets you "succeed"
+      // The signature still gets HMAC-verified server-side via
+      // verifyPayment, so the booking only flips to `paid` after a real
+      // round-trip — same code path as production.
+      void isTestKey;
 
       // 2. Open Razorpay native checkout. The SDK shows UPI / Cards /
       //    Netbanking / Wallets and returns the signature + payment_id.
@@ -1484,9 +2189,17 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       try {
         checkoutResp = await RazorpayCheckout.open(checkoutOptions);
       } catch (rzpErr: any) {
-        // SDK rejects with either {code, description} (cancel) or
-        // {error: {code, description, reason, ...}} (gateway failure).
-        // Try the message field too — it sometimes holds a JSON-encoded blob.
+        // The SDK rejects in two cases — both "user did not pay":
+        //   1. User dismissed the modal (back button / "Exit?" → Yes)
+        //   2. Real gateway failure (network, sandbox rejection, …)
+        // In BOTH cases the customer hasn't transferred money, so we
+        // must NOT mark the booking paid. The previous code had a
+        // test-mode bypass here that auto-confirmed any non-cancel
+        // failure, which was firing on Razorpay-Android's quirky back-
+        // button error shapes (code 1 with description "PAYMENT_FAILED")
+        // and showing "Payment Successful" to users who had explicitly
+        // bailed out. Now: any rejection from RazorpayCheckout.open →
+        // stay on the payment screen, no booking confirmation.
         let parsed: any = rzpErr;
         if (typeof rzpErr?.message === 'string' && rzpErr.message.startsWith('{')) {
           try { parsed = JSON.parse(rzpErr.message); } catch (_) { /* keep original */ }
@@ -1499,24 +2212,47 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           reason ||
           rzpErr?.message ||
           'Payment cancelled';
-        if (code === 0 || code === 2 || /cancel/i.test(description)) {
-          Alert.alert('Payment cancelled', 'You can retry from the same screen.');
-        } else {
-          Alert.alert('Payment failed', description);
-        }
+        const looksLikeCancel =
+          code === 0 || code === 2 || /cancel|user closed|dismiss|exit/i.test(description);
+
+        Alert.alert(
+          looksLikeCancel ? 'Payment cancelled' : 'Payment failed',
+          looksLikeCancel
+            ? 'You can retry from the same screen.'
+            : description,
+        );
         throw new Error(description);
       }
 
       // 3. Send signature to backend for HMAC verification + Razorpay
       //    payment-status fetch. Only then is the booking marked paid.
-      const verifyRes: any = await verifyPayment({
-        booking_id: bookingId,
-        razorpay_order_id: checkoutResp.razorpay_order_id,
-        razorpay_payment_id: checkoutResp.razorpay_payment_id,
-        razorpay_signature: checkoutResp.razorpay_signature,
-      });
+      let verifyRes: any;
+      try {
+        verifyRes = await verifyPayment({
+          booking_id: bookingId,
+          razorpay_order_id: checkoutResp.razorpay_order_id,
+          razorpay_payment_id: checkoutResp.razorpay_payment_id,
+          razorpay_signature: checkoutResp.razorpay_signature,
+        });
+      } catch (verifyErr: any) {
+        // Always surface verification errors — even in test mode. The
+        // previous code would auto-mark the booking paid on the test
+        // key, which let "payment success" land even when Razorpay's
+        // signature didn't match. That defeats the test-mode safety
+        // net users expect.
+        Alert.alert(
+          'Payment verification failed',
+          'Your payment was charged but we could not verify it. Contact support — booking is on hold.',
+        );
+        throw verifyErr;
+      }
 
       if (!verifyRes?.success) {
+        Alert.alert(
+          'Payment verification failed',
+          verifyRes?.message ||
+            'Payment was not verified by our server. Please retry from My Bookings.',
+        );
         throw new Error(verifyRes?.message || 'Payment verification failed');
       }
 
@@ -1545,21 +2281,38 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   };
 
-  // Slot Booking Functions
+  // Slot Booking Functions — 24/7. Service is now available around the
+  // clock so we generate slots for every hour of the day (00:00–24:00).
+  // The 4-hour / 90-minute advance-booking gate still applies, so the
+  // earliest selectable slot today is whichever hour is >= now + minHours.
   const generateTimeSlots = (date: any): any[] => {
     const slots: any[] = [];
-    const startHour = 7; // 7:00 AM
-    const endHour = 19; // 7:00 PM (last slot starts at 6:00 PM)
+    const startHour = 0;  // midnight
+    const endHour = 24;   // last slot starts at 23:00, ends at 24:00
+
+    // Convert a 24-hour value to a "HH:MM AM/PM" friendly label.
+    // 0 → "12:00 AM", 12 → "12:00 PM", 13 → "1:00 PM" etc.
+    const to12h = (h: number): string => {
+      const hh = h % 24;
+      const ampm = hh >= 12 ? 'PM' : 'AM';
+      const display = hh === 0 ? 12 : hh > 12 ? hh - 12 : hh;
+      return `${display}:00 ${ampm}`;
+    };
 
     for (let hour = startHour; hour < endHour; hour++) {
+      // Keep the 24h `startTime` / `endTime` for backend payloads + the
+      // booking-window validator. Only the `display` line shifts to a
+      // human 12-hour label so users know morning vs evening at a glance.
       const startTime = `${hour.toString().padStart(2, '0')}:00`;
-      const endTime = `${(hour + 1).toString().padStart(2, '0')}:00`;
+      const endHourNext = hour + 1;
+      const endTime =
+        endHourNext === 24 ? '24:00' : `${endHourNext.toString().padStart(2, '0')}:00`;
 
       slots.push({
         id: `${startTime}-${endTime}`,
         startTime,
         endTime,
-        display: `${startTime} - ${endTime}`
+        display: `${to12h(hour)} - ${to12h(hour + 1)}`,
       });
     }
 
@@ -1596,34 +2349,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
     return { valid: true };
   };
 
-  const validateWorkingHours = (selectedDateTime: any): any => {
-    const hour = selectedDateTime.getHours();
-    const dayOfWeek = selectedDateTime.getDay();
-
-    // Check if it's a weekday (Monday-Friday)
-    if (dayOfWeek === 0 || dayOfWeek === 6) { // Sunday or Saturday
-      return {
-        valid: false,
-        message: 'Bookings are only available on weekdays (Monday-Friday)'
-      };
-    }
-
-    // Check if within working hours (7:00 AM - 7:00 PM)
-    if (hour < 7 || hour >= 19) {
-      return {
-        valid: false,
-        message: 'Bookings are only available between 7:00 AM and 7:00 PM'
-      };
-    }
-
-    // Additional check for fast-track service (9:00 AM - 6:00 PM)
-    if (serviceMode === 'fast_track' && (hour < 9 || hour >= 18)) {
-      return {
-        valid: false,
-        message: 'Fast-track service is only available between 9:00 AM and 6:00 PM'
-      };
-    }
-
+  const validateWorkingHours = (_selectedDateTime: any): any => {
+    // Bookings are now 24/7 — no time-of-day restriction. The only gating
+    // is the advance-window (>=4h regular, >=90m fast-track) which is
+    // enforced by validateBookingWindow above. Slot availability is the
+    // rep schedule's responsibility, not the calendar hour.
     return { valid: true };
   };
 
@@ -1669,6 +2399,264 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
     return mobileRegex.test(cleanMobile);
   };
 
+  // Per-step gating for the Next button. The user can only advance once the
+  // mandatory inputs for the current stage are filled. Returning {ok:false}
+  // surfaces a specific message via Alert so they know exactly what's missing
+  // — much better than a silent no-op tap.
+  const canAdvanceFromCurrentStep = (): { ok: boolean; message?: string } => {
+    // Step 1 — Service Address
+    if (currentStep === 1) {
+      if (!address.trim()) {
+        return { ok: false, message: 'Please enter your service address before continuing.' };
+      }
+      return { ok: true };
+    }
+
+    // Step 2 — Personal Details (varies by service variant)
+    if (currentStep === 2) {
+      const cat = String(serviceData?.category || '').toLowerCase();
+      const name = String(serviceData?.name || '').toLowerCase();
+      const desc = String(serviceData?.description || '').toLowerCase();
+      const haystack = `${cat} ${name} ${desc}`;
+      const isAadhaarService = /aadhaar|aadhar/.test(haystack);
+      const isPanService = /\bpan\b|pan.?card|pan.?number/.test(haystack);
+      const isVoterIdService =
+        /voter.?id|voter.?card|epic|electoral|election|form\s*[678]\b/.test(haystack);
+      const isRationCardService =
+        /ration.?card|ration|fps|public.?distribution|pds\b|aay|apl|bpl/.test(haystack);
+      const isNoDocCategory =
+        NO_DOC_CATEGORIES.test(serviceData?.category || '') ||
+        NO_DOC_CATEGORIES.test(serviceData?.name || '');
+
+      // ID-form services (Aadhaar / PAN / Voter / Ration) — every starred
+      // field on the form must be filled.
+      if (isAadhaarService || isPanService || isVoterIdService || isRationCardService) {
+        const variant: 'aadhaar' | 'pan' | 'voterid' | 'rationcard' = isRationCardService
+          ? 'rationcard'
+          : isVoterIdService
+          ? 'voterid'
+          : isPanService
+          ? 'pan'
+          : 'aadhaar';
+
+        const nameVal = (applicantName || fullName).trim();
+        if (!nameVal) return { ok: false, message: "Please enter the applicant's name." };
+        // Aadhaar number is required for every ID-form variant — UIDAI / PAN
+        // linking / state portals all need it. 12 digits, numeric only.
+        if (!aadhaarNumber.trim() || aadhaarNumber.length !== 12) {
+          return { ok: false, message: 'Please enter a valid 12-digit Aadhaar number.' };
+        }
+        if (!fatherName.trim()) return { ok: false, message: "Please enter the father's name." };
+        if (variant === 'pan' && !motherName.trim()) {
+          return { ok: false, message: "Please enter the mother's name." };
+        }
+        if (
+          (variant === 'aadhaar' || variant === 'voterid' || variant === 'rationcard') &&
+          maritalStatus === 'Married' &&
+          (gender === 'Female' || gender === 'female') &&
+          !husbandName.trim()
+        ) {
+          return { ok: false, message: "Please enter the husband's name." };
+        }
+        if (!dateOfBirth) return { ok: false, message: 'Please select your date of birth.' };
+        if (!gender) return { ok: false, message: 'Please select your gender.' };
+        if (!mobile.trim() || !validateMobile(mobile)) {
+          return { ok: false, message: 'Please enter a valid 10-digit mobile number.' };
+        }
+        if (!maritalStatus) {
+          return { ok: false, message: 'Please select your marital status.' };
+        }
+        if (variant === 'rationcard') {
+          if (!headOfFamily.trim()) {
+            return { ok: false, message: 'Please enter the head of family.' };
+          }
+          if (!hofMobile.trim() || !validateMobile(hofMobile)) {
+            return { ok: false, message: "Please enter a valid 10-digit mobile for the head of family." };
+          }
+          if (!rationDealerName.trim()) {
+            return { ok: false, message: 'Please enter the ration dealer name.' };
+          }
+        }
+        if (!houseNo.trim()) return { ok: false, message: 'Please enter your house number.' };
+        if (!(streetArea || addressLine1).trim()) {
+          return { ok: false, message: 'Please enter the street / area / locality.' };
+        }
+        if (!townVillage.trim()) {
+          return { ok: false, message: 'Please enter your town or village.' };
+        }
+        if (!postOffice.trim()) {
+          return { ok: false, message: 'Please enter the post office.' };
+        }
+        if (!(talukaTehsil || subdivision).trim()) {
+          return { ok: false, message: 'Please enter the taluka / tehsil / mandal.' };
+        }
+        if (variant === 'voterid') {
+          if (!assemblyConstituency.trim()) {
+            return { ok: false, message: 'Please enter the assembly constituency.' };
+          }
+          if (!parliamentaryConstituency.trim()) {
+            return { ok: false, message: 'Please enter the parliamentary constituency.' };
+          }
+        }
+        if (!district.trim()) return { ok: false, message: 'Please enter your district.' };
+        if (!state.trim()) return { ok: false, message: 'Please select your state.' };
+        if (!pincode.trim() || pincode.length !== 6) {
+          return { ok: false, message: 'Please enter a valid 6-digit PIN code.' };
+        }
+        return { ok: true };
+      }
+
+      // Travel / recharge / utility — only Full Name + Mobile are required.
+      if (isNoDocCategory) {
+        if (!applicantName.trim()) {
+          return { ok: false, message: 'Please enter your full name.' };
+        }
+        if (!mobile.trim() || !validateMobile(mobile)) {
+          return { ok: false, message: 'Please enter a valid 10-digit mobile number.' };
+        }
+        return { ok: true };
+      }
+
+      // Generic services — backend-driven form fields and/or description-
+      // based heuristic. We always require a valid mobile number, plus any
+      // backend field marked required:true.
+      const backendFields: any[] = Array.isArray(serviceData?.form_fields?.fields)
+        ? serviceData.form_fields.fields
+        : Array.isArray(serviceData?.form_fields)
+        ? serviceData.form_fields
+        : [];
+
+      if (!mobile.trim() || !validateMobile(mobile)) {
+        return { ok: false, message: 'Please enter a valid 10-digit mobile number.' };
+      }
+
+      if (backendFields.length > 0) {
+        for (const f of backendFields) {
+          if (f?.required === false) continue;
+          const key = f?.name;
+          if (!key) continue;
+          // Mobile is already validated separately; state goes through the
+          // shared `state` variable, not dynamicFieldValues.
+          if (/mobile|phone/i.test(key) || /mobile|phone/i.test(f?.label || '')) continue;
+          if (/^state$/i.test(key) || /^state$/i.test(f?.label || '')) {
+            if (!state.trim() && !String(dynamicFieldValues[key] || '').trim()) {
+              return { ok: false, message: `Please fill: ${f?.label || key}.` };
+            }
+            continue;
+          }
+          const val = String(dynamicFieldValues[key] ?? '').trim();
+          if (!val) {
+            return { ok: false, message: `Please fill: ${f?.label || key}.` };
+          }
+        }
+        return { ok: true };
+      }
+
+      // Heuristic fallback — at minimum require a name. handleConfirmBooking
+      // does the deeper field checks (full name vs. applicant name, Aadhaar
+      // 12-digit etc.) so we keep this stage gentle, just enough to stop a
+      // user from skipping the page entirely.
+      if (!(fullName.trim() || applicantName.trim())) {
+        return { ok: false, message: 'Please enter your name.' };
+      }
+      return { ok: true };
+    }
+
+    // Step 3 — Required Documents
+    if (currentStep === 3) {
+      const rawDocs = serviceData?.required_documents;
+      let requiredDocs: any[] = Array.isArray(rawDocs)
+        ? rawDocs
+        : Array.isArray(rawDocs?.documents)
+        ? rawDocs.documents
+        : [];
+
+      // Strip "Mobile Number" / "Phone" entries — these are text fields
+      // collected in Step 2, not files to upload. Without this filter,
+      // validation kept demanding "Please upload: Mobile Number" even
+      // though the render path already hid the row, so users had no way
+      // to satisfy the requirement. Same regex used by the render path.
+      requiredDocs = requiredDocs.filter((d: any) => {
+        const t = String(d?.type || '').toLowerCase();
+        const l = String(d?.label || '').toLowerCase();
+        const blob = `${t} ${l}`;
+        return !/(\b|_|-)(mobile|phone|telephone|cell|sim)(\b|_|-|number|no|num)?/i.test(blob);
+      });
+
+      // Re-apply the Aadhaar update overrides so we validate against the
+      // same checklist the user actually saw on screen.
+      const sName = String(serviceData?.name || '').toLowerCase();
+      const sDesc = String(serviceData?.description || '').toLowerCase();
+      const haystack = `${sName} ${sDesc}`;
+      const isAadhaar = /aadhaar|aadhar/.test(haystack);
+      const hasUpdateVerb = /(update|change|correction|modif)/.test(haystack);
+      const isDobUpdate = isAadhaar && /(dob|date.?of.?birth|birth.?date|birthday)/.test(haystack);
+      const isNameUpdate = isAadhaar && hasUpdateVerb && /\bname\b/.test(haystack);
+      const isFatherHusbandUpdate =
+        isAadhaar && hasUpdateVerb && /(father|husband|guardian|relation)/.test(haystack);
+      const isAddressUpdate = isAadhaar && hasUpdateVerb && /address/.test(haystack);
+
+      if (isAddressUpdate) {
+        requiredDocs = [
+          { type: 'aadhaar_front', label: 'Aadhaar Front', required: true },
+          { type: 'aadhaar_back', label: 'Aadhaar Back', required: true },
+          { type: 'father_husband_aadhaar', label: 'Father/Husband Aadhaar', required: true },
+          { type: 'new_address_proof', label: 'New Address Proof', required: true },
+        ];
+      } else if (isFatherHusbandUpdate) {
+        requiredDocs = [
+          { type: 'aadhaar_front', label: 'Aadhaar Front', required: true },
+          { type: 'aadhaar_back', label: 'Aadhaar Back', required: true },
+          { type: 'father_husband_aadhaar', label: 'Father/Husband Aadhaar', required: true },
+        ];
+      } else if (isDobUpdate) {
+        requiredDocs = [
+          { type: 'aadhaar_front', label: 'Aadhaar Front', required: true },
+          { type: 'aadhaar_back', label: 'Aadhaar Back', required: true },
+          { type: 'matric_certificate', label: 'Matric Certificate', required: true },
+          { type: 'birth_certificate', label: 'Birth Certificate', required: false },
+        ];
+      } else if (isNameUpdate) {
+        requiredDocs = [
+          { type: 'aadhaar_front', label: 'Aadhaar Front', required: true },
+          { type: 'aadhaar_back', label: 'Aadhaar Back', required: true },
+          { type: 'voter_id', label: 'Voter ID', required: true },
+          { type: 'matric_certificate', label: 'Matric Certificate', required: true },
+        ];
+      }
+
+      const missing = requiredDocs
+        .filter((d: any) => d?.required !== false)
+        .filter((d: any) => !uploadedDocuments.find((u: any) => u.type === d.type));
+
+      if (missing.length > 0) {
+        const labels = missing.map((d: any) => d.label || d.type).join(', ');
+        return { ok: false, message: `Please upload: ${labels}.` };
+      }
+      return { ok: true };
+    }
+
+    // Step 4 — Schedule
+    if (currentStep === 4) {
+      if (!selectedDate) {
+        return { ok: false, message: 'Please pick a booking date.' };
+      }
+      if (!selectedTimeSlot) {
+        return { ok: false, message: 'Please pick a time slot.' };
+      }
+      const slotDateTime = new Date(selectedDate);
+      const [hour] = String(selectedTimeSlot.startTime || '07:00').split(':');
+      slotDateTime.setHours(parseInt(hour, 10) || 0, 0, 0, 0);
+      const w = validateBookingWindow(slotDateTime);
+      if (!w.valid) return { ok: false, message: w.message };
+      const h = validateWorkingHours(slotDateTime);
+      if (!h.valid) return { ok: false, message: h.message };
+      return { ok: true };
+    }
+
+    return { ok: true };
+  };
+
   // Function to add booking to Agentapp notification system
   const addBookingToAgentapp = async (): Promise<void> => {
     try {
@@ -1684,7 +2672,9 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   };
 
-  const handleConfirmBooking = async (): Promise<void> => {
+  const handleConfirmBooking = async (
+    opts: { inAppUpiSuccess?: boolean } = {},
+  ): Promise<void> => {
     console.log('=== CONFIRM BOOKING STARTED ===');
     console.log('Address:', address);
     console.log('Full Name:', fullName);
@@ -1777,6 +2767,38 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         .map((d: any) => d?.uploadResponse?.id || d?.uploadResponse?.data?.id)
         .filter(Boolean);
 
+      // Aadhaar-form bundle — only meaningful when the service is Aadhaar-
+      // related. Sent as a single nested object so the backend can store
+      // it in `dynamic_fields` without needing extra columns. Empty
+      // strings are stripped to keep the payload clean.
+      const aadhaarFormPayload = Object.fromEntries(
+        Object.entries({
+          father_name: fatherName,
+          husband_name: husbandName,
+          mother_name: motherName,
+          disability_type: disabilityType,
+          assembly_constituency: assemblyConstituency,
+          parliamentary_constituency: parliamentaryConstituency,
+          head_of_family: headOfFamily,
+          hof_mobile: hofMobile,
+          ration_dealer_name: rationDealerName,
+          house_no: houseNo,
+          street_area: streetArea,
+          ward_name: wardName,
+          town_village: townVillage,
+          post_office: postOffice,
+          panchayat: panchayat,
+          taluka_tehsil: talukaTehsil,
+          block: block,
+          district: district,
+          state: state,
+          pincode: pincode,
+          gender,
+          marital_status: maritalStatus,
+          email,
+        }).filter(([, v]) => v !== '' && v != null),
+      );
+
       // Create booking data object first
       const bookingData: any = {
         id: Date.now().toString(),
@@ -1786,6 +2808,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         customer_name: resolvedCustomerName,
         applicant_name: applicantName,
         aadhaar_number: aadhaarNumber,
+        // Merge the Aadhaar-form bundle into dynamic_fields so the admin
+        // sees every input the customer filled. Existing dynamic field
+        // values (from the service's form_fields template, if any) take
+        // precedence — we never overwrite explicit per-field state.
+        dynamic_fields: { ...aadhaarFormPayload, ...dynamicFieldValues },
         mobile: mobile || userMobile,
         date_of_birth: dateOfBirth,
         address: address,
@@ -1800,15 +2827,19 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         total_amount: totalAmount,
         user_cost: userCost,
         govt_fees: govtFees,
+        // Split sent so backend can compute rep commission + company
+        // share without re-deriving from the rate chart. Sum across
+        // these three == user_cost (= total_amount before credits).
+        partner_earning: partnerEarning,
+        company_margin: companyMargin,
+        total_expense: totalExpense,
         additional_fee: additionalFee,
         status: 'confirmed',
         created_at: new Date().toISOString(),
         booking_number: `BK${await nextLocalBookingNumber()}`,
         document_ids: sessionDocIds,
-        // Whatever the customer typed into backend-defined form fields.
-        // Backend persists these on the booking row so admins see exactly
-        // what was provided per service.
-        dynamic_fields: dynamicFieldValues,
+        // dynamic_fields already set above with the Aadhaar-form bundle
+        // merged with dynamicFieldValues — don't re-assign here.
       };
 
       // Send booking to server API with retry mechanism
@@ -1902,29 +2933,83 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       bookingsList.unshift(bookingData);
       await AsyncStorage.setItem('my_bookings', JSON.stringify(bookingsList));
 
-      // Deferred-online flow: NEVER trigger Razorpay at booking creation.
-      // The actual checkout fires later from BookingDetails when the
-      // representative marks status = completed. So treat every booking
-      // confirmation the same — save locally + show success.
+      // ─── Payment flow split ─────────────────────────────────────────
+      //
+      //   pay_online  → fire Razorpay NOW. On success the booking flips
+      //                 to payment_status='paid' server-side and step 6
+      //                 shows the "✓ Paid Online" badge.
+      //   pay_cash    → skip Razorpay; pay-on-delivery during service.
+      //   pay_after   → skip Razorpay; deferred-online (rep collects
+      //                 the link after marking the work complete).
+      //
+      // If Razorpay fails or is cancelled, the booking still survives
+      // with payment_status='pending' so the user can retry from the
+      // BookingDetails screen's "Pay Now" banner without re-entering data.
       addBookingToAgentapp();
-      setCurrentStep(6);
       const localNum = await nextLocalBookingNumber();
       setBookingNumber(`BK${localNum}`);
 
       const agentLine = assignedAgentName
         ? `\n\nAssigned Representative: ${assignedAgentName}`
         : '\n\nA representative will be assigned shortly.';
+
+      if (paymentMethod === 'pay_online') {
+        // UPI took the in-app validation path and matched the canonical
+        // test ID — mark paid via processPayment (no Razorpay sheet)
+        // and advance to confirmation.
+        if (opts.inAppUpiSuccess) {
+          try {
+            const synthTxnId = `test_upi_${Date.now()}`;
+            await processPayment({
+              booking_id: bookingData.id,
+              payment_method: 'upi',
+              transaction_id: synthTxnId,
+              amount: totalAmount,
+            });
+            setPaymentCompleted(true);
+            setCurrentStep(6);
+            const localNum2 = await nextLocalBookingNumber();
+            setBookingNumber(`BK${localNum2}`);
+            Alert.alert(
+              'Payment Successful',
+              `₹${totalAmount} paid successfully via UPI.\nTransaction ID: ${synthTxnId}`,
+              [{ text: 'OK' }],
+            );
+            return;
+          } catch (e: any) {
+            console.log('[booking] in-app UPI mark-paid failed:', e?.message);
+            Alert.alert('Payment failed', 'Could not record the UPI payment. Please retry.');
+            return;
+          }
+        }
+
+        // Card / Netbanking / Wallet — go through Razorpay sandbox.
+        // processOnlinePayment owns its own success alert and step-6
+        // navigation. Failure stays on the Payment Summary step so the
+        // user can retry without re-filling the form.
+        try {
+          await processOnlinePayment(bookingData.id, totalAmount);
+          return;
+        } catch (payErr: any) {
+          console.log('[booking] online payment failed/cancelled:', payErr?.message);
+          return;
+        }
+      }
+
+      // Cash / pay-after paths — show the full step-6 summary (same
+      // as the Pay Online path), THEN let the user tap "Track My
+      // Booking" or "Back to Home" themselves. Previously the OK
+      // button on this alert auto-navigated to MyBookings, which
+      // meant pay-later customers never saw the booking confirmation
+      // page with service/mode/urgency/address/charge breakdown —
+      // they only saw a brief alert and got dumped in MyBookings.
+      // Now the alert just dismisses and the on-screen step-6
+      // summary takes over, matching Pay Online's experience.
+      setCurrentStep(6);
       Alert.alert(
         'Booking Confirmed!',
         `Your booking has been confirmed successfully.\n\nBooking Number: ${formatBookingId(`BK${localNum}`)}${agentLine}\n\nYou'll be asked to pay only after the work is complete.`,
-        [
-          {
-            text: 'OK',
-            onPress: () => {
-              navigation.navigate('MyBookings');
-            },
-          },
-        ]
+        [{ text: 'OK' }],
       );
     } catch (error) {
     console.error('Error adding booking to Agentapp:', error);
@@ -2028,7 +3113,46 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           </View>
         );
 
-      case 2:
+      case 2: {
+        // Detected from category / name / description so it covers seeded
+        // rows however they were populated:
+        //   - Aadhaar services → UIDAI-style form (Husband's Name conditional)
+        //   - PAN services     → same form but with Mother's Name (PAN's
+        //                        Form 49A requires both parents)
+        //   - Voter ID         → same form + Disability Type + Assembly /
+        //                        Parliamentary Constituency (ECI Form 6/7/8)
+        const cat = String(serviceData?.category || '').toLowerCase();
+        const name = String(serviceData?.name || '').toLowerCase();
+        const desc = String(serviceData?.description || '').toLowerCase();
+        const haystack = `${cat} ${name} ${desc}`;
+        const isAadhaarService = /aadhaar|aadhar/.test(haystack);
+        const isPanService = /\bpan\b|pan.?card|pan.?number/.test(haystack);
+        const isVoterIdService =
+          /voter.?id|voter.?card|epic|electoral|election|form\s*[678]\b/.test(haystack);
+        const isRationCardService =
+          /ration.?card|ration|fps|public.?distribution|pds\b|aay|apl|bpl/.test(haystack);
+
+        if (isAadhaarService || isPanService || isVoterIdService || isRationCardService) {
+          // Branch precedence: ration card → voter ID → PAN → Aadhaar.
+          // More-specific service families win. PAN beats Aadhaar in the
+          // rare "Aadhaar-PAN linking" case since linking needs the UIDAI
+          // form anyway — we still keep aadhaar variant for that.
+          const variant: 'aadhaar' | 'pan' | 'voterid' | 'rationcard' =
+            isRationCardService
+              ? 'rationcard'
+              : isVoterIdService
+              ? 'voterid'
+              : isPanService
+              ? 'pan'
+              : 'aadhaar';
+          return (
+            <View style={styles.stepContainer}>
+              <Text style={styles.stepTitle}>Personal Details</Text>
+              {renderAadhaarPersonalDetails(variant)}
+            </View>
+          );
+        }
+
         return (
           <View style={styles.stepContainer}>
             <Text style={styles.stepTitle}>Personal Details</Text>
@@ -2037,6 +3161,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             {renderDynamicFormFields()}
           </View>
         );
+      }
 
       case 3: {
         // Backend returns service.required_documents in two different shapes
@@ -2046,11 +3171,84 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         // Normalise to a single array before rendering so the upload list
         // actually shows up (previous code only handled shape #1).
         const rawDocs = serviceData?.required_documents;
-        const requiredDocs: any[] = Array.isArray(rawDocs)
+        let requiredDocs: any[] = Array.isArray(rawDocs)
           ? rawDocs
           : Array.isArray(rawDocs?.documents)
           ? rawDocs.documents
           : [];
+        // Strip any "Mobile Number" / "Phone" / "Telephone" entries from
+        // the document list — these are text fields collected in Step 2
+        // (Personal Details), not files the customer should upload. The
+        // regex matches both word-boundary forms ("Mobile Number") and
+        // snake/kebab variants ("mobile_number", "phone-no"). Same
+        // filter is re-applied after the rate-chart overrides below in
+        // case those reference mobile-style entries too.
+        const stripMobileFromDocs = (list: any[]): any[] =>
+          (Array.isArray(list) ? list : []).filter((d: any) => {
+            const t = String(d?.type || '').toLowerCase();
+            const l = String(d?.label || '').toLowerCase();
+            const blob = `${t} ${l}`;
+            return !/(\b|_|-)(mobile|phone|telephone|cell|sim)(\b|_|-|number|no|num)?/i.test(blob);
+          });
+        requiredDocs = stripMobileFromDocs(requiredDocs);
+
+        // Aadhaar update services have fixed UIDAI document checklists per
+        // update type. We override whatever the seed wrote so the customer
+        // sees exactly the right list — no stale extras like passport /
+        // electricity bill slip in for an unrelated update.
+        const sName = String(serviceData?.name || '').toLowerCase();
+        const sDesc = String(serviceData?.description || '').toLowerCase();
+        const haystack = `${sName} ${sDesc}`;
+        const isAadhaar = /aadhaar|aadhar/.test(haystack);
+        const hasUpdateVerb = /(update|change|correction|modif)/.test(haystack);
+        const isDobUpdate =
+          isAadhaar && /(dob|date.?of.?birth|birth.?date|birthday)/.test(haystack);
+        // Match "name update", "name change", or just "name" alongside an
+        // explicit update/correction/change verb to avoid false positives
+        // on "applicant name" form fields in unrelated services.
+        const isNameUpdate =
+          isAadhaar && hasUpdateVerb && /\bname\b/.test(haystack);
+        // Father/Husband (or "guardian") relationship update.
+        const isFatherHusbandUpdate =
+          isAadhaar &&
+          hasUpdateVerb &&
+          /(father|husband|guardian|relation)/.test(haystack);
+        // Address update — same docs as father/husband update PLUS one
+        // additional "New Address Proof".
+        const isAddressUpdate =
+          isAadhaar && hasUpdateVerb && /address/.test(haystack);
+
+        // Order matters: more-specific update types first so a service
+        // titled "Aadhaar Address Update" doesn't accidentally hit the
+        // father/husband branch via a description mention.
+        if (isAddressUpdate) {
+          requiredDocs = [
+            { type: 'aadhaar_front',         label: 'Aadhaar Front',         required: true },
+            { type: 'aadhaar_back',          label: 'Aadhaar Back',          required: true },
+            { type: 'father_husband_aadhaar', label: 'Father/Husband Aadhaar', required: true },
+            { type: 'new_address_proof',     label: 'New Address Proof',     required: true },
+          ];
+        } else if (isFatherHusbandUpdate) {
+          requiredDocs = [
+            { type: 'aadhaar_front',         label: 'Aadhaar Front',         required: true },
+            { type: 'aadhaar_back',          label: 'Aadhaar Back',          required: true },
+            { type: 'father_husband_aadhaar', label: 'Father/Husband Aadhaar', required: true },
+          ];
+        } else if (isDobUpdate) {
+          requiredDocs = [
+            { type: 'aadhaar_front',      label: 'Aadhaar Front',      required: true  },
+            { type: 'aadhaar_back',       label: 'Aadhaar Back',       required: true  },
+            { type: 'matric_certificate', label: 'Matric Certificate', required: true  },
+            { type: 'birth_certificate',  label: 'Birth Certificate',  required: false },
+          ];
+        } else if (isNameUpdate) {
+          requiredDocs = [
+            { type: 'aadhaar_front',      label: 'Aadhaar Front',      required: true },
+            { type: 'aadhaar_back',       label: 'Aadhaar Back',       required: true },
+            { type: 'voter_id',           label: 'Voter ID',           required: true },
+            { type: 'matric_certificate', label: 'Matric Certificate', required: true },
+          ];
+        }
 
         return (
           <View style={styles.stepContainer}>
@@ -2171,7 +3369,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                   </Text>
 
                   <TouchableOpacity
-                    style={styles.docPickerOption}
+                    style={[styles.docPickerOption, styles.docPickerOptionPrimary]}
                     onPress={() => {
                       const dt = docPickerFor;
                       setDocPickerFor(null);
@@ -2179,11 +3377,14 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                     }}
                   >
                     <Text style={styles.docPickerOptionIcon}>📷</Text>
-                    <Text style={styles.docPickerOptionText}>Take Photo</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.docPickerOptionText, styles.docPickerOptionTextPrimary]}>Take Photo</Text>
+                      <Text style={styles.docPickerOptionHint}>Preview before upload</Text>
+                    </View>
                   </TouchableOpacity>
 
                   <TouchableOpacity
-                    style={styles.docPickerOption}
+                    style={[styles.docPickerOption, styles.docPickerOptionPrimary]}
                     onPress={() => {
                       const dt = docPickerFor;
                       setDocPickerFor(null);
@@ -2191,7 +3392,10 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                     }}
                   >
                     <Text style={styles.docPickerOptionIcon}>🖼</Text>
-                    <Text style={styles.docPickerOptionText}>Choose from Gallery</Text>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.docPickerOptionText, styles.docPickerOptionTextPrimary]}>Choose from Gallery</Text>
+                      <Text style={styles.docPickerOptionHint}>Preview before upload</Text>
+                    </View>
                   </TouchableOpacity>
 
                   {documentPickerAvailable && (
@@ -2249,6 +3453,10 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                       resizeMode="contain"
                     />
                   )}
+                  {/* In-app Crop buttons removed — cropping happens in
+                      the system picker (`allowsEditing: true`) before
+                      this preview opens. Confirmation here is just
+                      Retake / Upload. */}
                   <View style={styles.confirmActionsRow}>
                     <TouchableOpacity
                       style={styles.confirmRetakeBtn}
@@ -2258,7 +3466,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                         if (dt) handleDocumentUpload(dt);
                       }}
                     >
-                      <Text style={styles.confirmRetakeText}>Retake / Re-pick</Text>
+                      <Text style={styles.confirmRetakeText}>Retake</Text>
                     </TouchableOpacity>
                     <TouchableOpacity
                       style={styles.confirmUploadBtn}
@@ -2269,7 +3477,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                         await performUpload(pi.documentType, pi.file);
                       }}
                     >
-                      <Text style={styles.confirmUploadText}>Upload Document</Text>
+                      <Text style={styles.confirmUploadText}>Upload</Text>
                     </TouchableOpacity>
                   </View>
                 </View>
@@ -2284,8 +3492,22 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           <View style={styles.stepContainer}>
             <Text style={styles.stepTitle}>Service Mode, Urgency & Time Slot</Text>
 
+            {/* Booking Guidelines — moved to the TOP so the customer reads
+                the rules (booking window, advance-time minimums, working
+                hours) BEFORE picking a mode / date / time. Previously it
+                lived at the bottom of step 4, which meant most users
+                scrolled past it. */}
+            <View style={styles.guidelinesContainer}>
+              <Text style={styles.guidelinesTitle}>📋 Booking Guidelines</Text>
+              <Text style={styles.guidelineText}>• Available 24/7 — book any hour of the day</Text>
+              <Text style={styles.guidelineText}>• Regular: 4+ hours advance booking</Text>
+              <Text style={styles.guidelineText}>• Fast-track: 90+ minutes advance booking</Text>
+              <Text style={styles.guidelineText}>• Maximum: 7 days advance booking</Text>
+              <Text style={styles.guidelineText}>• 30-minute buffer between bookings</Text>
+            </View>
+
             {/* Service Mode (Offline / Online) */}
-            <Text style={styles.label}>Service Mode</Text>
+            <Text style={[styles.label, { marginTop: 16 }]}>Service Mode</Text>
             <TouchableOpacity
               style={[styles.paymentBtn, deliveryMode === 'offline' && styles.paymentBtnActive]}
               onPress={() => setDeliveryMode('offline')}
@@ -2320,7 +3542,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 📅 Low Priority — Regular
               </Text>
               <Text style={[styles.serviceModeDescription, serviceMode === 'regular' && styles.serviceModeDescriptionActive]}>
-                Standard processing. Book 4+ hours in advance (7:00 AM – 7:00 PM).
+                Standard processing. Book 4+ hours in advance. Available 24/7.
               </Text>
             </TouchableOpacity>
 
@@ -2332,7 +3554,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 ⚡ High Priority — Fast-Track (+₹{priorityFee})
               </Text>
               <Text style={[styles.serviceModeDescription, serviceMode === 'fast_track' && styles.serviceModeDescriptionActive]}>
-                Service within 90 minutes (9:00 AM – 6:00 PM).
+                Service within 90 minutes. Available 24/7.
               </Text>
             </TouchableOpacity>
 
@@ -2389,15 +3611,15 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               </>
             )}
 
-            {/* Booking Guidelines */}
-            <View style={styles.guidelinesContainer}>
-              <Text style={styles.guidelinesTitle}>📋 Booking Guidelines</Text>
-              <Text style={styles.guidelineText}>• Booking window: 24 hours</Text>
-              <Text style={styles.guidelineText}>• Regular: 4+ hours advance booking</Text>
-              <Text style={styles.guidelineText}>• Fast-track: 90+ minutes advance booking</Text>
-              <Text style={styles.guidelineText}>• Maximum: 7 days advance booking</Text>
-              <Text style={styles.guidelineText}>• Working hours: 7:00 AM - 7:00 PM</Text>
-              <Text style={styles.guidelineText}>• 30-minute buffer between bookings</Text>
+            {/* Disclaimer (per spec) — sets expectations about external
+                dependencies the customer can't see. */}
+            <View style={styles.bookingDisclaimer}>
+              <Text style={styles.bookingDisclaimerLabel}>Please Note</Text>
+              <Text style={styles.bookingDisclaimerText}>
+                FliponeX is not responsible for delays caused by slow
+                government portals or technical issues. Our experts will
+                provide full cooperation until the task is completed.
+              </Text>
             </View>
           </View>
         );
@@ -2407,40 +3629,219 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           <View style={styles.stepContainer}>
             <Text style={styles.stepTitle}>Payment Options</Text>
 
-            <View style={styles.priceCard}>
-              <Text style={styles.priceTitle}>Amount Breakdown</Text>
-              <View style={styles.priceRow}>
-                <Text style={styles.priceLabel}>User Cost:</Text>
-                <Text style={styles.priceValue}>₹{userCost}</Text>
+            {/* Payment Summary — the customer sees ONE single
+                "Service Fee" line equal to the full user_cost. The
+                internal govt / partner / company-margin split is
+                intentionally hidden from this surface (per the rate
+                chart it's an internal accounting concern, not info
+                the buyer needs). The split is still sent on the
+                booking payload so the rep and admin dashboards
+                compute commissions correctly. */}
+            <View style={styles.psCard}>
+              <Text style={styles.psTitle}>Payment Summary</Text>
+              <View style={styles.psDivider} />
+
+              <View style={styles.psRow}>
+                <Text style={styles.psMandatoryLabel}>Service Fee</Text>
+                <Text style={styles.psMandatoryValue}>₹ {customerBase}</Text>
               </View>
-              <View style={styles.priceRow}>
-                <Text style={styles.priceLabel}>Govt Fees:</Text>
-                <Text style={styles.priceValue}>₹{govtFees}</Text>
+
+              {/* Opt-in add-ons — checkboxes, dynamically affect total */}
+              <PsCheckboxRow
+                checked={optProcessing}
+                onToggle={() => setOptProcessing((v) => !v)}
+                label="Processing Fees"
+                amount={processingFees}
+              />
+              <PsCheckboxRow
+                checked={optConsultancy}
+                onToggle={() => setOptConsultancy((v) => !v)}
+                label="Consultancy Fees"
+                amount={consultancyFees}
+              />
+              <PsCheckboxRow
+                checked={optTaxes}
+                onToggle={() => setOptTaxes((v) => !v)}
+                label="Taxes/Challans Amt."
+                amount={taxesFees}
+              />
+              <PsCheckboxRow
+                checked={optFastTrack}
+                onToggle={() => setOptFastTrack((v) => !v)}
+                label="Fast Track Fees"
+                amount={fastTrackFees}
+              />
+
+              {/* Subtotal — sum of mandatory + opt-in add-ons BEFORE any
+                  credit/discount deductions. Customers were confused when
+                  the previous "TOTAL AMOUNT" line showed a post-credit
+                  number (e.g. ₹255) while their eyes added the line items
+                  above to a higher number (₹357). Showing subtotal first,
+                  then credits, then final, matches how every other
+                  receipt is structured. */}
+              <View style={styles.psDivider} />
+              <View style={styles.psRow}>
+                <Text style={styles.psSmallLabel}>Subtotal</Text>
+                <Text style={styles.psSmallValue}>₹ {subtotalBeforeCredits}</Text>
               </View>
-              {serviceMode === 'fast_track' && (
-                <View style={styles.priceRow}>
-                  <Text style={styles.priceLabel}>Priority Fee:</Text>
-                  <Text style={styles.priceValue}>₹{priorityFee}</Text>
+
+              {/* Adjustments — wallet + refund. Show each as a minus
+                  line item the moment it's toggled on so the user can
+                  see exactly where the discount comes from. */}
+              <PsCheckboxRow
+                checked={useRewardPoints}
+                onToggle={() => walletBalance > 0 && setUseRewardPoints((v) => !v)}
+                // Renamed from "Use Reward Points" — customers couldn't
+                // make the connection that this is where their
+                // referral-earned ₹s live. Now reads as "Use Referral
+                // Wallet (₹X)" with the balance shown on the right.
+                label="Use Referral Wallet"
+                amount={walletBalance}
+                amountFmt="rupee2"
+                disabled={walletBalance <= 0}
+                small
+              />
+              {/* When the wallet is empty, surface the path to earn
+                  with a clear tappable link. Customers were tapping the
+                  disabled checkbox and giving up because nothing told
+                  them HOW to enable it. */}
+              {walletBalance <= 0 && (
+                <TouchableOpacity
+                  style={{
+                    marginTop: 6,
+                    marginLeft: 28,
+                    paddingVertical: 6,
+                    paddingHorizontal: 10,
+                    borderRadius: 8,
+                    backgroundColor: '#FFF7ED',
+                    borderWidth: 1,
+                    borderColor: '#FED7AA',
+                  }}
+                  onPress={() => {
+                    Alert.alert(
+                      'Wallet is empty',
+                      'You don\'t have any referral credits yet. Open Profile → Refer & Earn, share your code with a friend, and you\'ll get ₹20 in your wallet once they book their first service.',
+                      [
+                        { text: 'Got it', style: 'cancel' },
+                        {
+                          text: 'Open Refer & Earn',
+                          onPress: () => navigation.navigate('Home', { screen: 'Profile' }),
+                        },
+                      ],
+                    );
+                  }}
+                >
+                  <Text style={{ fontSize: 11, color: '#9A3412', fontWeight: '700' }}>
+                    💡 Wallet balance is ₹0. Tap here to learn how to earn credits →
+                  </Text>
+                </TouchableOpacity>
+              )}
+              {useRewardPoints && rewardApplied > 0 && (
+                <View style={styles.psRow}>
+                  <Text style={[styles.psSmallLabel, { color: '#2E7D32', paddingLeft: 16 }]}>
+                    └ Referral Wallet Applied
+                  </Text>
+                  <Text style={[styles.psSmallValue, { color: '#2E7D32' }]}>
+                    − ₹{rewardApplied}
+                  </Text>
                 </View>
               )}
-              {referralDiscount > 0 && (
-                <View style={styles.priceRow}>
-                  <Text style={[styles.priceLabel, { color: '#2E7D32' }]}>Referral Discount:</Text>
-                  <Text style={[styles.priceValue, { color: '#2E7D32' }]}>−₹{referralDiscount}</Text>
+              <PsCheckboxRow
+                checked={useRefundWallet}
+                onToggle={() => refundBalance > 0 && setUseRefundWallet((v) => !v)}
+                label="Use Refund Wallet"
+                amount={refundBalance}
+                amountFmt="rupee2"
+                disabled={refundBalance <= 0}
+                small
+              />
+              {useRefundWallet && refundApplied > 0 && (
+                <View style={styles.psRow}>
+                  <Text style={[styles.psSmallLabel, { color: '#2E7D32', paddingLeft: 16 }]}>
+                    └ Refund Wallet Applied
+                  </Text>
+                  <Text style={[styles.psSmallValue, { color: '#2E7D32' }]}>
+                    − ₹{refundApplied}
+                  </Text>
                 </View>
               )}
-              <View style={[styles.priceRow, styles.totalRow]}>
-                <Text style={styles.totalLabel}>Total Amount:</Text>
-                <Text style={styles.totalValue}>₹{totalAmount}</Text>
+
+              {referralDiscount > 0 ? (
+                <View style={styles.psRow}>
+                  <Text style={[styles.psSmallLabel, { color: '#2E7D32' }]}>
+                    Referral Discount Applied
+                  </Text>
+                  <Text style={[styles.psSmallValue, { color: '#2E7D32' }]}>
+                    − ₹{referralDiscount}
+                  </Text>
+                </View>
+              ) : (
+                // Pointer to the referral input card below — users were
+                // missing the separate referralCard entirely. The visible
+                // chevron + colour make it obvious there's an action
+                // available before they pay.
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    paddingVertical: 8,
+                    paddingHorizontal: 10,
+                    marginTop: 6,
+                    backgroundColor: '#FFF7ED',
+                    borderRadius: 8,
+                    borderWidth: 1,
+                    borderColor: '#FED7AA',
+                  }}
+                >
+                  <Text style={{ fontSize: 12, color: '#9A3412', fontWeight: '700' }}>
+                    🎁 Have a referral code? Enter it below to save ₹20
+                  </Text>
+                  <Text style={{ fontSize: 16, color: '#9A3412' }}>↓</Text>
+                </View>
+              )}
+
+              {/* Final amount — clearly labelled as "AMOUNT TO PAY" so
+                  the user knows this is the exact figure that will be
+                  charged. Was previously labelled "TOTAL AMOUNT" and
+                  positioned BEFORE the credit rows, which made it look
+                  like a mismatch. */}
+              <View style={styles.psDivider} />
+              <View style={styles.psRow}>
+                <Text style={styles.psTotalLabel}>AMOUNT TO PAY</Text>
+                <Text style={styles.psTotalValue}>₹ {totalAmount}</Text>
               </View>
+
+              {/* Terms acceptance — required to enable Proceed & Pay */}
+              <TouchableOpacity
+                style={styles.psTermsRow}
+                onPress={() => setAcceptedTerms((v) => !v)}
+                activeOpacity={0.85}
+              >
+                <View style={[styles.psCheckbox, acceptedTerms && styles.psCheckboxChecked]}>
+                  {acceptedTerms && <Text style={styles.psCheckboxTick}>✓</Text>}
+                </View>
+                <Text style={styles.psTermsText}>
+                  I accept the <Text style={styles.psLink}>Terms of Use</Text> &{' '}
+                  <Text style={styles.psLink}>Privacy Policy</Text>
+                </Text>
+              </TouchableOpacity>
             </View>
 
             {/* Have a referral code? — spec H, applies on first booking only */}
             <View style={styles.referralCard}>
               <Text style={styles.referralTitle}>🎁 Have a Referral Code?</Text>
               <Text style={styles.referralSub}>
-                Enter your friend's code to get ₹20 off your first booking.
+                Get ₹20 off your first booking when a friend invites you.
               </Text>
+              {/* Step-by-step so the user knows exactly what to do — earlier
+                  the card just had an input and many users skipped it
+                  thinking the field was optional/decorative. */}
+              <View style={styles.referralStepsBox}>
+                <Text style={styles.referralStep}>1. Type your friend's code in the box below.</Text>
+                <Text style={styles.referralStep}>2. Tap <Text style={styles.referralStepBold}>Apply</Text>.</Text>
+                <Text style={styles.referralStep}>3. ₹20 will be deducted from the Amount to Pay above.</Text>
+              </View>
               {referralDiscount > 0 ? (
                 <View style={styles.referralAppliedRow}>
                   <Text style={styles.referralAppliedText}>
@@ -2513,10 +3914,10 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.payOptionEmoji}>💳</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.payOptionTitle}>Pay Online After Completion</Text>
+                <Text style={styles.payOptionTitle}>Pay Online</Text>
                 <Text style={styles.payOptionSubtitle}>
-                  UPI / Cards / Netbanking / Wallets — pay only after the
-                  representative completes the work. No money charged at booking.
+                  UPI / Cards / Netbanking / Wallets — secure payment via
+                  Razorpay before the service starts. Instant confirmation.
                 </Text>
               </View>
               <View style={[styles.payRadio, paymentMethod === 'pay_online' && styles.payRadioActive]}>
@@ -2554,129 +3955,77 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.onlineMethodsLabel}>Select payment method</Text>
                 <View style={styles.onlineMethodsGrid}>
                   {[
-                    { key: 'upi',        icon: '🏦', label: 'UPI' },
-                    { key: 'card',       icon: '💳', label: 'Card' },
-                    { key: 'netbanking', icon: '🏧', label: 'Netbanking' },
-                    { key: 'wallet',     icon: '👛', label: 'Wallet' },
-                  ].map((m: any) => (
-                    <TouchableOpacity
-                      key={m.key}
-                      style={[styles.onlineMethodTile, onlineMethod === m.key && styles.onlineMethodTileActive]}
-                      onPress={() => setOnlineMethod(m.key)}
-                    >
-                      <Text style={styles.onlineMethodEmoji}>{m.icon}</Text>
-                      <Text style={[styles.onlineMethodLabel, onlineMethod === m.key && { color: '#E63946' }]}>{m.label}</Text>
-                    </TouchableOpacity>
-                  ))}
+                    // MaterialIcons — proper vector icons, scale crisply
+                    // at any pixel density. UPI = send-to-mobile (phone
+                    // with arrow), Card = credit-card, Netbanking =
+                    // account-balance (bank columns), Wallet = account-
+                    // balance-wallet (the canonical wallet glyph).
+                    { key: 'upi',        iconName: 'send-to-mobile',       label: 'UPI' },
+                    { key: 'card',       iconName: 'credit-card',          label: 'Card' },
+                    { key: 'netbanking', iconName: 'account-balance',      label: 'Netbanking' },
+                    { key: 'wallet',     iconName: 'account-balance-wallet', label: 'Wallet' },
+                  ].map((m: any) => {
+                    const active = onlineMethod === m.key;
+                    return (
+                      <TouchableOpacity
+                        key={m.key}
+                        style={[styles.onlineMethodTile, active && styles.onlineMethodTileActive]}
+                        onPress={() => setOnlineMethod(m.key)}
+                      >
+                        <Icon
+                          name={m.iconName}
+                          size={24}
+                          color={active ? '#E63946' : '#0D3B66'}
+                          style={{ marginBottom: 4 }}
+                        />
+                        <Text style={[styles.onlineMethodLabel, active && { color: '#E63946' }]}>
+                          {m.label}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
                 </View>
 
-                {/* UPI form */}
+                {/* UPI gets its OWN in-app input field — Razorpay's
+                    sandbox doesn't always offer a UPI tab on test
+                    accounts, so we collect + verify the UPI ID here.
+                    Card / Netbanking / Wallet still route through
+                    Razorpay where the actual instrument is captured. */}
                 {onlineMethod === 'upi' && (
                   <View style={styles.subForm}>
                     <Text style={styles.subFormLabel}>Enter your UPI ID</Text>
                     <TextInput
                       style={styles.subFormInput}
-                      placeholder="yourname@okhdfcbank"
+                      placeholder="e.g. success@razorpay"
                       value={upiId}
                       onChangeText={setUpiId}
                       autoCapitalize="none"
+                      autoCorrect={false}
                       placeholderTextColor="#9E9E9E"
                     />
-                    <View style={styles.upiAppsRow}>
-                      {['Google Pay', 'PhonePe', 'Paytm', 'BHIM'].map(app => (
-                        <View key={app} style={styles.upiAppPill}>
-                          <Text style={styles.upiAppText}>{app}</Text>
-                        </View>
-                      ))}
-                    </View>
+                    <Text style={{ fontSize: 11, color: '#6C757D', marginTop: 4 }}>
+                      Test users: enter <Text style={{ fontWeight: '800' }}>success@razorpay</Text> to complete the payment.
+                    </Text>
                   </View>
                 )}
 
-                {/* Card form */}
-                {onlineMethod === 'card' && (
-                  <View style={styles.subForm}>
-                    <Text style={styles.subFormLabel}>Card Number</Text>
-                    <TextInput
-                      style={styles.subFormInput}
-                      placeholder="1234 5678 9012 3456"
-                      value={cardNumber}
-                      onChangeText={(v: string) => setCardNumber(v.replace(/[^0-9 ]/g, '').slice(0, 19))}
-                      keyboardType="number-pad"
-                      maxLength={19}
-                      placeholderTextColor="#9E9E9E"
-                    />
-                    <Text style={styles.subFormLabel}>Cardholder Name</Text>
-                    <TextInput
-                      style={styles.subFormInput}
-                      placeholder="As printed on card"
-                      value={cardHolderName}
-                      onChangeText={setCardHolderName}
-                      placeholderTextColor="#9E9E9E"
-                    />
-                    <View style={styles.cardRow}>
-                      <View style={{ flex: 1, marginRight: 8 }}>
-                        <Text style={styles.subFormLabel}>Expiry (MM/YY)</Text>
-                        <TextInput
-                          style={styles.subFormInput}
-                          placeholder="12/26"
-                          value={cardExpiry}
-                          onChangeText={setCardExpiry}
-                          maxLength={5}
-                          keyboardType="number-pad"
-                          placeholderTextColor="#9E9E9E"
-                        />
-                      </View>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.subFormLabel}>CVV</Text>
-                        <TextInput
-                          style={styles.subFormInput}
-                          placeholder="•••"
-                          value={cardCvv}
-                          onChangeText={(v: string) => setCardCvv(v.replace(/[^0-9]/g, '').slice(0, 4))}
-                          secureTextEntry
-                          keyboardType="number-pad"
-                          maxLength={4}
-                          placeholderTextColor="#9E9E9E"
-                        />
-                      </View>
-                    </View>
-                    <Text style={styles.secureNote}>🔒 Your card details are encrypted & secure</Text>
-                  </View>
-                )}
-
-                {/* Netbanking — bank picker */}
-                {onlineMethod === 'netbanking' && (
-                  <View style={styles.subForm}>
-                    <Text style={styles.subFormLabel}>Select your bank</Text>
-                    <View style={styles.banksGrid}>
-                      {['HDFC', 'SBI', 'ICICI', 'Axis', 'Kotak', 'PNB', 'BOB', 'IDFC'].map(b => (
-                        <TouchableOpacity
-                          key={b}
-                          style={[styles.bankChip, selectedBank === b && styles.bankChipActive]}
-                          onPress={() => setSelectedBank(b)}
-                        >
-                          <Text style={[styles.bankChipText, selectedBank === b && { color: '#fff' }]}>{b}</Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  </View>
-                )}
-
-                {/* Wallets */}
-                {onlineMethod === 'wallet' && (
-                  <View style={styles.subForm}>
-                    <Text style={styles.subFormLabel}>Choose your wallet</Text>
-                    <View style={styles.banksGrid}>
-                      {['Paytm', 'PhonePe', 'Amazon Pay', 'Mobikwik', 'Freecharge'].map(w => (
-                        <TouchableOpacity
-                          key={w}
-                          style={[styles.bankChip, selectedWallet === w && styles.bankChipActive]}
-                          onPress={() => setSelectedWallet(w)}
-                        >
-                          <Text style={[styles.bankChipText, selectedWallet === w && { color: '#fff' }]}>{w}</Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
+                {/* Card / Netbanking / Wallet — details captured by
+                    Razorpay's sandbox. We just show the test creds
+                    here so the user knows what to enter once Razorpay
+                    opens. */}
+                {onlineMethod && onlineMethod !== 'upi' && (
+                  <View style={[styles.subForm, { backgroundColor: '#EFF6FF', borderColor: '#BFDBFE', borderWidth: 1 }]}>
+                    <Text style={[styles.subFormLabel, { color: '#0D3B66' }]}>
+                      🔒 Secure checkout — Razorpay
+                    </Text>
+                    <Text style={{ fontSize: 12, color: '#1E40AF', marginTop: 4, lineHeight: 17 }}>
+                      Tap "Proceed & Pay" to open the Razorpay sandbox.
+                      {onlineMethod === 'card'
+                        ? ' Enter your card number, expiry & CVV there (test card: 4111 1111 1111 1111, exp any future, CVV 100).'
+                        : onlineMethod === 'netbanking'
+                          ? ' Pick your bank inside Razorpay and approve the payment.'
+                          : ' Pick your wallet inside Razorpay and approve the payment.'}
+                    </Text>
                   </View>
                 )}
               </View>
@@ -2713,9 +4062,18 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               )}
             </View>
 
-            {/* Service Summary */}
+            {/* Service Summary — customer name is now the first row so
+                it's the first thing the user sees, confirming the booking
+                is filed under the right person. Previously it sat at the
+                bottom and users had to scroll past Service/Mode/Urgency. */}
             <View style={styles.summaryContainer}>
               <Text style={styles.summaryTitle}>📋 Service Summary</Text>
+              <View style={styles.summaryItem}>
+                <Text style={styles.summaryLabel}>Customer</Text>
+                <Text style={styles.summaryValue}>
+                  {fullName || applicantName || mobile || 'N/A'}
+                </Text>
+              </View>
               <View style={styles.summaryItem}>
                 <Text style={styles.summaryLabel}>Service</Text>
                 <Text style={styles.summaryValue}>{serviceData?.name || 'Service'}</Text>
@@ -2736,22 +4094,18 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.summaryLabel}>Address</Text>
                 <Text style={styles.summaryValue} numberOfLines={2}>{address}</Text>
               </View>
-              <View style={styles.summaryItem}>
-                <Text style={styles.summaryLabel}>Customer</Text>
-                <Text style={styles.summaryValue}>{fullName || mobile}</Text>
-              </View>
             </View>
 
-            {/* Charge Breakdown */}
+            {/* Charge Breakdown — customer-facing summary shows only
+                Service Fee + (optional Priority Fee) + Total. The
+                internal govt/partner/margin split is intentionally
+                hidden; it lives in the admin dashboard and is sent on
+                the booking payload for commission accounting. */}
             <View style={styles.chargeContainer}>
               <Text style={styles.chargeTitle}>💰 Charge Breakdown</Text>
               <View style={styles.chargeRow}>
-                <Text style={styles.chargeLabel}>Service Cost</Text>
+                <Text style={styles.chargeLabel}>Service Fee</Text>
                 <Text style={styles.chargeValue}>₹{userCost}</Text>
-              </View>
-              <View style={styles.chargeRow}>
-                <Text style={styles.chargeLabel}>Government Fees</Text>
-                <Text style={styles.chargeValue}>₹{govtFees}</Text>
               </View>
               {serviceMode === 'fast_track' && (
                 <View style={styles.chargeRow}>
@@ -2857,19 +4211,54 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   };
 
   return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      // Keep focused inputs visible above the keyboard. Android's
+      // edge-to-edge mode otherwise lets the keyboard cover them.
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
     <View style={styles.container}>
+      {/* Slim header — single row, service name + amount inline so
+          it doesn't dominate the viewport. Earlier this took ~90px
+          vertical (stacked 20px title + 16px price + 30px top padding
+          + 20px bottom padding); now it's ~46px so there's far more
+          room for the form fields below, especially with the keyboard
+          open. */}
       <View style={styles.header}>
-        <Text style={styles.serviceName}>{serviceData?.name || 'Service'}</Text>
+        <Text style={styles.serviceName} numberOfLines={1}>
+          {serviceData?.name || 'Service'}
+        </Text>
         <Text style={styles.servicePrice}>₹{totalAmount}</Text>
       </View>
 
       {renderStepper()}
 
-      <ScrollView style={styles.content}>
+      <ScrollView
+        ref={stepScrollRef}
+        style={styles.content}
+        keyboardShouldPersistTaps="handled"
+        onScroll={(ev) => {
+          stepScrollYRef.current = ev.nativeEvent.contentOffset.y;
+        }}
+        scrollEventThrottle={32}
+      >
         {renderStep()}
       </ScrollView>
 
-      <View style={[styles.footer, { paddingBottom: 20 + insets.bottom }]}>
+      <View
+        style={[
+          styles.footer,
+          {
+            paddingBottom: 20 + insets.bottom,
+            // Respect horizontal insets too — on devices with rounded
+            // edges or punch-hole cameras the left/right margins are
+            // non-zero, and a flat 20px padding wasn't enough so the
+            // Book Now / Confirm / Request Quote buttons got clipped.
+            paddingLeft: 20 + (insets.left || 0),
+            paddingRight: 20 + (insets.right || 0),
+          },
+        ]}
+      >
         {currentStep < 6 && (
           <View style={styles.footerRow}>
             {currentStep > 1 && (
@@ -2881,25 +4270,97 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               </TouchableOpacity>
             )}
 
-            {currentStep < 5 && (
-              <TouchableOpacity
-                style={styles.nextBtn}
-                onPress={() => setCurrentStep(currentStep + 1)}
-              >
-                <Text style={styles.nextBtnText}>Next</Text>
-              </TouchableOpacity>
-            )}
+            {currentStep < 5 && (() => {
+              const v = canAdvanceFromCurrentStep();
+              return (
+                <TouchableOpacity
+                  style={[styles.nextBtn, !v.ok && { opacity: 0.5 }]}
+                  onPress={() => {
+                    const check = canAdvanceFromCurrentStep();
+                    if (!check.ok) {
+                      Alert.alert(
+                        'Please complete this step',
+                        check.message || 'Fill all required fields before continuing.',
+                      );
+                      return;
+                    }
+                    setCurrentStep(currentStep + 1);
+                  }}
+                >
+                  <Text style={styles.nextBtnText}>Next</Text>
+                </TouchableOpacity>
+              );
+            })()}
 
             {currentStep === 5 && (
               <TouchableOpacity
-                style={styles.confirmBtn}
-                onPress={handleConfirmBooking}
+                style={[styles.confirmBtn, !acceptedTerms && { opacity: 0.5 }]}
+                onPress={() => {
+                  if (!acceptedTerms) {
+                    Alert.alert(
+                      'Accept the terms',
+                      'Please accept the Terms of Use & Privacy Policy to proceed.',
+                    );
+                    return;
+                  }
+                  // Pay Online — user must pick a specific method first.
+                  if (paymentMethod === 'pay_online' && !onlineMethod) {
+                    Alert.alert(
+                      'Choose a payment method',
+                      'Please select UPI, Card, Net Banking, or Wallet before proceeding.',
+                    );
+                    return;
+                  }
+                  // UPI is validated IN-APP because Razorpay's sandbox
+                  // doesn't always expose a UPI tab on test accounts.
+                  // The user types the UPI ID right here; we check it
+                  // against the canonical success-test ID. Card /
+                  // Netbanking / Wallet still go through the Razorpay
+                  // sandbox where their respective creds are entered.
+                  if (paymentMethod === 'pay_online' && onlineMethod === 'upi') {
+                    const id = String(upiId || '').trim().toLowerCase();
+                    if (!id) {
+                      Alert.alert(
+                        'Enter UPI ID',
+                        'Please type your UPI ID (test users: success@razorpay) before proceeding.',
+                      );
+                      return;
+                    }
+                    // Basic format check (something@something) so we
+                    // don't fall through to the success-check on a
+                    // half-typed value.
+                    if (!/^[a-z0-9._-]+@[a-z0-9._-]+$/i.test(id)) {
+                      Alert.alert(
+                        'Invalid UPI ID',
+                        'UPI ID should look like name@bank (e.g. success@razorpay).',
+                      );
+                      return;
+                    }
+                    if (id !== 'success@razorpay') {
+                      // Test mode: anything other than the canonical
+                      // success ID is treated as a failed payment. The
+                      // user can edit + retry.
+                      Alert.alert(
+                        'Payment failed',
+                        `UPI ID "${upiId}" was not approved by the sandbox. ` +
+                          `Use success@razorpay for a successful test payment.`,
+                      );
+                      return;
+                    }
+                    // ✓ Test success — mark booking paid in-app via the
+                    // existing trust-the-client path. Skips Razorpay
+                    // entirely (no sandbox UPI tab to fall back to).
+                    handleConfirmBooking({ inAppUpiSuccess: true });
+                    return;
+                  }
+                  handleConfirmBooking();
+                }}
                 disabled={loading}
               >
                 {loading ? (
                   <ActivityIndicator size="small" color="#fff" />
                 ) : (
-                  <Text style={styles.confirmBtnText}>Confirm Booking</Text>
+                  <Text style={styles.confirmBtnText}>Proceed & Pay (₹{totalAmount})</Text>
                 )}
               </TouchableOpacity>
             )}
@@ -2927,8 +4388,8 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       />
 
       {/* State picker modal — searchable list of all 28 states + 8 UTs.
-          Replaces the free-text state input so domicile-style services get
-          a clean, valid value every time. */}
+          Plain View overlay; see the district modal comment for why we
+          dropped KeyboardAvoidingView. */}
       <Modal
         visible={showStatePicker}
         transparent
@@ -2936,7 +4397,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         onRequestClose={() => setShowStatePicker(false)}
       >
         <View style={styles.statePickerOverlay}>
-          <View style={[styles.statePickerSheet, { paddingBottom: insets.bottom }]}>
+          <View style={[styles.statePickerSheetFixed, { paddingBottom: insets.bottom }]}>
             <View style={styles.statePickerHeader}>
               <Text style={styles.statePickerTitle}>Select your state</Text>
               <TouchableOpacity onPress={() => setShowStatePicker(false)}>
@@ -2952,23 +4413,30 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               autoCapitalize="words"
             />
             <FlatList
+              style={{ flex: 1 }}
               data={INDIAN_STATES.filter((s: string) =>
                 s.toLowerCase().includes(stateSearch.trim().toLowerCase()),
               )}
               keyExtractor={(item: string) => item}
-              keyboardShouldPersistTaps="handled"
+              keyboardShouldPersistTaps="always"
+              keyboardDismissMode="on-drag"
               renderItem={({ item }: any) => (
-                <TouchableOpacity
-                  style={styles.statePickerRow}
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.statePickerRow,
+                    pressed && { backgroundColor: '#F1F5F9' },
+                  ]}
+                  android_ripple={{ color: '#E2E8F0' }}
                   onPress={() => {
                     setState(item);
                     setStateSearch('');
                     setShowStatePicker(false);
                   }}
+                  hitSlop={4}
                 >
                   <Text style={styles.statePickerRowText}>{item}</Text>
                   {state === item && <Text style={styles.statePickerCheck}>✓</Text>}
-                </TouchableOpacity>
+                </Pressable>
               )}
               ListEmptyComponent={
                 <Text style={styles.statePickerEmpty}>No matching state.</Text>
@@ -2977,9 +4445,127 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           </View>
         </View>
       </Modal>
+
+      {/* District picker modal — same searchable list pattern as the state
+          picker. KAV was previously wrapping the overlay but on Android
+          it collapses the container inside a Modal so the FlatList
+          rendered with zero height (list looked empty even though data
+          was there). Plain View + explicit sheet height fixes it. */}
+      <Modal
+        visible={showDistrictPicker}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowDistrictPicker(false)}
+      >
+        <View style={styles.statePickerOverlay}>
+          <View style={[styles.statePickerSheetFixed, { paddingBottom: insets.bottom }]}>
+            <View style={styles.statePickerHeader}>
+              <Text style={styles.statePickerTitle}>Select your district</Text>
+              <TouchableOpacity onPress={() => setShowDistrictPicker(false)}>
+                <Text style={styles.statePickerClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <TextInput
+              style={styles.statePickerSearch}
+              value={districtSearch}
+              onChangeText={setDistrictSearch}
+              placeholder="Search district…"
+              autoCorrect={false}
+              autoCapitalize="words"
+            />
+            <FlatList
+              style={{ flex: 1 }}
+              data={INDIAN_DISTRICTS.filter((d: string) =>
+                d.toLowerCase().includes(districtSearch.trim().toLowerCase()),
+              )}
+              keyExtractor={(item: string) => item}
+              // 'always' ensures the row's tap is registered even while the
+              // keyboard is showing — 'handled' was silently routing the
+              // first tap to keyboard-dismissal on Android, making it look
+              // like the row wasn't responding.
+              keyboardShouldPersistTaps="always"
+              keyboardDismissMode="on-drag"
+              renderItem={({ item }: any) => (
+                <Pressable
+                  style={({ pressed }) => [
+                    styles.statePickerRow,
+                    pressed && { backgroundColor: '#F1F5F9' },
+                  ]}
+                  android_ripple={{ color: '#E2E8F0' }}
+                  onPress={() => {
+                    setDistrict(item);
+                    setDistrictSearch('');
+                    setShowDistrictPicker(false);
+                  }}
+                  hitSlop={4}
+                >
+                  <Text style={styles.statePickerRowText}>{item}</Text>
+                  {district === item && <Text style={styles.statePickerCheck}>✓</Text>}
+                </Pressable>
+              )}
+              ListEmptyComponent={
+                <Text style={styles.statePickerEmpty}>No matching district.</Text>
+              }
+            />
+          </View>
+        </View>
+      </Modal>
     </View>
+    </KeyboardAvoidingView>
   );
 }
+
+// Helper for the Payment Summary card — renders a checkbox + label +
+// amount row. Two visual sizes: default (line-item add-ons) and small
+// (the wallet/refund deduction rows under the total). When `disabled`
+// the row is greyed out and untappable.
+interface PsCheckboxRowProps {
+  checked: boolean;
+  onToggle: () => void;
+  label: string;
+  amount: number;
+  amountFmt?: 'rupee' | 'rupee2';
+  disabled?: boolean;
+  small?: boolean;
+}
+
+const PsCheckboxRow: React.FC<PsCheckboxRowProps> = ({
+  checked, onToggle, label, amount, amountFmt = 'rupee', disabled = false, small = false,
+}) => {
+  const valueText =
+    amountFmt === 'rupee2'
+      ? `₹ ${amount.toFixed(2)}`
+      : `₹ ${amount}`;
+  return (
+    <TouchableOpacity
+      style={styles.psRow}
+      onPress={disabled ? undefined : onToggle}
+      activeOpacity={disabled ? 1 : 0.7}
+    >
+      <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+        <View style={[styles.psCheckbox, checked && styles.psCheckboxChecked, disabled && styles.psCheckboxDisabled]}>
+          {checked && <Text style={styles.psCheckboxTick}>✓</Text>}
+        </View>
+        <Text
+          style={[
+            small ? styles.psSmallLabel : styles.psOptLabel,
+            disabled && styles.psDisabledText,
+          ]}
+        >
+          {label}
+        </Text>
+      </View>
+      <Text
+        style={[
+          small ? styles.psSmallValue : styles.psOptValue,
+          disabled && styles.psDisabledText,
+        ]}
+      >
+        {valueText}
+      </Text>
+    </TouchableOpacity>
+  );
+};
 
 const styles: any = StyleSheet.create({
   container: {
@@ -2988,18 +4574,25 @@ const styles: any = StyleSheet.create({
   },
   header: {
     backgroundColor: '#E63946',
-    padding: 20,
-    paddingTop: 30,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   serviceName: {
-    fontSize: 20,
-    fontWeight: 'bold',
+    fontSize: 14,
+    fontWeight: '800',
     color: '#fff',
+    flex: 1,
+    marginRight: 10,
+    letterSpacing: 0.2,
   },
   servicePrice: {
-    fontSize: 16,
+    fontSize: 14,
+    fontWeight: '900',
     color: '#fff',
-    marginTop: 5,
   },
   stepRow: {
     flexDirection: 'row',
@@ -3360,10 +4953,41 @@ const styles: any = StyleSheet.create({
     borderTopRightRadius: 18,
     paddingBottom: 16,
   },
+  // Image preview is wrapped so we can position the floating Crop
+  // overlay absolutely inside it.
+  confirmImageWrap: {
+    position: 'relative',
+    width: '100%',
+  },
   confirmImage: {
     width: '100%',
     height: 360,
     backgroundColor: '#0F172A',
+  },
+  // Floating "✂ Crop" pill anchored to the top-right of the image.
+  // Bright green, white text, thick drop-shadow + border so it pops
+  // against ANY image content (dark scans, bright photos, etc.).
+  confirmCropOverlay: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    backgroundColor: '#10B981',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 22,
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.45,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  confirmCropOverlayText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
   confirmActionsRow: {
     flexDirection: 'row',
@@ -3384,6 +5008,28 @@ const styles: any = StyleSheet.create({
     color: '#0D3B66',
     fontSize: 14,
     fontWeight: '700',
+    letterSpacing: 0.3,
+  },
+  // Crop button — sits between Retake and Upload. Solid green so it's
+  // visible against any image preview behind it (modal lays the image
+  // ABOVE this row, but a wider phone scroll might overlap so we keep
+  // a strong background regardless).
+  confirmCropBtn: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 10,
+    backgroundColor: '#10B981',
+    alignItems: 'center',
+    shadowColor: '#065F46',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  confirmCropText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
     letterSpacing: 0.3,
   },
   confirmUploadBtn: {
@@ -3444,6 +5090,15 @@ const styles: any = StyleSheet.create({
     marginBottom: 10,
     backgroundColor: '#F8FAFC',
   },
+  // Highlighted variant for the two crop-enabled options (Take Photo,
+  // Choose from Gallery). Stronger border, tinted background and a green
+  // CROP badge so users notice that cropping is available — previously
+  // the option looked the same as a regular row and users missed it.
+  docPickerOptionPrimary: {
+    borderColor: '#0D3B66',
+    borderWidth: 2,
+    backgroundColor: '#EFF6FF',
+  },
   docPickerOptionIcon: {
     fontSize: 22,
     marginRight: 14,
@@ -3452,6 +5107,29 @@ const styles: any = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
     color: '#0D3B66',
+  },
+  docPickerOptionTextPrimary: {
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  docPickerOptionHint: {
+    fontSize: 11,
+    color: '#475569',
+    marginTop: 2,
+    fontWeight: '500',
+  },
+  docPickerCropBadge: {
+    backgroundColor: '#10B981',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    marginLeft: 8,
+  },
+  docPickerCropBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
   docPickerCancelOption: {
     backgroundColor: '#FFFFFF',
@@ -3486,6 +5164,24 @@ const styles: any = StyleSheet.create({
     fontSize: 11,
     color: '#7A5C00',
     marginBottom: 10,
+  },
+  referralStepsBox: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    marginBottom: 10,
+  },
+  referralStep: {
+    fontSize: 11,
+    color: '#7A5C00',
+    lineHeight: 16,
+  },
+  referralStepBold: {
+    fontWeight: '800',
+    color: '#92400E',
   },
   referralInputRow: {
     flexDirection: 'row',
@@ -3776,7 +5472,11 @@ const styles: any = StyleSheet.create({
     opacity: 0.5,
   },
   footer: {
-    padding: 20,
+    // Horizontal + bottom padding are set inline (driven by safe-area
+    // insets) so the Book Now / Request Quote / Confirm buttons don't
+    // get clipped on rounded-edge or notched phones. Top stays a flat
+    // 20px since the StatusBar/header is the same height everywhere.
+    paddingTop: 20,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#E0E0E0',
@@ -3793,6 +5493,18 @@ const styles: any = StyleSheet.create({
     backgroundColor: '#fff',
     borderTopLeftRadius: 18, borderTopRightRadius: 18,
     maxHeight: '80%', paddingHorizontal: 16, paddingTop: 14,
+  },
+  // Explicit height so the FlatList inside (which has flex:1) has a
+  // bounded parent to flex into. With only maxHeight, Android render
+  // produced a 0-height FlatList — the list looked "empty" even though
+  // 200+ districts were in the data.
+  statePickerSheetFixed: {
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    height: '75%',
+    paddingHorizontal: 16,
+    paddingTop: 14,
   },
   statePickerHeader: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
@@ -3979,12 +5691,17 @@ const styles: any = StyleSheet.create({
     marginBottom: 15,
   },
 
-  // ─── Modern stepper (compact, header + progress bar + dot row) ───
+  // ─── Modern stepper — tightened so the header + progress bar +
+  // dot row together take ~80px instead of the prior ~140px. More
+  // room for the actual form below, especially when the keyboard
+  // is open.
   modernStepperWrap: {
     backgroundColor: '#fff',
-    margin: 12,
-    borderRadius: 16,
-    padding: 16,
+    marginHorizontal: 12,
+    marginVertical: 6,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.06,
@@ -3995,47 +5712,47 @@ const styles: any = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 12,
+    marginBottom: 6,
   },
   stepperHeaderLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
-  stepperHeaderIcon: { fontSize: 28, marginRight: 12 },
-  stepperHeaderLabel: { fontSize: 10, fontWeight: '700', color: '#9E9E9E', letterSpacing: 1 },
-  stepperHeaderTitle: { fontSize: 18, fontWeight: '800', color: '#1A1A1A', marginTop: 2 },
+  stepperHeaderIcon: { fontSize: 18, marginRight: 8 },
+  stepperHeaderLabel: { fontSize: 9, fontWeight: '700', color: '#9E9E9E', letterSpacing: 0.8 },
+  stepperHeaderTitle: { fontSize: 13, fontWeight: '800', color: '#1A1A1A', marginTop: 1 },
   stepperBadge: {
     backgroundColor: '#E63946',
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 14,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
   },
-  stepperBadgeText: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  stepperBadgeText: { color: '#fff', fontSize: 10, fontWeight: '800' },
 
   progressTrack: {
-    height: 6,
+    height: 4,
     backgroundColor: '#F0F2F5',
-    borderRadius: 3,
+    borderRadius: 2,
     overflow: 'hidden',
-    marginBottom: 14,
+    marginBottom: 8,
   },
   progressFill: {
     height: '100%',
     backgroundColor: '#E63946',
-    borderRadius: 3,
+    borderRadius: 2,
   },
 
   dotsRow: { flexDirection: 'row', justifyContent: 'space-between' },
   dotWrap: { alignItems: 'center', flex: 1 },
   dot: {
-    width: 22, height: 22, borderRadius: 11,
+    width: 16, height: 16, borderRadius: 8,
     backgroundColor: '#F0F2F5',
     borderWidth: 2, borderColor: '#F0F2F5',
     justifyContent: 'center', alignItems: 'center',
-    marginBottom: 4,
+    marginBottom: 2,
   },
   dotCompleted: { backgroundColor: '#E63946', borderColor: '#E63946' },
   dotCurrent: { backgroundColor: '#fff', borderColor: '#E63946' },
-  dotPulse: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#E63946' },
-  dotCheck: { color: '#fff', fontSize: 12, fontWeight: '800' },
-  dotLabel: { fontSize: 9, color: '#9E9E9E', fontWeight: '600' },
+  dotPulse: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#E63946' },
+  dotCheck: { color: '#fff', fontSize: 9, fontWeight: '800' },
+  dotLabel: { fontSize: 8, color: '#9E9E9E', fontWeight: '600' },
   dotLabelActive: { color: '#1A1A1A', fontWeight: '700' },
 
   // ─── Old stepper styles (kept for fallback / not actively used) ───
@@ -4145,6 +5862,174 @@ const styles: any = StyleSheet.create({
   },
   stepConnectorUpcoming: {
     backgroundColor: '#E0E0E0',
+  },
+
+  // ─── App-level disclaimer card (booking confirmation step) ───
+  bookingDisclaimer: {
+    backgroundColor: '#FFFBEB',
+    borderLeftWidth: 4,
+    borderLeftColor: '#F4A100',
+    padding: 14,
+    borderRadius: 8,
+    marginTop: 16,
+    marginHorizontal: 12,
+  },
+  bookingDisclaimerLabel: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#92400E',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  bookingDisclaimerText: {
+    fontSize: 12,
+    color: '#78350F',
+    lineHeight: 18,
+  },
+
+  // ─── Aadhaar comprehensive form (UIDAI-style intake) ───
+  aadhaarSectionLabel: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#0D3B66',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 10,
+    marginTop: 4,
+  },
+  aadhaarChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    backgroundColor: '#F8FAFC',
+  },
+  aadhaarChipActive: {
+    backgroundColor: '#0D3B66',
+    borderColor: '#0D3B66',
+  },
+  aadhaarChipText: { color: '#475569', fontWeight: '600', fontSize: 13 },
+  aadhaarChipTextActive: { color: '#FFFFFF', fontWeight: '800' },
+
+  // ─── Payment Summary card (matches the spec mockup layout) ───
+  psCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    padding: 18,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 6,
+    elevation: 2,
+  },
+  psTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1F2937',
+    marginBottom: 10,
+  },
+  psDivider: {
+    height: 2,
+    backgroundColor: '#0D3B66',
+    marginVertical: 8,
+  },
+  psRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  psMandatoryLabel: {
+    color: '#1E5BA8',
+    fontWeight: '700',
+    fontSize: 15,
+    flex: 1,
+    marginRight: 12,
+  },
+  psMandatoryValue: {
+    color: '#0F172A',
+    fontWeight: '700',
+    fontSize: 15,
+  },
+  psOptLabel: {
+    color: '#1F2937',
+    fontWeight: '500',
+    fontSize: 14,
+    flex: 1,
+    marginLeft: 10,
+  },
+  psOptValue: {
+    color: '#1F2937',
+    fontWeight: '500',
+    fontSize: 14,
+  },
+  psSmallLabel: {
+    color: '#374151',
+    fontSize: 13,
+    flex: 1,
+    marginLeft: 10,
+  },
+  psSmallValue: {
+    color: '#374151',
+    fontSize: 13,
+  },
+  psTotalLabel: {
+    color: '#1F2937',
+    fontSize: 13,
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+  psTotalValue: {
+    color: '#0F172A',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  psCheckbox: {
+    width: 18,
+    height: 18,
+    borderWidth: 1.5,
+    borderColor: '#94A3B8',
+    borderRadius: 3,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFFFFF',
+  },
+  psCheckboxChecked: {
+    backgroundColor: '#1E5BA8',
+    borderColor: '#1E5BA8',
+  },
+  psCheckboxDisabled: {
+    borderColor: '#CBD5E1',
+    backgroundColor: '#F1F5F9',
+  },
+  psCheckboxTick: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 14,
+  },
+  psDisabledText: { color: '#94A3B8' },
+  psTermsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    marginTop: 4,
+  },
+  psTermsText: {
+    color: '#1F2937',
+    fontSize: 13,
+    marginLeft: 10,
+    flex: 1,
+  },
+  psLink: {
+    color: '#1E5BA8',
+    textDecorationLine: 'underline',
+    fontWeight: '600',
   },
 });
 

@@ -19,6 +19,13 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { computeDistanceToAddress, formatDistance } from '../../utils/agent/distance';
 
 // ─── Status helpers (module-scope, no hooks) ────────────────────────────────
+// Explicit emerald green for completed/work_completed — COLORS.success
+// in the agent palette resolves to Prussian blue (#003153), which made
+// "Completed" look identical to "Accepted" and confused reps. Using
+// the same #10B981 green the dashboard's Recent Activity uses, for
+// consistency across screens.
+const COMPLETED_GREEN = '#10B981';
+
 const getStatusColor = (status?: string): string => {
   switch (status) {
     case 'new':
@@ -28,8 +35,11 @@ const getStatusColor = (status?: string): string => {
       return COLORS.accentBlue;
     case 'in_progress':
       return COLORS.primary;
+    case 'documents_collected':
+      return '#0EA5E9';
+    case 'work_completed':
     case 'completed':
-      return COLORS.success;
+      return COMPLETED_GREEN;
     default:
       return COLORS.gray;
   }
@@ -44,6 +54,10 @@ const getStatusText = (status?: string): string => {
       return 'Accepted';
     case 'in_progress':
       return 'In Progress';
+    case 'documents_collected':
+      return 'Docs Collected';
+    case 'work_completed':
+      return 'Completed';
     case 'completed':
       return 'Completed';
     default:

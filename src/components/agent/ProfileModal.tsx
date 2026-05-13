@@ -8,9 +8,13 @@ import {
   Modal,
   Alert,
   ScrollView,
+  KeyboardAvoidingView,
+  Platform,
+  FlatList,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { COLORS, SIZES } from '../../constants/agent/colors';
+import { INDIAN_STATES, INDIAN_DISTRICTS } from '../../constants/districts';
 
 export interface AgentProfile {
   name: string;
@@ -19,6 +23,7 @@ export interface AgentProfile {
   address: string;
   city: string;
   state: string;
+  district: string;
   pincode: string;
 }
 
@@ -36,9 +41,18 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
     address: '',
     city: '',
     state: '',
+    district: '',
     pincode: '',
   });
   const [loading, setLoading] = useState<boolean>(false);
+  // Picker visibility + search state for State / District dropdowns —
+  // free-text inputs caused typos that broke admin filtering, so the
+  // rep now selects from the same canonical lists used by the customer
+  // booking form.
+  const [showStatePicker, setShowStatePicker] = useState<boolean>(false);
+  const [showDistrictPicker, setShowDistrictPicker] = useState<boolean>(false);
+  const [stateSearch, setStateSearch] = useState<string>('');
+  const [districtSearch, setDistrictSearch] = useState<string>('');
 
   useEffect(() => {
     if (visible) {
@@ -58,6 +72,7 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
           address: data.address || '',
           city: data.city || '',
           state: data.state || '',
+          district: data.district || '',
           pincode: data.pincode || '',
         });
       }
@@ -105,6 +120,10 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
       presentationStyle="pageSheet"
       onRequestClose={onClose}
     >
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
       <View style={styles.container}>
         <View style={styles.header}>
           <Text style={styles.title}>Edit Profile</Text>
@@ -113,7 +132,7 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
           </TouchableOpacity>
         </View>
 
-        <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+        <ScrollView style={styles.content} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
           <View style={styles.form}>
             <Text style={styles.label}>Full Name</Text>
             <TextInput
@@ -161,12 +180,40 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
             />
 
             <Text style={styles.label}>State</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Enter your state"
-              value={agentData.state}
-              onChangeText={(value) => updateField('state', value)}
-            />
+            <TouchableOpacity
+              style={[styles.input, styles.pickerInput]}
+              onPress={() => setShowStatePicker(true)}
+              activeOpacity={0.7}
+            >
+              <Text
+                style={{
+                  color: agentData.state ? '#212121' : '#9E9E9E',
+                  fontSize: 15,
+                  flex: 1,
+                }}
+              >
+                {agentData.state || 'Tap to select your state'}
+              </Text>
+              <Text style={{ color: '#9E9E9E', fontSize: 18 }}>▾</Text>
+            </TouchableOpacity>
+
+            <Text style={styles.label}>District</Text>
+            <TouchableOpacity
+              style={[styles.input, styles.pickerInput]}
+              onPress={() => setShowDistrictPicker(true)}
+              activeOpacity={0.7}
+            >
+              <Text
+                style={{
+                  color: agentData.district ? '#212121' : '#9E9E9E',
+                  fontSize: 15,
+                  flex: 1,
+                }}
+              >
+                {agentData.district || 'Tap to select your district'}
+              </Text>
+              <Text style={{ color: '#9E9E9E', fontSize: 18 }}>▾</Text>
+            </TouchableOpacity>
 
             <Text style={styles.label}>Pincode</Text>
             <TextInput
@@ -194,9 +241,158 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
           </TouchableOpacity>
         </View>
       </View>
+      </KeyboardAvoidingView>
+
+      {/* State picker — searchable sheet, same UX as the customer
+          booking form so reps see a familiar dropdown. */}
+      <Modal
+        visible={showStatePicker}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowStatePicker(false)}
+      >
+        <View style={pickerStyles.overlay}>
+          <View style={pickerStyles.sheet}>
+            <View style={pickerStyles.headerRow}>
+              <Text style={pickerStyles.title}>Select your state</Text>
+              <TouchableOpacity onPress={() => setShowStatePicker(false)}>
+                <Text style={pickerStyles.close}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <TextInput
+              style={pickerStyles.search}
+              value={stateSearch}
+              onChangeText={setStateSearch}
+              placeholder="Search…"
+              autoCorrect={false}
+              autoCapitalize="words"
+            />
+            <FlatList
+              data={INDIAN_STATES.filter((s: string) =>
+                s.toLowerCase().includes(stateSearch.trim().toLowerCase()),
+              )}
+              keyExtractor={(item: string) => item}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({ item }: { item: string }) => (
+                <TouchableOpacity
+                  style={pickerStyles.row}
+                  onPress={() => {
+                    updateField('state', item);
+                    setStateSearch('');
+                    setShowStatePicker(false);
+                  }}
+                >
+                  <Text style={pickerStyles.rowText}>{item}</Text>
+                  {agentData.state === item && (
+                    <Text style={pickerStyles.check}>✓</Text>
+                  )}
+                </TouchableOpacity>
+              )}
+              ListEmptyComponent={
+                <Text style={pickerStyles.empty}>No matching state.</Text>
+              }
+            />
+          </View>
+        </View>
+      </Modal>
+
+      {/* District picker — same pattern as the state picker above. */}
+      <Modal
+        visible={showDistrictPicker}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowDistrictPicker(false)}
+      >
+        <View style={pickerStyles.overlay}>
+          <View style={pickerStyles.sheet}>
+            <View style={pickerStyles.headerRow}>
+              <Text style={pickerStyles.title}>Select your district</Text>
+              <TouchableOpacity onPress={() => setShowDistrictPicker(false)}>
+                <Text style={pickerStyles.close}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <TextInput
+              style={pickerStyles.search}
+              value={districtSearch}
+              onChangeText={setDistrictSearch}
+              placeholder="Search district…"
+              autoCorrect={false}
+              autoCapitalize="words"
+            />
+            <FlatList
+              data={INDIAN_DISTRICTS.filter((d: string) =>
+                d.toLowerCase().includes(districtSearch.trim().toLowerCase()),
+              )}
+              keyExtractor={(item: string) => item}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({ item }: { item: string }) => (
+                <TouchableOpacity
+                  style={pickerStyles.row}
+                  onPress={() => {
+                    updateField('district', item);
+                    setDistrictSearch('');
+                    setShowDistrictPicker(false);
+                  }}
+                >
+                  <Text style={pickerStyles.rowText}>{item}</Text>
+                  {agentData.district === item && (
+                    <Text style={pickerStyles.check}>✓</Text>
+                  )}
+                </TouchableOpacity>
+              )}
+              ListEmptyComponent={
+                <Text style={pickerStyles.empty}>No matching district.</Text>
+              }
+            />
+          </View>
+        </View>
+      </Modal>
     </Modal>
   );
 };
+
+const pickerStyles = StyleSheet.create({
+  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  sheet: {
+    backgroundColor: '#fff',
+    maxHeight: '75%',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 24,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  title: { fontSize: 17, fontWeight: '800', color: '#0D3B66' },
+  close: { fontSize: 22, color: '#64748B', paddingHorizontal: 8 },
+  search: {
+    borderWidth: 1,
+    borderColor: '#E7ECF2',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginVertical: 10,
+    backgroundColor: '#F8FAFC',
+    fontSize: 15,
+  },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  rowText: { fontSize: 15, color: '#1F2937' },
+  check: { fontSize: 18, color: '#10B981', fontWeight: '800' },
+  empty: { textAlign: 'center', color: '#94A3B8', paddingVertical: 24 },
+});
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
@@ -231,6 +427,10 @@ const styles = StyleSheet.create({
     marginBottom: SIZES.padding * 2,
     backgroundColor: COLORS.white,
     color: COLORS.text,
+  },
+  pickerInput: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   footer: {
     flexDirection: 'row',

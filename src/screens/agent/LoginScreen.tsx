@@ -30,6 +30,7 @@ interface NavigationProp {
   navigate: (route: string, params?: Record<string, unknown>) => void;
   goBack: () => void;
   replace?: (route: string) => void;
+  reset?: (state: { index: number; routes: { name: string }[] }) => void;
 }
 
 interface RouteProp {
@@ -53,6 +54,7 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
   const [resending, setResending] = useState<boolean>(false);
   const [resendCooldown, setResendCooldown] = useState<number>(0);
   const [devOtp, setDevOtp] = useState<string | null>(null);
+  const [warmingUp, setWarmingUp] = useState<boolean>(false);
   const otpRef = useRef<TextInput | null>(null);
 
   useEffect(() => {
@@ -71,6 +73,9 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
     if (isResend) setResending(true);
     else setLoading(true);
 
+    // If the request takes >5s, surface a "server warming up" message so
+    // the user knows we're waiting on Render's cold-start, not stuck.
+    const warmupTimer = setTimeout(() => setWarmingUp(true), 5000);
     try {
       const res = await sendOTP(mobile, 'sms');
       if (res?.success) {
@@ -84,6 +89,8 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
     } catch (e: any) {
       Alert.alert('Could not send OTP', e?.message || 'Network error');
     } finally {
+      clearTimeout(warmupTimer);
+      setWarmingUp(false);
       setLoading(false);
       setResending(false);
     }
@@ -137,12 +144,23 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
         }
       }
 
+      // Reset the entire stack so back from AgentTabs exits the app
+      // instead of popping back to ModeSelect (which made every back
+      // tap feel like an accidental logout). Logout is the only path
+      // that should send the rep to ModeSelect.
+      const goAgentHome = (): void => {
+        if (navigation.reset) {
+          navigation.reset({ index: 0, routes: [{ name: 'AgentTabs' }] });
+        } else {
+          navigation.replace?.('AgentTabs');
+        }
+      };
       if (referralStatus) {
         Alert.alert('Welcome to FliponeX', referralStatus, [
-          { text: 'OK', onPress: () => navigation.replace?.('AgentTabs') },
+          { text: 'OK', onPress: goAgentHome },
         ]);
       } else {
-        navigation.replace?.('AgentTabs');
+        goAgentHome();
       }
     } catch (e: any) {
       Alert.alert('Verification failed', e?.message || 'Try again.');
@@ -161,7 +179,7 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: '#0F172A' }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView
         contentContainerStyle={[styles.container, { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 24 }]}
@@ -173,6 +191,9 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
         </View>
         <Text style={styles.title}>FliponeX Representative</Text>
         <Text style={styles.subtitle}>Sign in to receive jobs</Text>
+
+        {/* Pre-login banner removed — matched the customer-app cleanup
+            so the rep landing screen is focused on the OTP form. */}
 
         {phase === 'mobile' ? (
           <View style={styles.card}>
@@ -206,6 +227,13 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.btnText}>Send OTP</Text>
               )}
             </TouchableOpacity>
+
+            {warmingUp && (
+              <Text style={styles.warmupHint}>
+                ⏳ Waking up the server (free tier sleeps after inactivity).
+                This takes up to a minute on first use today.
+              </Text>
+            )}
 
             <Text style={styles.helpLine}>
               Need access? Contact your FliponeX admin to be onboarded.
@@ -243,25 +271,12 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
               </View>
             ) : null}
 
-            {/* Referral code goes ABOVE the verify button so it's clear
-                the same action submits both. New reps coming in via a
-                shared referral link will see the code prefilled here. */}
-            <View style={styles.referralBox}>
-              <Text style={styles.referralLabel}>Referred by another rep? (optional)</Text>
-              <TextInput
-                style={styles.referralInput}
-                value={referralCode}
-                onChangeText={(v) => setReferralCode(v.toUpperCase().substring(0, 16))}
-                placeholder="FLIPXXXX"
-                placeholderTextColor="#64748B"
-                autoCapitalize="characters"
-              />
-              {referralCode.trim().length > 0 && (
-                <Text style={styles.referralHint}>
-                  ✓ Will be applied automatically when you verify.
-                </Text>
-              )}
-            </View>
+            {/* Referral code input removed from agent login. Reps now
+                apply referral codes from inside the app (Referral
+                screen → Apply code), not at the OTP step. Deep-link
+                referrals still resolve via the route.params path,
+                so a tap-to-join link keeps working — there's just no
+                manual entry field at sign-in anymore. */}
 
             <TouchableOpacity
               style={[styles.btn, otp.length !== 6 && styles.btnDisabled]}
@@ -274,8 +289,6 @@ const AgentLoginScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.btnText}>
                   {otp.length !== 6
                     ? `Enter all 6 digits (${otp.length}/6)`
-                    : referralCode.trim().length > 0
-                    ? 'Verify & Apply Referral'
                     : 'Verify & Continue'}
                 </Text>
               )}
@@ -350,6 +363,12 @@ const styles = StyleSheet.create({
   btnText: { color: '#0F172A', fontSize: 16, fontWeight: '900', letterSpacing: 0.5 },
 
   helpLine: { fontSize: 11, color: '#94A3B8', textAlign: 'center', marginTop: 14, lineHeight: 16 },
+  warmupHint: {
+    fontSize: 12, color: '#FCD34D', textAlign: 'center',
+    marginTop: 14, lineHeight: 16, fontWeight: '700',
+    backgroundColor: 'rgba(252,211,77,0.10)',
+    paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8,
+  },
 
   resendRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginTop: 14 },
   resendText: { color: '#94A3B8', fontSize: 13 },

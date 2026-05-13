@@ -12,6 +12,7 @@ import {
   Alert,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
 import { getMyDocuments, uploadKYCDocument } from '../services/api';
 import SuccessToast from '../components/SuccessToast';
 import DocPreviewModal from '../components/DocPreviewModal';
@@ -103,25 +104,24 @@ const DocumentsScreen: React.FC = () => {
 
   const onRefresh = (): void => { setRefreshing(true); loadDocuments(); };
 
-  // Phase 1 — open picker (gallery / camera). User crops via the system
-  // editor inside ImagePicker. The picked asset is held in state and shown
-  // in a preview modal until they explicitly tap Submit.
+  // Phase 1 — open picker (gallery / camera) with the styled crop UI
+  // (react-native-image-crop-picker → UCrop on Android). Cropper has a
+  // branded toolbar + a clearly-coloured confirm tick, replacing
+  // Android's plain "CROP" text overlay that customers struggled with.
+  // The picked asset is held in state + shown in a preview modal until
+  // they tap Submit.
   const pickFromGallery = async (docType: DocType): Promise<void> => {
     try {
       haptics.tap();
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        showToast('Permission Needed', 'Please allow access to photos to upload', 'error');
-        return;
-      }
-      const result: any = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ['images'] as any,
-        allowsEditing: true,
-        aspect: [4, 3],
-        quality: 0.8,
+      const file = await pickWithCrop({ namePrefix: `kyc_${docType.key}` });
+      if (!file) return;
+      // Wrap into the same { uri, mimeType, fileName } shape the rest
+      // of this screen expects so we don't have to touch the upload /
+      // preview rendering downstream.
+      setPendingUpload({
+        docType,
+        asset: { uri: file.uri, mimeType: file.type, fileName: file.name } as any,
       });
-      if (result.canceled || !result.assets?.[0]) return;
-      setPendingUpload({ docType, asset: result.assets[0] });
     } catch (e: any) {
       console.log('gallery pick error:', e?.message);
       showToast('Could Not Open', 'Photo picker failed to open', 'error');
@@ -131,18 +131,12 @@ const DocumentsScreen: React.FC = () => {
   const pickFromCamera = async (docType: DocType): Promise<void> => {
     try {
       haptics.tap();
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permission.granted) {
-        showToast('Permission Needed', 'Camera access required', 'error');
-        return;
-      }
-      const result: any = await ImagePicker.launchCameraAsync({
-        allowsEditing: true,
-        aspect: [4, 3],
-        quality: 0.8,
+      const file = await captureWithCrop({ namePrefix: `kyc_${docType.key}` });
+      if (!file) return;
+      setPendingUpload({
+        docType,
+        asset: { uri: file.uri, mimeType: file.type, fileName: file.name } as any,
       });
-      if (result.canceled || !result.assets?.[0]) return;
-      setPendingUpload({ docType, asset: result.assets[0] });
     } catch (e: any) {
       console.log('camera pick error:', e?.message);
       showToast('Could Not Open', 'Camera failed to open', 'error');
@@ -220,9 +214,10 @@ const DocumentsScreen: React.FC = () => {
       >
         {/* Brand header with progress */}
         <View style={styles.header}>
-          <Text style={styles.headerTitle}>My Documents</Text>
+          <Text style={styles.headerTitle}>My KYC Documents</Text>
           <Text style={styles.headerSubtitle}>
-            Upload your KYC documents to verify your account
+            Upload your identity proofs (Aadhaar, PAN, Photo, Address)
+            so your account is verified before booking any service.
           </Text>
 
           <View style={styles.progressBox}>
@@ -354,6 +349,8 @@ const DocumentsScreen: React.FC = () => {
                 resizeMode="contain"
               />
             )}
+            {/* In-app Crop buttons removed — system picker handles
+                cropping (`allowsEditing: true`). */}
             <View style={styles.previewActions}>
               <TouchableOpacity
                 style={[styles.previewBtn, styles.previewBtnGhost]}
@@ -450,8 +447,39 @@ const styles = StyleSheet.create({
   },
   previewTitle: { fontSize: 17, fontWeight: '800', color: '#1A1A1A', marginBottom: 4 },
   previewHint: { fontSize: 12, color: '#6C757D', marginBottom: 14 },
+  // Wrapper so we can absolutely-position the floating Crop pill on
+  // top of the image.
+  previewImageWrap: {
+    position: 'relative',
+    width: '100%',
+    marginBottom: 16,
+  },
   previewImage: {
-    width: '100%', height: 360, borderRadius: 12, backgroundColor: '#F0F2F5', marginBottom: 16,
+    width: '100%', height: 360, borderRadius: 12, backgroundColor: '#F0F2F5',
+  },
+  // Floating Crop button in top-right of the image — bright green with
+  // a white border + drop shadow so it's visible on any image.
+  previewCropOverlay: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    backgroundColor: '#10B981',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 22,
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.45,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  previewCropOverlayText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
   previewActions: { flexDirection: 'row', gap: 10 },
   previewBtn: {
@@ -459,6 +487,10 @@ const styles = StyleSheet.create({
   },
   previewBtnGhost: { backgroundColor: '#F0F2F5' },
   previewBtnGhostText: { color: '#37474F', fontWeight: '700', fontSize: 14 },
+  // Secondary crop button in the action row (in addition to the
+  // overlay) so the user can reach it from either spot.
+  previewBtnCrop: { backgroundColor: '#10B981' },
+  previewBtnCropText: { color: '#fff', fontWeight: '800', fontSize: 14 },
   previewBtnPrimary: { backgroundColor: '#E63946' },
   previewBtnPrimaryText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   docMiddle: { flex: 1 },

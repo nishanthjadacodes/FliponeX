@@ -381,6 +381,46 @@ export const updateProfile = async (
   }
 };
 
+// Remove the current profile picture (sets User.profile_pic to NULL).
+// UI should optimistically clear the local state so the avatar reverts
+// to the first-letter initial without waiting for a re-fetch.
+export const deleteAvatar = async (): Promise<{ success: boolean }> => {
+  try {
+    const response = await api.delete<{ success: boolean }>('/profile/avatar');
+    return response.data;
+  } catch (error: any) {
+    console.error('Delete avatar error:', error);
+    throw error.response?.data || { message: 'Failed to remove avatar' };
+  }
+};
+
+// Upload / replace the user's avatar (profile picture). Returns the new
+// URL the backend stored on User.profile_pic — typically a Cloudinary URL
+// in production, /uploads/<filename> on local. UI updates state with the
+// returned URL so the new avatar renders without an extra GET.
+export const uploadAvatar = async (file: {
+  uri: string;
+  name: string;
+  type: string;
+}): Promise<{ success: boolean; profile_pic: string }> => {
+  const fd = new FormData();
+  fd.append('file', file as any);
+  const token = await getToken();
+  const res = await fetch(`${api.defaults.baseURL}/profile/avatar`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: fd as any,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((json as any)?.message || `Avatar upload failed (HTTP ${res.status})`);
+  }
+  return json as { success: boolean; profile_pic: string };
+};
+
 // ─── Documents ─────────────────────────────────────────────────────────────
 export const getMyDocuments = async (): Promise<ApiResponse<DocumentRecord[]> | DocumentRecord[]> => {
   try {
@@ -617,6 +657,29 @@ export interface ReviewPayload {
   [key: string]: unknown;
 }
 
+// Customer self-reschedule. Backend gates on >=2h before scheduled time;
+// closer than that returns 400 with a "window closed, contact support"
+// message. Caller should surface the message to the user.
+export interface RescheduleOptions {
+  preferred_date?: string;
+  preferred_time?: string;
+  reason?: string;
+}
+export const rescheduleMyBooking = async (
+  bookingId: string,
+  payload: RescheduleOptions,
+): Promise<ApiResponse<unknown>> => {
+  try {
+    const response = await api.put<ApiResponse<unknown>>(
+      `/bookings/${bookingId}/reschedule`,
+      payload,
+    );
+    return response.data;
+  } catch (error: any) {
+    throw error.response?.data || { message: 'Failed to reschedule' };
+  }
+};
+
 export const submitReview = async (
   bookingId: string,
   reviewData: ReviewPayload,
@@ -755,6 +818,25 @@ export const getCurrentLocation = async (): Promise<ApiResponse<unknown>> => {
   } catch (error) {
     console.error('Get current location error:', error);
     throw error;
+  }
+};
+
+// Push the user's current GPS coords up to the backend so they're
+// stored on the User row (current_lat / current_lng). Used by the
+// customer's BookingScreen the moment they tap "Use my location" —
+// agents reading the booking detail then get fresh coords for
+// reliable distance calculation, even on Android devices without
+// Google Mobile Services where Location.geocodeAsync returns empty.
+//
+// Fire-and-forget: failure is non-fatal (network / auth).
+export const updateMyLocation = async (
+  latitude: number,
+  longitude: number,
+): Promise<void> => {
+  try {
+    await api.post('/geolocation/update', { latitude, longitude });
+  } catch (e: any) {
+    console.log('[geolocation/update] non-fatal:', e?.message);
   }
 };
 
@@ -1092,6 +1174,51 @@ export const getOffers = async (): Promise<ApiResponse<OfferItem[]>> => {
   return data;
 };
 
+// ─── In-app notification inbox (Alerts chip on Home + banner) ─────────────
+export interface InboxItem {
+  id: string | number;
+  type: string;
+  title: string;
+  body?: string | null;
+  deep_link?: { route?: string; params?: Record<string, unknown> } | null;
+  metadata?: any;
+  seen_at?: string | null;
+  created_at?: string;
+}
+
+export interface InboxResponse {
+  notifications: InboxItem[];
+  unread_count: number;
+}
+
+// Pulls the customer's inbox. `unread_only=true` is what the top-down
+// banner uses; the Alerts modal on Home wants ALL notifications (most
+// recent first), so we pass false. Limit kept at 50 — anything older
+// is rarely actioned and not worth shipping over the wire on every
+// home-screen poll.
+export const getInboxNotifications = async (
+  unreadOnly: boolean = false,
+  limit: number = 50,
+): Promise<InboxResponse> => {
+  const { data } = await api.get<InboxResponse>(
+    `/notifications/inbox?unread_only=${unreadOnly ? 'true' : 'false'}&limit=${limit}`,
+  );
+  return data;
+};
+
+// Mark a single notification as seen. Called when the user taps a row
+// in the Alerts modal. Backend flips seen_at and the badge count drops.
+export const markNotificationRead = async (id: string | number): Promise<void> => {
+  await api.post(`/notifications/${id}/read`, {});
+};
+
+// Bulk "mark everything as seen" — fires when the user opens the
+// Alerts modal so the badge clears to 0 immediately. New notifications
+// arriving after this point bump the badge back up.
+export const markAllNotificationsRead = async (): Promise<void> => {
+  await api.post('/notifications/read-all', {});
+};
+
 // ─── Compliance Vault (B2B) ───────────────────────────────────────────────
 export type ComplianceType =
   | 'factory_license'
@@ -1112,7 +1239,13 @@ export interface ComplianceDoc {
   mime_type: string;
   plaintext_size: number;
   note?: string | null;
-  compliance_type: ComplianceType;
+  compliance_type?: ComplianceType | null;
+  // Register-specific fields. Set when the row was added via the personal
+  // compliance register; null when the row predates the register feature.
+  document_name?: string | null;
+  issuing_authority?: string | null;
+  document_number?: string | null;
+  issue_date?: string | null;
   expiry_date: string; // YYYY-MM-DD
   status: ComplianceStatus;
   daysLeft: number;
@@ -1132,14 +1265,30 @@ export const getComplianceDocs = async (): Promise<ComplianceListResponse> => {
   return data;
 };
 
+export interface ComplianceUploadFields {
+  // Either compliance_type (legacy enum / B2B path) OR document_name
+  // (free-text register path) must be set. Both is fine too.
+  compliance_type?: ComplianceType | string;
+  document_name?: string;
+  issuing_authority?: string;
+  document_number?: string;
+  issue_date?: string;       // YYYY-MM-DD
+  expiry_date: string;       // YYYY-MM-DD (required)
+  note?: string;
+}
+
 export const uploadComplianceDoc = async (
   file: { uri: string; name: string; type: string },
-  fields: { compliance_type: ComplianceType | string; expiry_date: string; note?: string },
+  fields: ComplianceUploadFields,
 ): Promise<{ success: boolean; data: ComplianceDoc }> => {
   const fd = new FormData();
   fd.append('file', file as any);
-  fd.append('compliance_type', fields.compliance_type);
   fd.append('expiry_date', fields.expiry_date);
+  if (fields.compliance_type) fd.append('compliance_type', fields.compliance_type);
+  if (fields.document_name) fd.append('document_name', fields.document_name);
+  if (fields.issuing_authority) fd.append('issuing_authority', fields.issuing_authority);
+  if (fields.document_number) fd.append('document_number', fields.document_number);
+  if (fields.issue_date) fd.append('issue_date', fields.issue_date);
   if (fields.note) fd.append('note', fields.note);
 
   // Use raw fetch so we don't double-set Content-Type — multipart needs a
@@ -1160,13 +1309,61 @@ export const uploadComplianceDoc = async (
   return json as { success: boolean; data: ComplianceDoc };
 };
 
+// Inline-edit a register row. Only the fields you pass are updated;
+// everything else is preserved. Pass empty string to clear a field.
+export interface ComplianceUpdateFields {
+  document_name?: string | null;
+  issuing_authority?: string | null;
+  document_number?: string | null;
+  issue_date?: string | null;
+  expiry_date?: string | null;
+  note?: string | null;
+  compliance_type?: ComplianceType | string | null;
+}
+
+export const updateComplianceDoc = async (
+  id: string,
+  updates: ComplianceUpdateFields,
+): Promise<{ success: boolean; data: ComplianceDoc }> => {
+  const { data } = await api.patch<{ success: boolean; data: ComplianceDoc }>(
+    `/compliance/${id}`,
+    updates,
+  );
+  return data;
+};
+
+export const deleteComplianceDoc = async (
+  id: string,
+): Promise<{ success: boolean }> => {
+  const { data } = await api.delete<{ success: boolean }>(`/compliance/${id}`);
+  return data;
+};
+
 export const renewComplianceDoc = async (
   id: string,
 ): Promise<{ success: boolean; message: string }> => {
-  const { data } = await api.post<{ success: boolean; message: string }>(
-    `/compliance/${id}/renew`,
-  );
-  return data;
+  try {
+    const { data } = await api.post<{ success: boolean; message: string }>(
+      `/compliance/${id}/renew`,
+    );
+    return data;
+  } catch (e: any) {
+    // axios swallows the backend's structured error inside e.response.data.
+    // Rethrow with the real message so the alert reads "Document not found"
+    // / "Company profile required" instead of the opaque
+    // "Request failed with status code 404".
+    const backendMsg = e?.response?.data?.message;
+    const status = e?.response?.status;
+    if (status === 404) {
+      throw new Error(
+        backendMsg ||
+          "We couldn't find this compliance document on our records. " +
+            'Open My Documents and re-upload it to enable one-click renewal.',
+      );
+    }
+    if (backendMsg) throw new Error(backendMsg);
+    throw e;
+  }
 };
 
 // Re-export shared types so screens can import them from `services/api` directly

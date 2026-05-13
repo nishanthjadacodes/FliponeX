@@ -10,8 +10,11 @@ import {
   ActivityIndicator,
   Modal,
   Image,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Clipboard from 'expo-clipboard';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import {
@@ -21,7 +24,9 @@ import {
   submitReview,
   createPaymentOrder,
   verifyPayment,
+  rescheduleMyBooking,
 } from '../services/api';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import RazorpayCheckout from 'react-native-razorpay';
 import * as haptics from '../utils/haptics';
 import { formatBookingId } from '../utils/bookingId';
@@ -97,6 +102,17 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
   // Deferred payment — set true while the Razorpay popup is open / order is
   // being created. Locks the "Pay Now" button so the user can't double-tap.
   const [paying, setPaying] = useState<boolean>(false);
+  // Reschedule modal state — owns the new preferred date/time + reason
+  // and the loading flag while the PUT /bookings/:id/reschedule is in
+  // flight. Replaces the earlier "navigate back to Booking" stub which
+  // silently dropped the booking-id and looked broken to users.
+  const [showReschedule, setShowReschedule] = useState<boolean>(false);
+  const [rescheduleDate, setRescheduleDate] = useState<Date | null>(null);
+  const [rescheduleTime, setRescheduleTime] = useState<Date | null>(null);
+  const [rescheduleReason, setRescheduleReason] = useState<string>('');
+  const [rescheduling, setRescheduling] = useState<boolean>(false);
+  const [showRescheduleDatePicker, setShowRescheduleDatePicker] = useState<boolean>(false);
+  const [showRescheduleTimePicker, setShowRescheduleTimePicker] = useState<boolean>(false);
 
   useEffect(() => {
     loadBookingDetails();
@@ -251,6 +267,43 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     } finally {
       setVerificationLoading(false);
       setOtp('');
+    }
+  };
+
+  // Submit a reschedule request to the backend. Backend gates on >=2h
+  // before the original scheduled time and returns a friendly message
+  // when the window is closed — we surface it as-is so the user knows
+  // to call support rather than blame the app.
+  const handleSubmitReschedule = async (): Promise<void> => {
+    if (!rescheduleDate || !rescheduleTime) {
+      Alert.alert('Pick a date & time', 'Please select both a new date and time.');
+      return;
+    }
+    setRescheduling(true);
+    try {
+      const yyyy = rescheduleDate.getFullYear();
+      const mm = String(rescheduleDate.getMonth() + 1).padStart(2, '0');
+      const dd = String(rescheduleDate.getDate()).padStart(2, '0');
+      const hh = String(rescheduleTime.getHours()).padStart(2, '0');
+      const mi = String(rescheduleTime.getMinutes()).padStart(2, '0');
+      await rescheduleMyBooking(String(bookingId), {
+        preferred_date: `${yyyy}-${mm}-${dd}`,
+        preferred_time: `${hh}:${mi}`,
+        reason: rescheduleReason.trim() || undefined,
+      });
+      haptics.success();
+      setShowReschedule(false);
+      setRescheduleDate(null);
+      setRescheduleTime(null);
+      setRescheduleReason('');
+      Alert.alert('Rescheduled', 'Your booking has been rescheduled successfully.');
+      await loadBookingDetails();
+    } catch (e: any) {
+      haptics.error();
+      const msg = e?.message || 'Could not reschedule. Please try again or contact support.';
+      Alert.alert('Reschedule failed', msg);
+    } finally {
+      setRescheduling(false);
     }
   };
 
@@ -440,7 +493,15 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
         <View style={{ width: 56 }} />
       </View>
 
-      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.content}
+        showsVerticalScrollIndicator={false}
+        // Reserve space for the device's gesture / home-indicator bar
+        // plus a 16px buffer. Without this, the bottom action row
+        // (Track / Receipt / Reschedule / Cancel) was sitting under
+        // Android's 3-button bar — the user had to scroll past it.
+        contentContainerStyle={{ paddingBottom: insets.bottom + 16 }}
+      >
         {/* Booking Status */}
         <View style={styles.statusContainer}>
           <Text style={styles.bookingNumber}>{formatBookingId(booking?.booking_number || bookingId)}</Text>
@@ -458,6 +519,55 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
               {booking?.service?.name || booking?.service_name || booking?.serviceName || 'N/A'}
             </Text>
           </View>
+          {/* Preferred date — was previously missing from BookingDetails,
+              so customers couldn't see when they'd scheduled the visit.
+              Falls back to created_at (the booking creation date) so
+              older bookings without preferred_date still show something. */}
+          {(booking?.preferred_date || booking?.created_at) && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Date:</Text>
+              <Text style={styles.detailValue}>
+                {(() => {
+                  const raw = booking?.preferred_date || booking?.created_at;
+                  const d = new Date(raw);
+                  return Number.isNaN(d.getTime())
+                    ? String(raw)
+                    : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+                })()}
+              </Text>
+            </View>
+          )}
+          {/* Time slot — what the customer picked on step 4. Previously
+              hidden entirely from BookingDetails. */}
+          {booking?.preferred_time && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Time Slot:</Text>
+              <Text style={styles.detailValue}>{booking.preferred_time}</Text>
+            </View>
+          )}
+          {/* Service mode + urgency — surfaces the deliveryMode and
+              serviceMode the customer chose, so booking history matches
+              what they confirmed at checkout. */}
+          {booking?.delivery_mode && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Mode:</Text>
+              <Text style={styles.detailValue}>
+                {booking.delivery_mode === 'online'
+                  ? '💻 Online (Operator)'
+                  : '🏠 Offline (Doorstep)'}
+              </Text>
+            </View>
+          )}
+          {booking?.service_mode && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Urgency:</Text>
+              <Text style={styles.detailValue}>
+                {booking.service_mode === 'fast_track'
+                  ? '⚡ High Priority (Fast-Track)'
+                  : 'Low Priority (Regular)'}
+              </Text>
+            </View>
+          )}
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Amount:</Text>
             <Text style={styles.detailValue}>
@@ -495,8 +605,41 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
           </View>
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Address:</Text>
-            <Text style={styles.detailValue}>
-              {booking?.service_address || booking?.address || booking?.customer_address || 'N/A'}
+            <Text
+              style={styles.detailValue}
+              onPress={() => {
+                // If the stored address looks like "lat, lng", open
+                // Google Maps so the customer can verify the pin. Bare
+                // coords are normally a sign that reverse-geocoding
+                // failed on the booking flow — this gives them a way
+                // to actually see what the address resolves to.
+                const raw =
+                  booking?.service_address || booking?.address || booking?.customer_address || '';
+                const m = String(raw).match(
+                  /^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/,
+                );
+                if (m) {
+                  const url = `https://www.google.com/maps/search/?api=1&query=${m[1]},${m[2]}`;
+                  try {
+                    require('react-native').Linking.openURL(url).catch(() => {});
+                  } catch {}
+                }
+              }}
+            >
+              {(() => {
+                // Display logic — pure lat/lng strings get a clearer
+                // "Location pin (lat, lng)" prefix + tap-to-map hint.
+                // Customers used to see naked "12.345678, 77.123456"
+                // and wonder if the address even got saved.
+                const raw =
+                  booking?.service_address || booking?.address || booking?.customer_address;
+                if (!raw) return 'N/A';
+                const m = String(raw).match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
+                if (m) {
+                  return `📍 Map pin: ${Number(m[1]).toFixed(5)}, ${Number(m[2]).toFixed(5)} (tap to open)`;
+                }
+                return String(raw);
+              })()}
             </Text>
           </View>
         </View>
@@ -585,6 +728,60 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
           }
         </View>
 
+        {/* Payment receipt — shown ONLY after a successful Razorpay
+            transaction. Surfaces the full trail (UPI/Card/etc + transaction
+            id + amount + paid timestamp) so the customer has a verifiable
+            proof of payment without leaving the booking screen. */}
+        {booking?.payment_status === 'paid' && (
+          <View style={styles.paymentReceipt}>
+            <View style={styles.paymentReceiptHeader}>
+              <Text style={styles.paymentReceiptIcon}>✅</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.paymentReceiptTitle}>Payment Successful</Text>
+                {booking?.paid_at && (
+                  <Text style={styles.paymentReceiptSubtitle}>
+                    {new Date(booking.paid_at).toLocaleString('en-IN', {
+                      day: '2-digit', month: 'short', year: 'numeric',
+                      hour: '2-digit', minute: '2-digit',
+                    })}
+                  </Text>
+                )}
+              </View>
+              <Text style={styles.paymentReceiptAmount}>
+                ₹{booking?.amount_paid ?? booking?.total_amount ?? booking?.price_quoted ?? 0}
+              </Text>
+            </View>
+            <View style={styles.paymentReceiptDivider} />
+            <View style={styles.paymentReceiptRow}>
+              <Text style={styles.paymentReceiptLabel}>Method</Text>
+              <Text style={styles.paymentReceiptValue}>
+                {(booking?.payment_method || 'online').toUpperCase()}
+              </Text>
+            </View>
+            {booking?.transaction_id && (
+              <View style={styles.paymentReceiptRow}>
+                <Text style={styles.paymentReceiptLabel}>Transaction ID</Text>
+                <TouchableOpacity
+                  onPress={async () => {
+                    await Clipboard.setStringAsync(String(booking.transaction_id));
+                    Alert.alert('Copied', 'Transaction ID copied to clipboard.');
+                  }}
+                >
+                  <Text
+                    style={[styles.paymentReceiptValue, styles.paymentReceiptCopyable]}
+                    numberOfLines={1}
+                  >
+                    {booking.transaction_id}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            )}
+            <Text style={styles.paymentReceiptHint}>
+              Tap the transaction ID to copy. Save it for your records.
+            </Text>
+          </View>
+        )}
+
         {/* Deferred Pay Now banner — shown only after the representative
             marks the work complete AND payment hasn't been collected yet.
             Customer pays via Razorpay (UPI / Card / Netbanking / Wallets). */}
@@ -616,12 +813,34 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           )}
 
-        {/* "Verify Completion" used to live here. Removed because the OTP
-            handshake is owned by the rep — the customer reads the OTP off
-            the dev banner / SMS and tells it to the rep, who enters it on
-            the rep app. By the time the booking shows up here as
-            'completed', verification has already happened. The customer's
-            only remaining action is the rating below. */}
+        {/* Customer-facing OTP — shown when the rep has marked work
+            completed and is waiting for the customer to verify. The
+            customer reads this aloud to the rep, who types it on their
+            app to close the booking. Tap-to-copy makes it dictation-
+            friendly. The OTP arrives via push/SMS in production; this
+            in-app banner is the dev-mode fallback so testing works
+            without an SMS gateway. */}
+        {booking?.completion_otp &&
+          ['submitted', 'work_completed', 'in_progress'].includes(booking?.status) && (
+            <View style={styles.otpBanner}>
+              <Text style={styles.otpBannerLabel}>YOUR SUCCESS CODE</Text>
+              <Text style={styles.otpBannerCode} selectable>
+                {booking.completion_otp}
+              </Text>
+              <Text style={styles.otpBannerHint}>
+                Read this code to your representative when they ask.
+              </Text>
+              <TouchableOpacity
+                style={styles.otpBannerCopyBtn}
+                onPress={async () => {
+                  await Clipboard.setStringAsync(String(booking.completion_otp));
+                  Alert.alert('Copied', 'OTP copied to clipboard.');
+                }}
+              >
+                <Text style={styles.otpBannerCopyBtnText}>Tap to copy</Text>
+              </TouchableOpacity>
+            </View>
+        )}
 
         {/* Rate & Review (only for completed bookings without rating yet) */}
         {booking?.status === 'completed' && !booking?.customer_rating && (
@@ -662,6 +881,15 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             <Text style={styles.actionBtnIcon}>🧾</Text>
             <Text style={styles.actionBtnLabel}>Receipt</Text>
           </TouchableOpacity>
+          {(booking?.status === 'pending' || booking?.status === 'assigned' || booking?.status === 'accepted') && (
+            <TouchableOpacity
+              style={styles.actionBtn}
+              onPress={() => { haptics.tap(); setShowReschedule(true); }}
+            >
+              <Text style={styles.actionBtnIcon}>📅</Text>
+              <Text style={styles.actionBtnLabel}>Reschedule</Text>
+            </TouchableOpacity>
+          )}
           {(booking?.status === 'pending' || booking?.status === 'assigned') && (
             <TouchableOpacity style={[styles.actionBtn, styles.actionBtnDanger]} onPress={handleCancelBooking}>
               <Text style={styles.actionBtnIcon}>❌</Text>
@@ -673,6 +901,10 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
 
       {/* Rating Modal */}
       <Modal visible={showRating} transparent animationType="slide" onRequestClose={() => setShowRating(false)}>
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
         <View style={styles.modalOverlay}>
           <View style={styles.ratingCard}>
             <Text style={styles.ratingTitle}>Rate Your Experience</Text>
@@ -717,6 +949,7 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           </View>
         </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* Tap-to-preview modal — opens when the user taps any doc row above. */}
@@ -725,11 +958,146 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
         doc={previewDoc}
         onClose={() => setPreviewDoc(null)}
       />
+
+      {/* Reschedule modal — replaces the broken "navigate to Booking"
+          flow. Customer picks a new date + time + optional reason and
+          we hit PUT /bookings/:id/reschedule directly. Backend gates on
+          >=2h before scheduled time. */}
+      <Modal
+        visible={showReschedule}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowReschedule(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.rescheduleCard}>
+            <Text style={styles.rescheduleTitle}>Reschedule Booking</Text>
+            <Text style={styles.rescheduleSubtitle}>
+              Pick a new date & time. Must be at least 2 hours before the
+              original scheduled time.
+            </Text>
+
+            <Text style={styles.rescheduleLabel}>New Date *</Text>
+            <TouchableOpacity
+              style={styles.rescheduleInput}
+              onPress={() => setShowRescheduleDatePicker(true)}
+            >
+              <Text style={{ color: rescheduleDate ? '#1F2937' : '#94A3B8' }}>
+                {rescheduleDate ? rescheduleDate.toLocaleDateString('en-IN') : 'Select date'}
+              </Text>
+            </TouchableOpacity>
+            {showRescheduleDatePicker && (
+              <DateTimePicker
+                value={rescheduleDate || new Date()}
+                mode="date"
+                display="default"
+                minimumDate={new Date()}
+                maximumDate={new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)}
+                onChange={(_event: any, d: any) => {
+                  setShowRescheduleDatePicker(false);
+                  if (d) setRescheduleDate(d);
+                }}
+              />
+            )}
+
+            <Text style={styles.rescheduleLabel}>New Time *</Text>
+            <TouchableOpacity
+              style={styles.rescheduleInput}
+              onPress={() => setShowRescheduleTimePicker(true)}
+            >
+              <Text style={{ color: rescheduleTime ? '#1F2937' : '#94A3B8' }}>
+                {rescheduleTime
+                  ? rescheduleTime.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+                  : 'Select time'}
+              </Text>
+            </TouchableOpacity>
+            {showRescheduleTimePicker && (
+              <DateTimePicker
+                value={rescheduleTime || new Date()}
+                mode="time"
+                display="default"
+                is24Hour={false}
+                onChange={(_event: any, t: any) => {
+                  setShowRescheduleTimePicker(false);
+                  if (t) setRescheduleTime(t);
+                }}
+              />
+            )}
+
+            <Text style={styles.rescheduleLabel}>Reason (optional)</Text>
+            <TextInput
+              style={[styles.rescheduleInput, { height: 80, textAlignVertical: 'top', paddingTop: 10 }]}
+              placeholder="Why are you rescheduling?"
+              placeholderTextColor="#94A3B8"
+              value={rescheduleReason}
+              onChangeText={setRescheduleReason}
+              multiline
+            />
+
+            <View style={styles.rescheduleActions}>
+              <TouchableOpacity
+                style={styles.rescheduleCancelBtn}
+                onPress={() => setShowReschedule(false)}
+                disabled={rescheduling}
+              >
+                <Text style={styles.rescheduleCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.rescheduleSubmitBtn, rescheduling && { opacity: 0.7 }]}
+                onPress={handleSubmitReschedule}
+                disabled={rescheduling}
+              >
+                {rescheduling ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.rescheduleSubmitText}>Confirm Reschedule</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
+  // ─── Payment receipt (shown after Razorpay confirms `captured`) ───
+  paymentReceipt: {
+    margin: SIZES.BASE,
+    padding: 14,
+    borderRadius: 14,
+    backgroundColor: '#ECFDF5',
+    borderWidth: 1,
+    borderColor: '#10B981',
+  },
+  paymentReceiptHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  paymentReceiptIcon: { fontSize: 24 },
+  paymentReceiptTitle: { fontSize: 15, fontWeight: '800', color: '#065F46' },
+  paymentReceiptSubtitle: { fontSize: 11, color: '#047857', marginTop: 2 },
+  paymentReceiptAmount: { fontSize: 18, fontWeight: '900', color: '#065F46' },
+  paymentReceiptDivider: { height: 1, backgroundColor: '#A7F3D0', marginVertical: 10 },
+  paymentReceiptRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  paymentReceiptLabel: { fontSize: 12, color: '#047857' },
+  paymentReceiptValue: { fontSize: 13, fontWeight: '700', color: '#0F172A', maxWidth: '60%' },
+  paymentReceiptCopyable: { textDecorationLine: 'underline', color: '#059669' },
+  paymentReceiptHint: {
+    fontSize: 10,
+    color: '#047857',
+    fontStyle: 'italic',
+    marginTop: 6,
+    textAlign: 'right',
+  },
+
   // ─── Pay Now banner (shown after status=completed, before payment) ───
   payBanner: {
     flexDirection: 'row',
@@ -824,6 +1192,69 @@ const styles = StyleSheet.create({
   modalBtn: { flex: 1, paddingVertical: 14, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   modalBtnCancel: { backgroundColor: '#F0F2F5' },
   modalBtnSubmit: { backgroundColor: '#E63946' },
+
+  // ─── Reschedule modal ───
+  rescheduleCard: {
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    padding: 22,
+    maxHeight: '90%',
+  },
+  rescheduleTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#0D3B66',
+    marginBottom: 4,
+  },
+  rescheduleSubtitle: {
+    fontSize: 12,
+    color: '#6C757D',
+    marginBottom: 16,
+  },
+  rescheduleLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1F2937',
+    marginBottom: 6,
+    marginTop: 8,
+  },
+  rescheduleInput: {
+    borderWidth: 1,
+    borderColor: '#E9ECEF',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    fontSize: 14,
+    color: '#1F2937',
+    backgroundColor: '#F8FAFC',
+  },
+  rescheduleActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 18,
+  },
+  rescheduleCancelBtn: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    backgroundColor: '#F0F2F5',
+  },
+  rescheduleCancelText: {
+    color: '#1F2937',
+    fontWeight: '700',
+  },
+  rescheduleSubmitBtn: {
+    flex: 2,
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    backgroundColor: '#0D3B66',
+  },
+  rescheduleSubmitText: {
+    color: '#fff',
+    fontWeight: '800',
+  },
 
   container: {
     flex: 1,
@@ -1057,6 +1488,52 @@ const styles = StyleSheet.create({
   },
   documentTapHint: {
     fontSize: 10, color: '#1976D2', fontWeight: '600', marginTop: 4, letterSpacing: 0.3,
+  },
+  otpBanner: {
+    margin: SIZES.BASE,
+    backgroundColor: '#FEF3C7',
+    borderWidth: 2,
+    borderColor: '#F59E0B',
+    borderRadius: 14,
+    padding: 16,
+    alignItems: 'center',
+    shadowColor: '#92400E',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  otpBannerLabel: {
+    color: '#92400E',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 1.5,
+    marginBottom: 6,
+  },
+  otpBannerCode: {
+    color: '#0F172A',
+    fontSize: 36,
+    fontWeight: '900',
+    letterSpacing: 8,
+    marginBottom: 6,
+  },
+  otpBannerHint: {
+    color: '#78350F',
+    fontSize: 12,
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  otpBannerCopyBtn: {
+    backgroundColor: '#0D3B66',
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+    borderRadius: 18,
+  },
+  otpBannerCopyBtnText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
   noDocumentsSubtext: {
     fontSize: SIZES.SMALL,

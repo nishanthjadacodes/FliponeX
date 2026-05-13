@@ -12,8 +12,10 @@ import {
   Image,
   Linking,
   Platform,
+  KeyboardAvoidingView,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import { captureWithCrop, pickWithCrop } from '../../utils/cropPicker';
 import * as Location from 'expo-location';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import {
@@ -166,6 +168,17 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         // work_completed/submitted stage. This way navigating away and
         // back doesn't lose the OTP banner.
         if (b.completion_otp) setDevOtp(String(b.completion_otp));
+        // Prefer the customer's actual coordinates (last known position
+        // pinged from their device) over geocoding the typed address.
+        // Android's Location.geocodeAsync returns empty on devices
+        // without Google Mobile Services, which is why the previous
+        // version always showed "Address unresolved".
+        const customerLat = b.customer?.current_lat
+          ? Number(b.customer.current_lat)
+          : null;
+        const customerLng = b.customer?.current_lng
+          ? Number(b.customer.current_lng)
+          : null;
         const nextTask: Task = {
           id: b.id,
           customerId: b.customer_id || b.customer?.id || undefined,
@@ -182,7 +195,7 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
           requiredDocuments: b.documents_required || b.service?.required_documents,
         };
         setTask(nextTask);
-        computeDistance(nextTask.address);
+        computeDistance(nextTask.address, customerLat, customerLng);
       } else {
         setLoadError(data?.message || 'Task data is empty.');
       }
@@ -194,36 +207,63 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
     }
   };
 
-  const computeDistance = async (address: string): Promise<void> => {
+  const computeDistance = async (
+    address: string,
+    customerLat: number | null,
+    customerLng: number | null,
+  ): Promise<void> => {
     try {
-      if (!address || address === 'No address') {
-        setTask((t) => (t ? { ...t, distance: 'N/A' } : t));
-        return;
-      }
-
       const perm = await Location.requestForegroundPermissionsAsync();
       if (perm.status !== 'granted') {
         setTask((t) => (t ? { ...t, distance: 'Enable location' } : t));
         return;
       }
 
-      const [agentPos, geocoded] = await Promise.all([
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        Location.geocodeAsync(address).catch(() => [] as Location.LocationGeocodedLocation[]),
-      ]);
+      const agentPos = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
 
-      if (!geocoded || geocoded.length === 0) {
-        setTask((t) => (t ? { ...t, distance: 'Address unresolved' } : t));
+      // Path A — use the customer's actual coords if the backend has
+      // them. This is the reliable path; works on every Android
+      // device regardless of geocoder availability.
+      if (
+        customerLat != null &&
+        customerLng != null &&
+        Number.isFinite(customerLat) &&
+        Number.isFinite(customerLng)
+      ) {
+        const km = haversineKm(
+          agentPos.coords.latitude,
+          agentPos.coords.longitude,
+          customerLat,
+          customerLng,
+        );
+        const display = km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+        setTask((t) => (t ? { ...t, distance: display } : t));
         return;
       }
 
+      // Path B — fall back to geocoding the typed address. Often
+      // returns [] on Android devices without Google Mobile Services
+      // (custom ROMs, Huawei, etc.) — in that case we show a helpful
+      // hint instead of pretending we know the distance.
+      if (!address || address === 'No address') {
+        setTask((t) => (t ? { ...t, distance: 'No address' } : t));
+        return;
+      }
+      const geocoded = await Location.geocodeAsync(address).catch(
+        () => [] as Location.LocationGeocodedLocation[],
+      );
+      if (!geocoded || geocoded.length === 0) {
+        setTask((t) => (t ? { ...t, distance: 'Tap address to navigate' } : t));
+        return;
+      }
       const km = haversineKm(
         agentPos.coords.latitude,
         agentPos.coords.longitude,
         geocoded[0].latitude,
         geocoded[0].longitude,
       );
-
       const display = km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
       setTask((t) => (t ? { ...t, distance: display } : t));
     } catch (e: any) {
@@ -345,6 +385,11 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
     // alert — opening the OTP modal is feedback enough. Idempotent: on
     // bookings already at work_completed, backend just re-emits the OTP.
     await updateStatus('work_completed', true);
+    // Signal the dashboard to do a force-refresh on its next focus —
+    // booking just transitioned to 'submitted' on the backend, so
+    // /earnings now includes today's commission. The flag is read +
+    // cleared by DashboardScreen's focus listener.
+    AsyncStorage.setItem('dashboard_force_refresh', String(Date.now())).catch(() => {});
     setOtpModalVisible(true);
   };
 
@@ -357,6 +402,48 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
       Alert.alert('No Photos', 'Please capture at least one document photo before proceeding.');
       return;
     }
+    // Count how many docs the customer's service actually requires
+    // (filtering out non-uploadable text fields like Mobile Number).
+    const raw = (task as any)?.requiredDocuments;
+    const list: any[] = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.documents)
+        ? raw.documents
+        : [];
+    const requiredDocs = list.filter((d: any) => {
+      const t = String(d?.type || '').toLowerCase();
+      const l = String(d?.label || '').toLowerCase();
+      const blob = `${t} ${l}`;
+      // Mobile / phone / OTP entries are text fields collected in
+      // step 2 of the customer flow, not photo uploads — don't count
+      // them toward the "must capture" quota.
+      return !/(\b|_|-)(mobile|phone|telephone|cell|sim|otp)(\b|_|-|number|no|num)?/i.test(blob);
+    });
+    const requiredCount = requiredDocs.length;
+
+    // Quota check — only warns when the customer's service actually
+    // declared a doc list (some services have zero required docs).
+    if (requiredCount > 0 && capturedPhotos.length < requiredCount) {
+      const missing = requiredCount - capturedPhotos.length;
+      Alert.alert(
+        `${missing} document${missing === 1 ? '' : 's'} pending`,
+        `The customer's service requires ${requiredCount} document${requiredCount === 1 ? '' : 's'} but you've only captured ${capturedPhotos.length}. ` +
+          `Take photos of the remaining ${missing} before submitting, or tap Confirm to proceed anyway.`,
+        [
+          { text: 'Capture More', style: 'cancel' },
+          {
+            text: 'Confirm Anyway',
+            style: 'destructive',
+            onPress: () => {
+              updateStatus('documents_collected');
+              setDocumentsModalVisible(false);
+            },
+          },
+        ],
+      );
+      return;
+    }
+
     updateStatus('documents_collected');
     setDocumentsModalVisible(false);
   };
@@ -448,30 +535,18 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
   };
 
   const captureComplianceFromCamera = async (): Promise<void> => {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission Required', 'Camera permission is needed to capture the document.');
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ['images'],
-      quality: 0.8,
-      allowsEditing: true,
-    });
-    if (!result.canceled && result.assets?.[0]) {
-      setComplianceFile(buildComplianceFile(result.assets[0]));
-    }
+    // Styled crop UI — rep gets a branded cropper toolbar + clear
+    // confirm tick, same as customer-side. Replaces the system "CROP"
+    // overlay that was hard to spot on bright backgrounds.
+    const file = await captureWithCrop({ namePrefix: 'compliance' });
+    if (!file) return;
+    setComplianceFile(file);
   };
 
   const pickComplianceFromGallery = async (): Promise<void> => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      quality: 0.8,
-      allowsEditing: true,
-    });
-    if (!result.canceled && result.assets?.[0]) {
-      setComplianceFile(buildComplianceFile(result.assets[0]));
-    }
+    const file = await pickWithCrop({ namePrefix: 'compliance' });
+    if (!file) return;
+    setComplianceFile(file);
   };
 
   const handleComplianceSubmit = async (): Promise<void> => {
@@ -696,11 +771,18 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
   }
 
   return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
     <View style={styles.container}>
-      <ScrollView style={styles.content} stickyHeaderIndices={[0]}>
+      <ScrollView style={styles.content} stickyHeaderIndices={[0]} keyboardShouldPersistTaps="handled">
+        {/* Customer name at the very top — matches the customer's own
+            booking confirmation summary so the rep instantly knows who
+            the job is for before scanning service name / address. */}
         <View style={styles.taskHeader}>
+          <Text style={styles.taskCustomer}>{task?.customerName || 'Customer'}</Text>
           <Text style={styles.taskTitle}>{task?.serviceName}</Text>
-          <Text style={styles.taskCustomer}>{task?.customerName}</Text>
           <View style={styles.taskHeaderMeta}>
             <Text style={styles.taskAmount}>
               {'₹'}
@@ -711,6 +793,13 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         </View>
 
         <View style={styles.taskDetails}>
+          {/* Explicit Customer row at the top of the details section —
+              redundant with the header label above but matches the
+              customer-app summary layout the user asked us to mirror. */}
+          <View style={styles.detailItem}>
+            <Text style={styles.detailLabel}>Customer</Text>
+            <Text style={styles.detailValue}>{task?.customerName || 'N/A'}</Text>
+          </View>
           <View style={styles.detailItem}>
             <Text style={styles.detailLabel}>Address</Text>
             <Text style={styles.detailValue}>{task?.address}</Text>
@@ -771,7 +860,10 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         visible={otpModalVisible}
         onRequestClose={() => setOtpModalVisible(false)}
       >
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Complete Task</Text>
             <Text style={styles.modalDescription}>Enter the 6-digit OTP provided by the customer</Text>
@@ -817,7 +909,7 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+        </KeyboardAvoidingView>
       </Modal>
 
       <Modal
@@ -1000,6 +1092,7 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         </View>
       </Modal>
     </View>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -1021,10 +1114,19 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   taskTitle: {
-    fontSize: SIZES.h2, fontWeight: '900', color: COLORS.white, marginBottom: 2, letterSpacing: 0.3,
+    fontSize: SIZES.font + 2,
+    fontWeight: '600',
+    color: 'rgba(255,255,255,0.92)',
+    marginBottom: 8,
+    letterSpacing: 0.2,
   },
+  // Customer name is the visual anchor now — first thing the rep reads.
   taskCustomer: {
-    fontSize: SIZES.font, color: 'rgba(255,255,255,0.92)', marginBottom: 8, fontWeight: '600',
+    fontSize: SIZES.h2,
+    fontWeight: '900',
+    color: COLORS.white,
+    marginBottom: 2,
+    letterSpacing: 0.3,
   },
   taskHeaderMeta: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 2,
@@ -1350,6 +1452,19 @@ const styles = StyleSheet.create({
     color: '#1B4B72',
     fontWeight: '700',
     textDecorationLine: 'underline',
+  },
+  // Green crop pill alongside the picked compliance file preview.
+  complianceCropBtn: {
+    backgroundColor: '#10B981',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 12,
+  },
+  complianceCropBtnText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.3,
   },
   complianceUploadBtn: {
     backgroundColor: '#0D3B66',

@@ -33,6 +33,7 @@ interface NavigationProp {
   navigate: (route: string, params?: Record<string, unknown>) => void;
   goBack: () => void;
   replace?: (route: string) => void;
+  reset?: (state: { index: number; routes: { name: string }[] }) => void;
 }
 
 interface RouteProp {
@@ -56,6 +57,7 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
   const [resending, setResending] = useState<boolean>(false);
   const [resendCooldown, setResendCooldown] = useState<number>(0);
   const [devOtp, setDevOtp] = useState<string | null>(null);
+  const [warmingUp, setWarmingUp] = useState<boolean>(false);
   const otpRef = useRef<TextInput | null>(null);
 
   // Resend countdown — disables the resend button for 60s after each send.
@@ -75,6 +77,9 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
     if (isResend) setResending(true);
     else setLoading(true);
 
+    // Surface a "server warming up" hint after 5s so users know we're
+    // waiting on Render's free-tier cold-start, not stuck.
+    const warmupTimer = setTimeout(() => setWarmingUp(true), 5000);
     try {
       const res: any = await sendOTP(mobile);
       if (res?.success !== false) {
@@ -96,6 +101,8 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
     } catch (e: any) {
       Alert.alert('Could not send OTP', e?.message || 'Network error');
     } finally {
+      clearTimeout(warmupTimer);
+      setWarmingUp(false);
       setLoading(false);
       setResending(false);
     }
@@ -149,12 +156,25 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
         }
       }
 
+      // Reset the entire navigation stack to just [HomeTabs] so the
+      // back button on Home exits the app instead of "popping" the
+      // user back to ModeSelect (which previously left ModeSelect
+      // sitting underneath the HomeTabs replace and made every back
+      // tap feel like an accidental logout). Logout is the only path
+      // that should send the user to ModeSelect — see ProfileScreen.
+      const goHome = (): void => {
+        if (navigation.reset) {
+          navigation.reset({ index: 0, routes: [{ name: 'HomeTabs' }] });
+        } else {
+          navigation.replace?.('HomeTabs');
+        }
+      };
       if (referralStatus) {
         Alert.alert('Welcome to FliponeX', referralStatus, [
-          { text: 'OK', onPress: () => navigation.replace?.('HomeTabs') },
+          { text: 'OK', onPress: goHome },
         ]);
       } else {
-        navigation.replace?.('HomeTabs');
+        goHome();
       }
     } catch (e: any) {
       Alert.alert('Verification failed', e?.message || 'Try again.');
@@ -173,7 +193,7 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: '#0D3B66' }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView
         contentContainerStyle={[styles.container, { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 24 }]}
@@ -185,6 +205,10 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
         </View>
         <Text style={styles.title}>FliponeX Digital</Text>
         <Text style={styles.subtitle}>India's #1 Doorstep Digital Service</Text>
+
+        {/* Pre-login banner removed — the "Welcome to FliponeX" and
+            "Festive offer ₹20" cards distracted from the OTP form on
+            first-launch users without adding actionable value. */}
 
         {phase === 'mobile' ? (
           <View style={styles.card}>
@@ -216,6 +240,13 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.btnText}>Send OTP</Text>
               )}
             </TouchableOpacity>
+
+            {warmingUp && (
+              <Text style={styles.warmupHint}>
+                ⏳ Waking up the server (free tier sleeps after inactivity).
+                This takes up to a minute on first use today.
+              </Text>
+            )}
 
             <Text style={styles.legal}>
               By continuing you agree to FliponeX's Terms & Privacy Policy.
@@ -253,22 +284,11 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
               </View>
             ) : null}
 
-            <View style={styles.referralBox}>
-              <Text style={styles.referralLabel}>Have a referral code? (optional)</Text>
-              <TextInput
-                style={styles.referralInput}
-                value={referralCode}
-                onChangeText={(v) => setReferralCode(v.toUpperCase().substring(0, 16))}
-                placeholder="FLIPXXXX"
-                placeholderTextColor="#94A3B8"
-                autoCapitalize="characters"
-              />
-              {referralCode.trim().length > 0 && (
-                <Text style={styles.referralHint}>
-                  ✓ Will be applied automatically when you verify.
-                </Text>
-              )}
-            </View>
+            {/* Referral code entry removed from the login flow —
+                customers now apply codes on the Bill Summary inside
+                the booking flow (post-login). Pre-login referral was
+                creating confusion because the user hadn't picked a
+                service yet. */}
 
             <TouchableOpacity
               style={[styles.btn, otp.length !== 6 && styles.btnDisabled]}
@@ -281,8 +301,6 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.btnText}>
                   {otp.length !== 6
                     ? `Enter all 6 digits (${otp.length}/6)`
-                    : referralCode.trim().length > 0
-                    ? 'Verify & Apply Referral'
                     : 'Verify & Continue'}
                 </Text>
               )}
@@ -356,6 +374,12 @@ const styles = StyleSheet.create({
   btnText: { color: '#0D3B66', fontSize: 16, fontWeight: '900', letterSpacing: 0.5 },
 
   legal: { fontSize: 11, color: '#94A3B8', textAlign: 'center', marginTop: 14, lineHeight: 16 },
+  warmupHint: {
+    fontSize: 12, color: '#0D3B66', textAlign: 'center',
+    marginTop: 14, lineHeight: 16, fontWeight: '700',
+    backgroundColor: '#FEF3C7',
+    paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8,
+  },
 
   resendRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginTop: 14 },
   resendText: { color: '#475569', fontSize: 13 },

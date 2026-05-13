@@ -8,6 +8,8 @@ import {
   Modal,
   Alert,
   ScrollView,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -99,6 +101,10 @@ const BankDetailsModal: React.FC<BankDetailsModalProps> = ({ visible, onClose })
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
       <View style={styles.overlay}>
         <View style={styles.card}>
           <View style={styles.header}>
@@ -195,6 +201,7 @@ const BankDetailsModal: React.FC<BankDetailsModalProps> = ({ visible, onClose })
           </View>
         </View>
       </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 };

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   View,
   Text,
@@ -11,7 +11,6 @@ import {
 } from 'react-native';
 import {
   setUserMode,
-  getUserMode,
 } from '../utils/storage';
 import { ADMIN_DASHBOARD_URL, CUSTOMER_WEBSITE_URL } from '../config';
 
@@ -51,27 +50,20 @@ type MobileMode = 'customer' | 'agent';
 const ModeSelectScreen: React.FC<ModeSelectScreenProps> = ({ navigation }) => {
   const [busy, setBusy] = useState<boolean>(false);
 
-  // If a mobile mode is already persisted, skip this screen — splash
-  // already routes returning users to the right tab stack via the token
-  // check. We mirror that here only as a safety net (e.g. user navigated
-  // back to ModeSelect after picking once).
-  useEffect(() => {
-    (async () => {
-      const existing = await getUserMode();
-      if (existing === 'customer') navigation.replace('Login');
-      else if (existing === 'agent') navigation.replace('AgentLogin');
-    })();
-  }, [navigation]);
+  // Note: previously this screen auto-redirected to Login if a mode was
+  // already persisted. That broke the back button — pressing back from
+  // Login would land here, the redirect would fire, and the user got
+  // ping-ponged. Routing on warm launch now happens once in Splash; this
+  // screen always shows the picker so the user can switch modes.
 
-  // Picking a mode now routes to the corresponding LOGIN screen — no
-  // more silent guest-login. The user verifies their identity via OTP,
-  // gets a real JWT for their actual role, and lands in the tabs after
-  // verification.
+  // Picking a mode pushes (not replaces) the corresponding LOGIN screen
+  // so the back button lands the user back on this toggle page.
   const pickMobile = async (mode: MobileMode): Promise<void> => {
     if (busy) return;
     setBusy(true);
     await setUserMode(mode);
-    navigation.replace(mode === 'agent' ? 'AgentLogin' : 'Login');
+    navigation.navigate(mode === 'agent' ? 'AgentLogin' : 'Login');
+    setBusy(false);
   };
 
   const openWeb = (url: string, title: string): void => {

@@ -159,13 +159,12 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
   };
 
   const filteredEarnings = getFilteredEarnings();
-  const paidTotal = earnings
-    .filter((e) => e.paymentStatus === 'paid')
-    .reduce((s, e) => s + e.commission, 0);
-  const pendingTotal = earnings
-    .filter((e) => e.paymentStatus !== 'paid')
-    .reduce((s, e) => s + e.commission, 0);
-  const payAfterJobs = earnings.filter((e) => e.paymentStatus !== 'paid');
+  // Completed-jobs count for the simplified summary card. We no
+  // longer split into "paid" vs "pay-after to settle" — the rep
+  // earns the same commission regardless of how the customer paid,
+  // and the previous split caused confusion ("why is half my money
+  // marked 'to settle'?"). Now it's just total earned + count.
+  const completedJobsCount = earnings.length;
 
   const periods: PeriodOption[] = [
     { id: 'all', label: 'All Time' },
@@ -178,34 +177,38 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
     <LinearGradient colors={COLORS.bgGradient} style={styles.container}>
       <ScrollView>
         <Animated.View style={[styles.content, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
-          {/* Stats Header */}
+          {/* Stats Header — render React state DIRECTLY via plain Text.
+              The previous version read `(todayEarningsAnim as any)._value`
+              on Animated.Text, which froze at whatever the animation
+              last targeted (the initial 0 from cache / cold start).
+              Animated.Text doesn't animate text children — only style
+              props — so React re-renders triggered by setTodayEarnings
+              etc. never reached the displayed value. Same fix as the
+              home dashboard's Today's Earnings tile. */}
           <View style={styles.header}>
             <Text style={styles.headerTitle}>Earnings & Collections</Text>
             <Animated.View style={[styles.statsRow, { transform: [{ scale: scaleAnim }] }]}>
               <View style={styles.statCard}>
                 <LinearGradient colors={COLORS.goldGradient} style={styles.statCardGradient}>
-                  <Animated.Text style={styles.statValue}>
-                    {'₹'}
-                    {Math.floor((todayEarningsAnim as any)._value)}
-                  </Animated.Text>
+                  <Text style={styles.statValue}>
+                    {'₹'}{Math.floor(todayEarnings)}
+                  </Text>
                   <Text style={styles.statLabel}>Today</Text>
                 </LinearGradient>
               </View>
               <View style={styles.statCard}>
                 <LinearGradient colors={COLORS.blueGradient} style={styles.statCardGradient}>
-                  <Animated.Text style={styles.statValue}>
-                    {'₹'}
-                    {Math.floor((weekEarningsAnim as any)._value)}
-                  </Animated.Text>
+                  <Text style={styles.statValue}>
+                    {'₹'}{Math.floor(weekEarnings)}
+                  </Text>
                   <Text style={styles.statLabel}>This Week</Text>
                 </LinearGradient>
               </View>
               <View style={styles.statCard}>
                 <LinearGradient colors={COLORS.sunset} style={styles.statCardGradient}>
-                  <Animated.Text style={styles.statValue}>
-                    {'₹'}
-                    {Math.floor((totalEarningsAnim as any)._value)}
-                  </Animated.Text>
+                  <Text style={styles.statValue}>
+                    {'₹'}{Math.floor(totalEarnings)}
+                  </Text>
                   <Text style={styles.statLabel}>Total</Text>
                 </LinearGradient>
               </View>
@@ -213,22 +216,18 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
           </View>
         </Animated.View>
 
-        {/* Collection Summary */}
+        {/* Earnings Summary — simplified. Just total earned + jobs
+            count. Removed the previous "Received" vs "Pay-After-Service
+            To Settle" split since the rep's commission is the same
+            regardless of how the customer paid, and the split misled
+            reps into thinking half their money was being held back. */}
         <Animated.View style={[styles.content, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
           <View style={styles.collectionCard}>
-            <Text style={styles.collectionTitle}>Collection Summary</Text>
+            <Text style={styles.collectionTitle}>Earnings Summary</Text>
             <View style={styles.collectionRow}>
-              <Text style={styles.collectionLabel}>Received (Online/Paid)</Text>
-              <Text style={[styles.collectionValue, { color: '#4CAF50' }]}>
-                {'₹'}
-                {paidTotal}
-              </Text>
-            </View>
-            <View style={styles.collectionRow}>
-              <Text style={styles.collectionLabel}>Pay-After-Service (To Settle)</Text>
-              <Text style={[styles.collectionValue, { color: '#FF9800' }]}>
-                {'₹'}
-                {pendingTotal}
+              <Text style={styles.collectionLabel}>Completed Jobs</Text>
+              <Text style={styles.collectionValue}>
+                {completedJobsCount}
               </Text>
             </View>
             <View
@@ -238,7 +237,7 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
               ]}
             >
               <Text style={[styles.collectionLabel, { fontWeight: 'bold' }]}>Total Earned</Text>
-              <Text style={[styles.collectionValue, { fontWeight: 'bold' }]}>
+              <Text style={[styles.collectionValue, { fontWeight: 'bold', color: '#10B981' }]}>
                 {'₹'}
                 {totalEarnings}
               </Text>
@@ -286,14 +285,13 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
                       {'₹'}
                       {earning.commission}
                     </Text>
-                    <View
-                      style={[
-                        styles.paymentBadge,
-                        earning.paymentStatus === 'paid' ? styles.paidBadge : styles.pendingBadge,
-                      ]}
-                    >
-                      <Text style={styles.paymentBadgeText}>
-                        {earning.paymentStatus === 'paid' ? 'Paid' : 'To Settle'}
+                    {/* Always green "Completed" — the rep earned this
+                        money the moment the task was done, regardless
+                        of how the customer paid. No more "To Settle"
+                        confusion. */}
+                    <View style={[styles.paymentBadge, styles.completedBadge]}>
+                      <Text style={[styles.paymentBadgeText, styles.completedBadgeText]}>
+                        Completed
                       </Text>
                     </View>
                   </View>
@@ -307,34 +305,9 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
             </View>
           )}
 
-          {/* Pay-After-Service Jobs to Settle */}
-          {payAfterJobs.length > 0 && (
-            <View style={styles.settleSection}>
-              <Text style={styles.settleTitle}>Pay-After-Service Jobs (To Settle)</Text>
-              <Text style={styles.settleSubtext}>
-                Cash collected from customers that needs to be settled internally
-              </Text>
-              {payAfterJobs.map((job) => (
-                <View key={job.id} style={styles.settleCard}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.earningCustomer}>{job.customerName}</Text>
-                    <Text style={styles.earningService}>{job.serviceName}</Text>
-                  </View>
-                  <Text style={[styles.earningAmount, { color: '#FF9800' }]}>
-                    {'₹'}
-                    {job.commission}
-                  </Text>
-                </View>
-              ))}
-              <View style={styles.settleTotalRow}>
-                <Text style={styles.settleTotalLabel}>Total to Settle</Text>
-                <Text style={styles.settleTotalValue}>
-                  {'₹'}
-                  {pendingTotal}
-                </Text>
-              </View>
-            </View>
-          )}
+          {/* Pay-After-Service settlement section removed — every
+              completed task contributes the same commission to the
+              rep's earnings regardless of how the customer paid. */}
 
           <View style={{ height: 20 }} />
         </ScrollView>
@@ -407,8 +380,12 @@ const styles = StyleSheet.create({
   earningDate: { fontSize: 11, color: '#94A3B8' },
   earningAmount: { fontSize: 16, fontWeight: '900', color: '#F4A100', marginBottom: 4 },
   paymentBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
-  paidBadge: { backgroundColor: '#D1FAE5', borderWidth: 1, borderColor: '#10B981' },
-  pendingBadge: { backgroundColor: '#FEF3C7', borderWidth: 1, borderColor: '#F59E0B' },
+  // Green "Completed" badge — every earning record is fully earned
+  // regardless of payment method. Same emerald-green palette as the
+  // dashboard's Recent Activity completed status, for visual
+  // consistency across screens.
+  completedBadge: { backgroundColor: '#D1FAE5', borderWidth: 1, borderColor: '#10B981' },
+  completedBadgeText: { color: '#065F46' },
   paymentBadgeText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.4, color: '#065F46' },
 
   emptyContainer: { alignItems: 'center', paddingVertical: 40 },

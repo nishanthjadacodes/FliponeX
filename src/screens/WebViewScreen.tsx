@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect } from 'react';
+import { useRef, useState, useEffect, useLayoutEffect } from 'react';
 import {
   View,
   Text,
@@ -8,6 +8,7 @@ import {
   BackHandler,
   Platform,
 } from 'react-native';
+import Icon from 'react-native-vector-icons/MaterialIcons';
 
 // Defensive load — react-native-webview is a native module. If the dev-client
 // APK was built before it was installed, `require` throws at runtime. Fall
@@ -28,6 +29,7 @@ interface WebViewScreenProps {
     goBack: () => void;
     replace?: (route: string) => void;
     addListener: (event: string, cb: (e: any) => void) => () => void;
+    setOptions: (opts: Record<string, unknown>) => void;
   };
   route: {
     params?: {
@@ -55,6 +57,46 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   const [loading, setLoading] = useState<boolean>(true);
   const [errored, setErrored] = useState<boolean>(false);
   const [canGoBack, setCanGoBack] = useState<boolean>(false);
+  // Bumping this key remounts the <WebView>, forcing it to reload the
+  // original `url` from scratch. Used by the in-header Home button to
+  // jump back to the embedded site's root (admin dashboard's super
+  // admin landing page, customer website's home, etc.) regardless of
+  // how deep the user has navigated within the WebView's history.
+  const [webViewKey, setWebViewKey] = useState<number>(0);
+
+  // Custom Home button in the stack header — navigates the WebView to
+  // its root URL instead of going out to the customer app's HomeTabs.
+  // Without this override, the inherited Home button from
+  // AppNavigator's stackHeader would dump the user out of the admin
+  // dashboard entirely.
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity
+          onPress={() => {
+            // Force a full reload of the WebView with the original URL.
+            // Tries the WebView's own history-reset first (cheaper than
+            // remount); falls back to remounting via the key bump.
+            try {
+              if (webViewRef.current?.injectJavaScript) {
+                const safeUrl = JSON.stringify(url || '');
+                webViewRef.current.injectJavaScript(
+                  `window.location.href = ${safeUrl}; true;`,
+                );
+                return;
+              }
+            } catch (_) { /* fall through to remount */ }
+            setWebViewKey((k) => k + 1);
+          }}
+          style={{ paddingHorizontal: 14, paddingVertical: 6 }}
+          accessibilityLabel="Reset to home"
+          accessibilityRole="button"
+        >
+          <Icon name="home" size={24} color="#FFFFFF" />
+        </TouchableOpacity>
+      ),
+    });
+  }, [navigation, url]);
 
   // Android hardware back button — walk back through the WebView's own
   // history first, then fall through to React Navigation exit.
@@ -121,11 +163,21 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   return (
     <View style={styles.container}>
       <WebView
+        key={webViewKey}
         ref={webViewRef}
         source={{ uri: url }}
         style={styles.webview}
         onLoadStart={() => { setLoading(true); setErrored(false); }}
         onLoadEnd={() => setLoading(false)}
+        // Hide the loading overlay as soon as the page is mostly loaded
+        // (>=70%). React hydration of large Next.js bundles tends to
+        // delay onLoadEnd, leaving the overlay covering already-rendered
+        // content — onLoadProgress lets us dismiss it earlier.
+        onLoadProgress={({ nativeEvent }: any) => {
+          if (typeof nativeEvent?.progress === 'number' && nativeEvent.progress >= 0.7) {
+            setLoading(false);
+          }
+        }}
         onError={() => { setLoading(false); setErrored(true); }}
         onHttpError={({ nativeEvent }: any) => {
           // 5xx / 4xx from the server. Not a network failure — let it render
@@ -141,8 +193,12 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
       />
 
       {loading && (
-        <View style={styles.loadingOverlay} pointerEvents="none">
-          <ActivityIndicator size="large" color="#0D3B66" />
+        // Bottom-pinned thin loader instead of a fullscreen overlay —
+        // the user sees the page render in real time and only a small
+        // status pill at the bottom indicates network activity.
+        <View style={styles.loadingPill} pointerEvents="none">
+          <ActivityIndicator size="small" color="#FFFFFF" />
+          <Text style={styles.loadingPillText}>Loading…</Text>
         </View>
       )}
 
@@ -171,6 +227,29 @@ const styles = StyleSheet.create({
     position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
     justifyContent: 'center', alignItems: 'center',
     backgroundColor: 'rgba(255,255,255,0.8)',
+  },
+  loadingPill: {
+    position: 'absolute',
+    bottom: 24,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(13,59,102,0.92)',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 20,
+    gap: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  loadingPillText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.3,
   },
   errorOverlay: {
     position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,

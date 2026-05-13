@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TextInput, TouchableOpacity,
-  ActivityIndicator, Alert, KeyboardAvoidingView, Platform,
+  ActivityIndicator, Alert, KeyboardAvoidingView, Platform, Modal,
 } from 'react-native';
 import { createEnquiry, getCompanyProfile } from '../services/api';
 import * as haptics from '../utils/haptics';
@@ -103,6 +103,8 @@ const EnquiryScreen: React.FC<Props> = ({ navigation, route }) => {
   const [preferredTime, setPreferredTime] = useState<string>('');
   const [urgency, setUrgency] = useState<string>('standard');
   const [submitting, setSubmitting] = useState<boolean>(false);
+  const [successOpen, setSuccessOpen] = useState<boolean>(false);
+  const [submittedRef, setSubmittedRef] = useState<string>('');
 
   useEffect(() => {
     (async () => {
@@ -126,18 +128,20 @@ const EnquiryScreen: React.FC<Props> = ({ navigation, route }) => {
     }
     setSubmitting(true);
     try {
-      await createEnquiry({
+      const res: any = await createEnquiry({
         service_id: service.id,
         notes: notes.trim(),
         urgency,
         preferred_contact_time: preferredTime.trim() || null,
       });
       haptics.success();
-      Alert.alert(
-        'Enquiry Submitted',
-        "We've received your request. A FliponeX Digital expert will review the scope and share a quote within 24 business hours.",
-        [{ text: 'OK', onPress: () => navigation.navigate('MyBookings') }]
-      );
+      // Surface a clean in-app success modal instead of the system
+      // Alert dialog. Reads more like a confirmation receipt — better
+      // matches the rest of the app's visual language and gives the
+      // user a reference number they can quote in support tickets.
+      const enquiryId = res?.data?.id || res?.id || '';
+      setSubmittedRef(enquiryId ? String(enquiryId).slice(0, 8).toUpperCase() : '—');
+      setSuccessOpen(true);
     } catch (e: any) {
       haptics.error();
       Alert.alert('Could not submit', e?.message || 'Please try again in a moment.');
@@ -160,7 +164,7 @@ const EnquiryScreen: React.FC<Props> = ({ navigation, route }) => {
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: '#F8F9FA' }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
 
@@ -267,6 +271,51 @@ const EnquiryScreen: React.FC<Props> = ({ navigation, route }) => {
 
         <View style={{ height: 24 }} />
       </ScrollView>
+
+      {/* Success modal — shown after the enquiry is accepted by the
+          backend. The user gets a checkmark, a reference number to
+          quote in support, and a single CTA back to My Bookings.
+          Dismissing the modal also navigates so the user can't get
+          stuck on the now-stale form. */}
+      <Modal
+        visible={successOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setSuccessOpen(false);
+          navigation.navigate('MyBookings');
+        }}
+      >
+        <View style={styles.successBackdrop}>
+          <View style={styles.successCard}>
+            <View style={styles.successIconWrap}>
+              <Text style={styles.successIcon}>✓</Text>
+            </View>
+            <Text style={styles.successTitle}>Quote Requested</Text>
+            <Text style={styles.successBody}>
+              We&apos;ve received your enquiry for{' '}
+              <Text style={styles.successBodyAccent}>{service?.name || 'this service'}</Text>.
+              {'\n\n'}
+              A FliponeX Digital expert will review the scope and share a quote within
+              24 business hours.
+            </Text>
+            <View style={styles.successRefRow}>
+              <Text style={styles.successRefLabel}>Reference</Text>
+              <Text style={styles.successRefValue}>#{submittedRef}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.successCta}
+              onPress={() => {
+                setSuccessOpen(false);
+                navigation.navigate('MyBookings');
+              }}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.successCtaText}>View My Enquiries</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 };
@@ -352,6 +401,103 @@ const styles = StyleSheet.create({
   footNote: {
     fontSize: 11, color: '#6C757D', textAlign: 'center',
     marginTop: 10, paddingHorizontal: 10, lineHeight: 15,
+  },
+
+  // ─── Quote-requested success modal ──────────────────────────────────
+  successBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(8,43,76,0.65)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  successCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    paddingVertical: 26,
+    paddingHorizontal: 22,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.25,
+    shadowRadius: 18,
+    elevation: 12,
+  },
+  successIconWrap: {
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    backgroundColor: '#10B981',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+    shadowColor: '#10B981',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    elevation: 6,
+  },
+  successIcon: {
+    color: '#FFFFFF',
+    fontSize: 36,
+    fontWeight: '900',
+    lineHeight: 38,
+  },
+  successTitle: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: '#0D3B66',
+    marginBottom: 8,
+  },
+  successBody: {
+    fontSize: 13.5,
+    color: '#475569',
+    textAlign: 'center',
+    lineHeight: 19,
+    marginBottom: 16,
+  },
+  successBodyAccent: {
+    color: '#0D3B66',
+    fontWeight: '800',
+  },
+  successRefRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+    backgroundColor: '#F1F5F9',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    marginBottom: 18,
+  },
+  successRefLabel: {
+    fontSize: 11,
+    color: '#64748B',
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
+  successRefValue: {
+    fontSize: 14,
+    color: '#0D3B66',
+    fontWeight: '900',
+    letterSpacing: 0.5,
+  },
+  successCta: {
+    width: '100%',
+    backgroundColor: '#0D3B66',
+    paddingVertical: 13,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  successCtaText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+    fontSize: 14,
+    letterSpacing: 0.3,
   },
 });
 

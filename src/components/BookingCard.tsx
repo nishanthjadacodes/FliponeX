@@ -26,6 +26,16 @@ export interface BookingCardItem {
   price_quoted?: number;
   service_address?: string;
   address?: string;
+  // Scheduled visit slot — surfaced on the card so ongoing bookings
+  // show exactly when the rep is expected. Previously only the
+  // create-date was shown, which made it look like the booking had
+  // no scheduling info.
+  preferred_date?: string | null;
+  preferred_time?: string | null;
+  // Payment status — surfaces a green "✓ PAID" pill next to the amount
+  // when the customer has paid online (Razorpay) or cash-on-completion.
+  payment_status?: 'pending' | 'paid' | 'refunded' | string;
+  payment_method?: string;
 }
 
 export interface BookingCardProps {
@@ -121,19 +131,56 @@ const BookingCard: React.FC<BookingCardProps> = ({ booking, onPress }) => {
           </View>
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Date:</Text>
-            <Text style={styles.detailValue}>{formatDate(booking.created_at || booking.createdAt)}</Text>
+            <Text style={styles.detailValue}>
+              {/* Prefer the customer's scheduled date over booking-creation
+                  date — that's the date the visit actually happens on. */}
+              {formatDate(
+                booking.preferred_date || booking.created_at || booking.createdAt,
+              )}
+            </Text>
           </View>
+          {/* Time slot — was missing from the card. Now visible on every
+              ongoing booking so the customer can see the appointment
+              window without tapping into details. */}
+          {booking.preferred_time && (
+            <View style={styles.detailRow}>
+              <Text style={styles.detailLabel}>Time Slot:</Text>
+              <Text style={styles.detailValue}>{booking.preferred_time}</Text>
+            </View>
+          )}
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Amount:</Text>
-            <Text style={styles.detailValue}>
-              ₹{booking.total_amount || booking.totalAmount || booking.price_quoted || 0}
-            </Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Text style={styles.detailValue}>
+                ₹{booking.total_amount || booking.totalAmount || booking.price_quoted || 0}
+              </Text>
+              {booking.payment_status === 'paid' && (
+                <View style={styles.paidPill}>
+                  <Text style={styles.paidPillText}>✓ PAID</Text>
+                </View>
+              )}
+              {booking.payment_status === 'pending' && (
+                <View style={styles.pendingPill}>
+                  <Text style={styles.pendingPillText}>Pay later</Text>
+                </View>
+              )}
+            </View>
           </View>
           {(booking.address || booking.service_address) && (
             <View style={styles.detailRow}>
               <Text style={styles.detailLabel}>Address:</Text>
               <Text style={styles.detailValue} numberOfLines={2}>
-                {booking.address || booking.service_address}
+                {(() => {
+                  // If the stored "address" is actually just lat,lng
+                  // (reverse-geocoding failed at booking time), show a
+                  // friendlier "📍 Map pin" label instead of raw coords.
+                  const raw = booking.address || booking.service_address || '';
+                  const m = String(raw).match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
+                  if (m) {
+                    return `📍 Map pin: ${Number(m[1]).toFixed(4)}, ${Number(m[2]).toFixed(4)}`;
+                  }
+                  return raw;
+                })()}
               </Text>
             </View>
           )}
@@ -161,6 +208,29 @@ const styles = StyleSheet.create({
   detailRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: SIZES.BASE / 4 },
   detailLabel: { fontSize: SIZES.SMALL, color: COLORS.GRAY },
   detailValue: { fontSize: SIZES.SMALL, fontWeight: '600', color: COLORS.BLACK },
+  paidPill: {
+    backgroundColor: '#D1FAE5',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  paidPillText: {
+    color: '#065F46',
+    fontWeight: '800',
+    fontSize: 10,
+    letterSpacing: 0.3,
+  },
+  pendingPill: {
+    backgroundColor: '#FEF3C7',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  pendingPillText: {
+    color: '#92400E',
+    fontWeight: '700',
+    fontSize: 10,
+  },
 });
 
 export default BookingCard;

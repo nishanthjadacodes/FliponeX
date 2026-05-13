@@ -11,6 +11,8 @@ import {
   TextInput,
   RefreshControl,
   Animated,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getDashboard, updateOnlineStatus, updateProfile } from '../../services/agent/api';
@@ -215,11 +217,16 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
   };
 
   return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
     <LinearGradient colors={COLORS.bgGradient} style={styles.container}>
       <Animated.View style={[styles.content, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
         <ScrollView
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
         >
           <View style={styles.profileHeader}>
             <Animated.View style={[styles.avatar, { transform: [{ scale: scaleAnim }] }]}>
@@ -239,22 +246,10 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
             </TouchableOpacity>
           </View>
 
-          <View style={styles.card}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.cardTitle}>Online Status</Text>
-              <Text style={styles.cardSubtext}>
-                {isOnline ? 'Receiving job requests' : 'Not receiving requests'}
-              </Text>
-            </View>
-            <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-              <Switch
-                value={isOnline}
-                onValueChange={handleToggleOnlineStatus}
-                trackColor={{ false: '#ccc', true: COLORS.success }}
-                thumbColor={COLORS.white}
-              />
-            </Animated.View>
-          </View>
+          {/* Online Status card removed — the toggle now lives only on
+              the Dashboard (Home tab) hero so it has a single source of
+              truth. Two toggles meant the rep had to remember which one
+              was the canonical state. */}
 
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>Performance</Text>
@@ -385,62 +380,77 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
           transparent
           onRequestClose={() => setShowChangePassword(false)}
         >
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>Change Password</Text>
+          {/* KeyboardAvoidingView + scrollable card so the third TextInput
+              (Confirm Password) and the action buttons stay visible above
+              the keyboard. Previously the keyboard covered the lower half
+              of the modal on smaller phones and users had to dismiss the
+              keyboard to tap Change. */}
+          <KeyboardAvoidingView
+            style={styles.modalOverlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          >
+            <ScrollView
+              contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              <View style={styles.modalContent}>
+                <Text style={styles.modalTitle}>Change Password</Text>
 
-              <Text style={styles.inputLabel}>Current Password</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Enter current password"
-                secureTextEntry
-                value={passwords.current}
-                onChangeText={(v) => setPasswords((p) => ({ ...p, current: v }))}
-              />
+                <Text style={styles.inputLabel}>Current Password</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Enter current password"
+                  secureTextEntry
+                  value={passwords.current}
+                  onChangeText={(v) => setPasswords((p) => ({ ...p, current: v }))}
+                />
 
-              <Text style={styles.inputLabel}>New Password</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Enter new password"
-                secureTextEntry
-                value={passwords.newPass}
-                onChangeText={(v) => setPasswords((p) => ({ ...p, newPass: v }))}
-              />
+                <Text style={styles.inputLabel}>New Password</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Enter new password"
+                  secureTextEntry
+                  value={passwords.newPass}
+                  onChangeText={(v) => setPasswords((p) => ({ ...p, newPass: v }))}
+                />
 
-              <Text style={styles.inputLabel}>Confirm New Password</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Re-enter new password"
-                secureTextEntry
-                value={passwords.confirm}
-                onChangeText={(v) => setPasswords((p) => ({ ...p, confirm: v }))}
-              />
+                <Text style={styles.inputLabel}>Confirm New Password</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Re-enter new password"
+                  secureTextEntry
+                  value={passwords.confirm}
+                  onChangeText={(v) => setPasswords((p) => ({ ...p, confirm: v }))}
+                />
 
-              <View style={styles.modalActions}>
-                <TouchableOpacity
-                  style={[styles.modalBtn, { backgroundColor: COLORS.lightGray }]}
-                  onPress={() => {
-                    setShowChangePassword(false);
-                    setPasswords({ current: '', newPass: '', confirm: '' });
-                  }}
-                >
-                  <Text style={{ color: COLORS.text, fontWeight: '600' }}>Cancel</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.modalBtn, { backgroundColor: COLORS.primary }]}
-                  onPress={handleChangePassword}
-                  disabled={savingPassword}
-                >
-                  <Text style={{ color: COLORS.white, fontWeight: '600' }}>
-                    {savingPassword ? 'Saving...' : 'Change'}
-                  </Text>
-                </TouchableOpacity>
+                <View style={styles.modalActions}>
+                  <TouchableOpacity
+                    style={[styles.modalBtn, { backgroundColor: COLORS.lightGray }]}
+                    onPress={() => {
+                      setShowChangePassword(false);
+                      setPasswords({ current: '', newPass: '', confirm: '' });
+                    }}
+                  >
+                    <Text style={{ color: COLORS.text, fontWeight: '600' }}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.modalBtn, { backgroundColor: COLORS.primary }]}
+                    onPress={handleChangePassword}
+                    disabled={savingPassword}
+                  >
+                    <Text style={{ color: COLORS.white, fontWeight: '600' }}>
+                      {savingPassword ? 'Saving...' : 'Change'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
               </View>
-            </View>
-          </View>
+            </ScrollView>
+          </KeyboardAvoidingView>
         </Modal>
       </Animated.View>
     </LinearGradient>
+    </KeyboardAvoidingView>
   );
 };
 

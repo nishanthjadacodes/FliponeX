@@ -25,6 +25,7 @@ export type RootStackParamList = {
   // Agent surface
   AgentTabs: NavigatorScreenParams<AgentTabParamList> | undefined;
   TaskExecution: { taskId: string };
+  TeamTreeIncome: undefined;
 
   // Embedded webviews
   WebView: { url: string; title?: string };
@@ -40,6 +41,7 @@ export type RootStackParamList = {
 export type HomeTabParamList = {
   Home: undefined;
   MyBookings: undefined;
+  Services: { category?: string } | undefined;
   Profile: undefined;
 };
 

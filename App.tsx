@@ -9,6 +9,8 @@ import {
 } from './src/utils/notifications';
 import type { RootStackParamList } from './src/types';
 import { loadAppLanguage } from './src/i18n';
+import NotificationBanner from './src/components/NotificationBanner';
+import { API_BASE_URL } from './src/config';
 
 // Navigation lifecycle in this app:
 //   • Cold start (fresh launch after a full process kill — swiped from recents,
@@ -61,6 +63,12 @@ export default function App() {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <NavigationContainer ref={navRef}>
         <AppNavigator />
+        {/* Top-down banner for in-app notifications. Renders ABOVE the
+            stack screens (zIndex 9999) so it's visible on every screen.
+            Polls the backend's /notifications/inbox on app focus and
+            shows the topmost unseen notification with a tap-to-deep-link
+            CTA. Handles both customer and agent surfaces. */}
+        <NotificationBanner navigationRef={navRef} apiBase={API_BASE_URL} />
       </NavigationContainer>
     </GestureHandlerRootView>
   );

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -16,18 +16,31 @@ import {
   TextInput,
   Pressable,
   Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import { STRINGS, VALUE_PROPS, HERO_BANNERS } from '../constants/strings';
-import { getServices, getTrendingServices, getOffers } from '../services/api';
-import type { Service, OfferItem } from '../services/api';
+import {
+  getServices,
+  getTrendingServices,
+  getOffers,
+  getInboxNotifications,
+  markAllNotificationsRead,
+  markNotificationRead,
+} from '../services/api';
+import type { Service, OfferItem, InboxItem } from '../services/api';
 import { getUser, clearAuthSession } from '../utils/storage';
 import B2BToggle from '../components/B2BToggle';
-import ServiceCard from '../components/ServiceCard';
+import ServiceCard, { iconForCategory } from '../components/ServiceCard';
+import * as haptics from '../utils/haptics';
 import WhatsAppButton from '../components/WhatsAppButton';
 import EngagingContentSection from '../components/EngagingContentSection';
 import ComplianceRedAlertBanner from '../components/ComplianceRedAlertBanner';
 import AutoCarousel from '../components/AutoCarousel';
+import { LinearGradient } from 'expo-linear-gradient';
 
 interface Props {
   navigation: {
@@ -41,6 +54,10 @@ interface Props {
 }
 
 const HomeScreen: React.FC<Props> = ({ navigation }) => {
+  // Bottom system inset (Android 3-button / gesture bar, iPhone home
+  // indicator). Used to pad the scroll content so the last visible
+  // section / CTA isn't covered by the device's navigation chrome.
+  const insets = useSafeAreaInsets();
   const [services, setServices] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
   const [selectedCategory, setSelectedCategory] = useState<string>(STRINGS.ALL_CATEGORIES);
@@ -58,6 +75,14 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const [searchTimeoutId, setSearchTimeoutId] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [trendingServices, setTrendingServices] = useState<Service[]>([]);
   const [offers, setOffers] = useState<OfferItem[]>([]);
+  // ─── Notifications inbox (drives the Alerts chip + modal) ────────────
+  // The badge on the chip shows `inboxUnread`. Opening the chip lists
+  // ALL recent notifications in `inboxItems` and clears the badge.
+  // New B2B quote replies, booking-status changes, etc. all land here.
+  const [inboxItems, setInboxItems] = useState<InboxItem[]>([]);
+  const [inboxUnread, setInboxUnread] = useState<number>(0);
+  const [showAlertsModal, setShowAlertsModal] = useState<boolean>(false);
+  const [inboxLoading, setInboxLoading] = useState<boolean>(false);
   const searchInputRef = useRef<any>(null);
   // Hero / Offers carousels now live in <AutoCarousel /> which animates on
   // the native UI thread via react-native-reanimated. No JS refs/state
@@ -76,6 +101,81 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     scrollRef.current?.scrollTo({ y, animated: true });
   }, []);
 
+  // Diversified Trending row. The backend's /services/trending tends to
+  // return whatever has the highest book-count, which clusters around a
+  // single category (early on, only Aadhaar / PAN had real bookings, so
+  // the row read as "Aadhaar Aadhaar Aadhaar"). We layer the backend
+  // list with one representative service per major category so the
+  // strip showcases the full catalogue — Aadhaar, PAN, GST, Ayushman,
+  // Voter ID, PF Withdrawal, Driving Licence, Ration Card, Passport.
+  // Backend's order wins; cross-category fills slot in only where the
+  // category isn't already represented.
+  const displayedTrending = useMemo<Service[]>(() => {
+    const TRENDING_KEYWORDS: { label: string; rx: RegExp }[] = [
+      { label: 'aadhaar',   rx: /aadhaar|aadhar|uidai/i },
+      { label: 'pan',       rx: /\bpan\b|pan.?card/i },
+      { label: 'gst',       rx: /\bgst\b|goods.?and.?services.?tax/i },
+      { label: 'ayushman',  rx: /ayushman|abha|pmjay/i },
+      { label: 'voterid',   rx: /voter|epic|electoral/i },
+      { label: 'pf',        rx: /\bpf\b|provident.?fund|epfo|withdraw/i },
+      { label: 'driving',   rx: /driving.?licen[cs]e|\bdl\b/i },
+      { label: 'ration',    rx: /ration.?card|fps\b/i },
+      { label: 'passport',  rx: /passport/i },
+      { label: 'birth',     rx: /birth.?certificate/i },
+      { label: 'income',    rx: /income.?certificate/i },
+    ];
+    const bucketOf = (s: any): string => {
+      const hay = `${s?.name || ''} ${s?.category || ''} ${s?.description || ''}`;
+      for (const k of TRENDING_KEYWORDS) if (k.rx.test(hay)) return k.label;
+      return s?.category ? `cat:${String(s.category).toLowerCase()}` : 'misc';
+    };
+
+    const seenIds = new Set<string>();
+    const seenBuckets = new Set<string>();
+    const out: Service[] = [];
+
+    // 1. Backend's trending list keeps its priority, but only one per
+    //    bucket so the row doesn't collapse onto one category.
+    for (const s of trendingServices as any[]) {
+      if (!s?.id) continue;
+      const b = bucketOf(s);
+      if (seenIds.has(String(s.id))) continue;
+      if (seenBuckets.has(b)) continue;
+      seenIds.add(String(s.id));
+      seenBuckets.add(b);
+      out.push(s as Service);
+    }
+
+    // 2. Fill the row with the first service from each missing keyword
+    //    bucket — gives the user a taste of every major category.
+    for (const k of TRENDING_KEYWORDS) {
+      if (seenBuckets.has(k.label)) continue;
+      const match = (services as any[]).find((s) => {
+        if (!s?.id || seenIds.has(String(s.id))) return false;
+        const hay = `${s?.name || ''} ${s?.category || ''} ${s?.description || ''}`;
+        return k.rx.test(hay);
+      });
+      if (match) {
+        seenIds.add(String(match.id));
+        seenBuckets.add(k.label);
+        out.push(match as Service);
+      }
+    }
+
+    // 3. Top up with anything else so the strip is never empty even on
+    //    a fresh install with no trending data yet.
+    if (out.length < 6) {
+      for (const s of services as any[]) {
+        if (out.length >= 8) break;
+        if (!s?.id || seenIds.has(String(s.id))) continue;
+        seenIds.add(String(s.id));
+        out.push(s as Service);
+      }
+    }
+
+    return out;
+  }, [trendingServices, services]);
+
   // "Why FliponeX?" — 4 core value propositions shown as horizontal cards.
   // Pulled from the marketing brief so the app echoes the same promise as the website.
   const engagingContent = VALUE_PROPS;
@@ -86,6 +186,20 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     loadTrendingAndOffers();
   }, [serviceType]);
 
+  // Re-pull cached user on focus so the header avatar / first-letter
+  // picks up name / profile_pic changes the user just saved on the
+  // Profile screen. Without this, the avatar stays as 👤 until the
+  // app is fully restarted.
+  useEffect(() => {
+    const unsub = navigation.addListener?.('focus', () => {
+      loadUserData();
+    });
+    return () => {
+      if (typeof unsub === 'function') unsub();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navigation]);
+
   // Cleanup timeout on component unmount
   useEffect(() => {
     return () => {
@@ -94,6 +208,81 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
       }
     };
   }, [searchTimeoutId]);
+
+  // ─── Inbox poll (drives the Alerts chip badge + modal list) ──────────
+  // Pulls /notifications/inbox every 60s while the home screen is
+  // mounted. Also re-fetches on every screen focus so a user who's
+  // been deep in the booking flow / chatting with admin sees the
+  // freshest count when they return. Failures are silent — the chip
+  // just stays at its last-known value rather than throwing.
+  const refreshInbox = useCallback(async (): Promise<void> => {
+    try {
+      const res = await getInboxNotifications(false, 50);
+      const list = Array.isArray(res?.notifications) ? res.notifications : [];
+      setInboxItems(list);
+      const unread = list.filter((n) => !n.seen_at).length;
+      setInboxUnread(Number(res?.unread_count) || unread);
+    } catch (e: any) {
+      // 401 (not logged in) / network — silent. Banner pulls the same
+      // endpoint and logs its own failures.
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshInbox();
+    const t = setInterval(refreshInbox, 60_000);
+    const unsub = navigation.addListener?.('focus', refreshInbox);
+    return () => {
+      clearInterval(t);
+      if (typeof unsub === 'function') unsub();
+    };
+  }, [refreshInbox, navigation]);
+
+  // Open the Alerts modal → mark every visible row as seen so the
+  // badge clears immediately. Backend-side flips seen_at; next poll
+  // returns the same list with seen_at populated and unread_count=0.
+  const openAlerts = useCallback(async (): Promise<void> => {
+    haptics.tap();
+    setShowAlertsModal(true);
+    setInboxLoading(true);
+    try {
+      await refreshInbox();
+      if (inboxUnread > 0) {
+        await markAllNotificationsRead().catch(() => {});
+        setInboxUnread(0);
+        // Optimistically stamp seen_at locally so the row badges flip
+        // even before the next poll returns.
+        setInboxItems((prev) =>
+          prev.map((n) => (n.seen_at ? n : { ...n, seen_at: new Date().toISOString() })),
+        );
+      }
+    } finally {
+      setInboxLoading(false);
+    }
+  }, [inboxUnread, refreshInbox]);
+
+  // Tap on a single row — mark that one as read and follow deep_link
+  // if present. Quote-reply notifications carry deep_link pointing at
+  // the EnquiryDetails screen, so this routes the user straight there.
+  const handleNotificationTap = useCallback(
+    (n: InboxItem): void => {
+      markNotificationRead(n.id).catch(() => {});
+      setInboxItems((prev) =>
+        prev.map((x) => (x.id === n.id ? { ...x, seen_at: new Date().toISOString() } : x)),
+      );
+      setShowAlertsModal(false);
+      const route = n.deep_link?.route;
+      const params = n.deep_link?.params;
+      if (route && typeof navigation.navigate === 'function') {
+        try {
+          navigation.navigate(String(route), params || {});
+        } catch (_) {
+          /* unknown route — silent */
+        }
+      }
+    },
+    [navigation],
+  );
 
   // (Hero + Offers carousels now self-animate via <AutoCarousel /> — see
   // src/components/AutoCarousel.tsx for the Reanimated implementation.)
@@ -160,6 +349,95 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     }
     // Don't force focus back - let user control keyboard
   }, [searchTimeoutId]);
+
+  // Voice search — defensive load of @react-native-voice/voice. If the
+  // native module is built into the APK (you've installed the package
+  // and rebuilt with gradlew assembleRelease), real STT runs and
+  // whatever the user says lands in the search input → fires the
+  // existing debounced search → suggestions appear → tap routes to
+  // booking flow. If the module isn't available (e.g. dev-client APK
+  // built before the package was installed), we fall back to focusing
+  // the input + nudging the user to use the keyboard's built-in mic
+  // — that path always works.
+  let VoiceMod: any = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    VoiceMod = require('@react-native-voice/voice')?.default || null;
+  } catch (_) {
+    VoiceMod = null;
+  }
+
+  const [voiceListening, setVoiceListening] = useState<boolean>(false);
+
+  // Wire Voice events on mount so we can stream interim results into
+  // the search input (mimics Google's voice-search UI — text appears
+  // as you speak).
+  useEffect(() => {
+    if (!VoiceMod) return;
+    const onResult = (e: any) => {
+      const text = (e?.value && e.value[0]) || '';
+      if (text) {
+        setSearchQuery(text);
+        handleSearchInputChange(text);
+      }
+    };
+    const onPartial = (e: any) => {
+      const text = (e?.value && e.value[0]) || '';
+      if (text) setSearchQuery(text);
+    };
+    const onEnd = () => setVoiceListening(false);
+    const onError = () => setVoiceListening(false);
+    VoiceMod.onSpeechResults = onResult;
+    VoiceMod.onSpeechPartialResults = onPartial;
+    VoiceMod.onSpeechEnd = onEnd;
+    VoiceMod.onSpeechError = onError;
+    return () => {
+      try { VoiceMod.destroy?.().then?.(VoiceMod.removeAllListeners); } catch (_) {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleVoiceSearch = useCallback(async () => {
+    haptics.tap();
+
+    if (VoiceMod) {
+      // Real STT path. Toggle: tap once to start listening, tap again
+      // to stop. Errors fall through to the keyboard-fallback path.
+      try {
+        if (voiceListening) {
+          await VoiceMod.stop();
+          setVoiceListening(false);
+          return;
+        }
+        // Empty the search box so the spoken phrase replaces (not
+        // appends to) any previous query.
+        setSearchQuery('');
+        await VoiceMod.start('en-IN');
+        setVoiceListening(true);
+        return;
+      } catch (err: any) {
+        console.log('Voice.start failed, falling back:', err?.message);
+        setVoiceListening(false);
+        // fall through to the keyboard-mic fallback below
+      }
+    }
+
+    // Fallback path — focus input + show the keyboard so the user can
+    // use Gboard's built-in mic. Same end result (text in searchQuery
+    // → debounced search → suggestions), just one extra tap.
+    searchInputRef.current?.focus?.();
+    setTimeout(() => {
+      const y = Math.max(0, (searchYRef.current || 0) - 12);
+      scrollRef.current?.scrollTo({ y, animated: true });
+    }, 60);
+    Alert.alert(
+      'Voice Search',
+      "Tap the 🎤 mic on your keyboard and say the service name (e.g. \"Aadhaar update\", \"PAN card\", \"Voter ID\"). Suggestions will appear as you speak.",
+      [{ text: 'Got it' }],
+      { cancelable: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceListening, VoiceMod]);
 
 
   const handleModalServicePress = useCallback((service: any) => {
@@ -468,7 +746,7 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
 
   // Combined sticky brand block — greeting + buttons + search all stick together
   const renderStickyBrand = () => (
-    <View style={styles.stickyBrand}>
+    <View style={styles.stickyBrand} collapsable={false}>
       <View style={styles.headerTop}>
         {/* App logo — small circular image to reinforce branding */}
         <View style={styles.brandLogoWrap}>
@@ -477,14 +755,42 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
 
         <View style={{ flex: 1 }}>
           <Text style={styles.greeting}>Hello {(user?.name || 'there').split(' ')[0]} 👋</Text>
-          <Text style={styles.brandName}>FliponeX Digital</Text>
+          {/* Brand title — "FlipOne" white, "X" gold accent (matches the
+              marketing logo treatment), then a small "Doorstep Digital
+              Service" pill on its own line directly below. */}
+          <Text style={styles.brandName}>
+            Flipone<Text style={styles.brandNameAccent}>X</Text> Digital
+          </Text>
+          <View style={styles.brandTagline}>
+            <Text style={styles.brandTaglineText}>Doorstep Digital Service</Text>
+          </View>
         </View>
         <View style={styles.headerActions}>
-          <TouchableOpacity style={styles.iconButton} onPress={() => navigation.navigate('Profile')}>
-            <Text style={styles.iconButtonText}>👤</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.iconButton} onPress={handleLogout}>
-            <Text style={styles.iconButtonText}>🚪</Text>
+          {/* Single avatar button — opens Profile. Surfaces, in order:
+                1. profile_pic if uploaded (real photo)
+                2. first letter of user.name if set
+                3. generic 👤 emoji as the very last fallback
+              The standalone door / logout icon was removed — Logout
+              already lives inside the Profile screen, so the duplicate
+              top-right button just confused users. */}
+          <TouchableOpacity
+            style={styles.iconButton}
+            onPress={() => navigation.navigate('Profile')}
+            accessibilityLabel="Open profile"
+          >
+            {user?.profile_pic ? (
+              <Image
+                source={{ uri: user.profile_pic }}
+                style={styles.iconAvatarImg}
+                resizeMode="cover"
+              />
+            ) : user?.name && user.name.trim().length > 0 ? (
+              <Text style={[styles.iconButtonText, { fontWeight: '900' }]}>
+                {user.name.trim().charAt(0).toUpperCase()}
+              </Text>
+            ) : (
+              <Text style={styles.iconButtonText}>👤</Text>
+            )}
           </TouchableOpacity>
         </View>
       </View>
@@ -494,124 +800,225 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
 
   const renderRestOfHeader = () => (
     <View>
-      {/* ─── Hero hook banner — verbatim copy from marketing brief ───
-          Headline, sub-headline, trust-factor CTA line, and tappable CTA button
-          that scrolls the page down to the services list so the user lands on
-          the normal Service → Booking flow. */}
-      <View style={styles.heroHook}>
-        <View style={styles.heroHookBadge}>
-          <Text style={styles.heroHookBadgeText}>#1 DOORSTEP DIGITAL SERVICE</Text>
-        </View>
-        <Text style={styles.heroHookTitle}>{STRINGS.HERO_HEADLINE}</Text>
-        <Text style={styles.heroHookSubtitle}>{STRINGS.HERO_SUBHEADLINE}</Text>
-
-        <Text style={styles.heroHookCtaLine}>{STRINGS.HERO_CTA_LINE}</Text>
-        <Text style={styles.heroHookCtaTagline}>{STRINGS.HERO_CTA_TAGLINE}</Text>
-
-        <TouchableOpacity
-          style={styles.heroHookButton}
-          activeOpacity={0.85}
-          onPress={scrollToServices}
-        >
-          <Text style={styles.heroHookButtonText}>{STRINGS.HERO_CTA_BUTTON} →</Text>
-        </TouchableOpacity>
+      {/* ─── Trust strip — 5 mini-cards that auto-rotate horizontally
+          via the same native-thread AutoCarousel used for "FliponeX at
+          a Glance" hero banners below. Each item slides every 2.8s with
+          a cubic-ease curve so the user always sees the full set even
+          if they don't manually swipe. */}
+      <View style={styles.trustStrip}>
+        <AutoCarousel
+          items={[
+            { image: require('../../assets/location.png'), iconBg: '#EDE7F6', label: 'Real-time Tracking', sub: 'Track your service in real-time' },
+            { icon: '🛡️', iconBg: '#E3F2FD', label: '100% Secure', sub: 'Your data is fully protected' },
+            { icon: '✅', iconBg: '#E8F5E9', label: 'Verified Agent', sub: 'Experts at your doorstep' },
+            { icon: '💼', iconBg: '#E3EEF8', label: 'Pay After Service', sub: 'Pay only once task is completed' },
+            { icon: '🎧', iconBg: '#FCE4EC', label: '24x7 Support', sub: 'We are always here to help' },
+          ]}
+          cardWidth={200}
+          intervalMs={2800}
+          slideDurationMs={650}
+          renderItem={(item: any) => (
+            <View style={styles.trustItem}>
+              <View style={[styles.trustItemIcon, { backgroundColor: item.iconBg }]}>
+                {item.image ? (
+                  <Image source={item.image} style={styles.trustItemImg} resizeMode="contain" />
+                ) : (
+                  <Text style={styles.trustItemIconEmoji}>{item.icon}</Text>
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.trustItemLabel} numberOfLines={1}>{item.label}</Text>
+                <Text style={styles.trustItemSub} numberOfLines={2}>{item.sub}</Text>
+              </View>
+            </View>
+          )}
+          style={{ paddingHorizontal: 6 }}
+        />
       </View>
 
-      {/* ─── High-priority action row: Book New Service (red) + My Bookings (blue) ─── */}
-      <View style={styles.actionRow}>
+      {/* ─── Hero card — the marketing centerpiece. Navy gradient with
+          headline, 5 service pills (Aadhaar/PAN/GST/Loans/100+), the
+          "Fast · Secure · Reliable" tagline, and the gold CTA. The
+          delivery-rep illustration sits on the right; if you've added
+          src/assets/delivery-rep.png it gets used, otherwise the
+          fallback composition shows. */}
+      <View style={styles.heroCard}>
+        <View style={styles.heroCardRow}>
+          <View style={styles.heroCardLeft}>
+            {/* Single-line headline — was previously split across two
+                lines ("Get Any Common and" / "Industrial Services"),
+                which made the hero card eat too much vertical space
+                AND wrapped awkwardly on narrow screens. adjustsFontSizeToFit
+                ensures the text shrinks if it would otherwise wrap on
+                very small devices. */}
+            <Text
+              style={styles.heroCardTitle}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.7}
+            >
+              Get Any Common & Industrial Services
+            </Text>
+            <Text style={styles.heroCardTitleAccent}>At Your Doorstep</Text>
+
+            <View style={styles.heroPills}>
+              {/* GST removed — service is not live yet. Will restore
+                  once the GST registration flow ships. */}
+              {['Aadhaar', 'PAN', 'Loans', '100+ Services'].map((label) => (
+                <View key={label} style={styles.heroPill}>
+                  <Text style={styles.heroPillTick}>✓</Text>
+                  <Text style={styles.heroPillText}>{label}</Text>
+                </View>
+              ))}
+            </View>
+
+            <View style={styles.heroTaglineRow}>
+              <View style={styles.heroTaglineLine} />
+              <Text style={styles.heroTaglineText}>Fast · Secure · Reliable</Text>
+              <View style={styles.heroTaglineLine} />
+            </View>
+
+            <TouchableOpacity
+              style={styles.heroCardCta}
+              activeOpacity={0.85}
+              onPress={scrollToServices}
+            >
+              <Text style={styles.heroCardCtaText}>Book Service Now  →</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Delivery-rep illustration with a stylized scene behind it
+              that mirrors the marketing reference: a navy door panel
+              with brass handle, faint city-skyline silhouettes (lighter
+              navy rectangles in varying heights), a small grid of dots
+              in the upper-right corner, and a green plant tucked next
+              to the door. All scene elements are absolute-positioned
+              behind the agent image so the figure stays anchored in
+              the foreground. */}
+          <View style={styles.heroCardRight}>
+            {/* Top-right grid dots */}
+            <View style={styles.heroSceneDots} pointerEvents="none">
+              {Array.from({ length: 9 }).map((_, i) => (
+                <View key={i} style={styles.heroSceneDot} />
+              ))}
+            </View>
+
+            {/* City skyline silhouette — lighter navy rectangles. */}
+            <View style={styles.heroSceneSkyline} pointerEvents="none">
+              <View style={[styles.skyBldg, { height: 40, marginRight: 2 }]} />
+              <View style={[styles.skyBldg, { height: 28, marginRight: 2 }]} />
+              <View style={[styles.skyBldg, { height: 56, marginRight: 2 }]} />
+              <View style={[styles.skyBldg, { height: 36, marginRight: 2 }]} />
+              <View style={[styles.skyBldg, { height: 48 }]} />
+            </View>
+
+            {/* Door panel — taller than the rep, sits flush right behind */}
+            <View style={styles.heroSceneDoorFrame} pointerEvents="none">
+              <View style={styles.heroSceneDoor}>
+                <View style={styles.heroSceneDoorHandle} />
+              </View>
+            </View>
+
+            {/* Plant block was removed — the floating leaf emoji over a
+                small terracotta tile read as awkward clip-art rather
+                than scenery. The agent PNG already has its own subtle
+                background details; keeping the scene clean (just
+                door + skyline + dots + halo) makes the figure pop. */}
+
+            {/* Soft halo behind the rep for the "spotlight" effect */}
+            <View style={styles.heroRepHalo} pointerEvents="none" />
+
+            {/* Foreground: the rep PNG */}
+            <Image
+              source={require('../../assets/agent.png')}
+              style={styles.heroRepImage}
+              resizeMode="contain"
+            />
+          </View>
+        </View>
+      </View>
+
+      {/* ─── 4-card action grid in a SINGLE ROW: Book New Service /
+          My Bookings / My Documents / Refer & Earn. Each card is now
+          ~23% width so all 4 fit horizontally on a phone screen. */}
+      <View style={styles.quadCards}>
         <TouchableOpacity
-          style={[styles.actionBtn, styles.actionBtnPrimary]}
+          style={[styles.quadCard, { backgroundColor: '#1976D2' }]}
           onPress={scrollToServices}
           activeOpacity={0.85}
         >
-          <Text style={styles.actionBtnIcon}>➕</Text>
-          <View>
-            <Text style={styles.actionBtnTitle}>Book New Service</Text>
-            <Text style={styles.actionBtnSubtitle}>Start a fresh request</Text>
+          <View style={styles.quadCardIcon}>
+            <Text style={styles.quadCardIconText}>+</Text>
           </View>
+          <Text style={styles.quadCardTitle}>Book{'\n'}New</Text>
+          <Text style={styles.quadCardCtaText}>BOOK NOW →</Text>
         </TouchableOpacity>
+
         <TouchableOpacity
-          style={[styles.actionBtn, styles.actionBtnSecondary]}
+          style={[styles.quadCard, { backgroundColor: '#2E7D32' }]}
           onPress={() => navigation.navigate('MyBookings')}
           activeOpacity={0.85}
         >
-          <Text style={styles.actionBtnIcon}>📋</Text>
-          <View>
-            <Text style={styles.actionBtnTitle}>My Bookings</Text>
-            <Text style={styles.actionBtnSubtitle}>Track & manage</Text>
+          <View style={styles.quadCardIcon}>
+            <Text style={styles.quadCardIconText}>📋</Text>
           </View>
+          <Text style={styles.quadCardTitle}>My{'\n'}Bookings</Text>
+          <Text style={styles.quadCardCtaText}>VIEW →</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.quadCard, { backgroundColor: '#7B1FA2' }]}
+          onPress={() => handleQuickAction('documents')}
+          activeOpacity={0.85}
+        >
+          <View style={styles.quadCardIcon}>
+            <Text style={styles.quadCardIconText}>📁</Text>
+          </View>
+          <Text style={styles.quadCardTitle}>KYC{'\n'}Documents</Text>
+          <Text style={styles.quadCardCtaText}>VIEW →</Text>
+        </TouchableOpacity>
+
+        {/* Refer & Earn — gold↘amber linear gradient (not pure yellow) so
+            it reads as a premium "rewards" tile next to the solid colored
+            siblings. Dark navy text + dark CTA pill keep contrast high. */}
+        <TouchableOpacity onPress={handleShareApp} activeOpacity={0.85} style={styles.quadCardWrap}>
+          <LinearGradient
+            colors={['#FCD34D', '#F59E0B', '#D97706']}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 1 }}
+            style={styles.quadCard}
+          >
+            <Text style={styles.quadCardGiftEmoji}>🎁</Text>
+            <Text style={styles.quadCardTitleGold}>Refer{'\n'}& Earn</Text>
+            <Text style={styles.quadCardCtaTextGold}>₹20 →</Text>
+          </LinearGradient>
         </TouchableOpacity>
       </View>
 
-      {/* ─── Gold Refer & Earn card (earnings/rewards highlight) ─── */}
-      <TouchableOpacity
-        style={styles.goldCard}
-        activeOpacity={0.9}
-        onPress={handleShareApp}
-      >
-        <View style={styles.goldCardIconWrap}>
-          <Text style={styles.goldCardIcon}>🎁</Text>
-        </View>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.goldCardTitle}>Refer & Earn ₹20</Text>
-          <Text style={styles.goldCardSubtitle}>
-            Share FliponeX with friends — earn rewards on every successful signup.
-          </Text>
-        </View>
-        <Text style={styles.goldCardArrow}>›</Text>
-      </TouchableOpacity>
-
-      {/* ─── Promo carousel — auto-rotates on the native UI thread ─── */}
-      {/* Cards span the full screen width (minus a small symmetrical inset)
-          and butt up against each other with no gap, so the slide reads as
-          one continuous strip — same feel as Swiggy/Zomato heroes. */}
-      <Text style={styles.bannerSectionTitle}>FliponeX at a Glance</Text>
-      <AutoCarousel
-        items={HERO_BANNERS}
-        cardWidth={Dimensions.get('window').width}
-        intervalMs={3500}
-        slideDurationMs={650}
-        renderItem={(b: any) => (
-          <View
-            style={[
-              styles.heroBannerCard,
-              { backgroundColor: b.tint, marginHorizontal: 8 },
-            ]}
-          >
-            <View style={styles.heroBannerLeft}>
-              <View style={[styles.heroBannerBadge, { backgroundColor: b.badgeBg }]}>
-                <Text style={[styles.heroBannerBadgeText, { color: b.badgeFg }]}>{b.bannerType}</Text>
-              </View>
-              <Text style={[styles.heroBannerTitle, { color: b.fg }]}>{b.mainText}</Text>
-            </View>
-            <Text style={styles.heroBannerEmoji}>{b.emoji}</Text>
-          </View>
-        )}
-      />
-
-      {/* Compact horizontal-scroll quick actions */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.quickStrip}
-      >
-        <TouchableOpacity style={styles.quickChip} onPress={() => navigation.navigate('MyBookings')}>
-          <Text style={styles.quickChipIcon}>📋</Text>
-          <Text style={styles.quickChipText}>My Orders</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.quickChip} onPress={() => handleQuickAction('documents')}>
-          <Text style={styles.quickChipIcon}>📄</Text>
-          <Text style={styles.quickChipText}>Documents</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.quickChip} onPress={() => handleQuickAction('rewards')}>
+      {/* Quick actions — Rewards + Alerts as a 2-up row that spans the
+          full home screen width. Was previously a horizontal ScrollView
+          with auto-width chips, which left a big empty strip on the
+          right side of the screen on most phones. */}
+      <View style={styles.quickStrip}>
+        <TouchableOpacity
+          style={styles.quickChip}
+          onPress={() => handleQuickAction('rewards')}
+        >
           <Text style={styles.quickChipIcon}>🏆</Text>
           <Text style={styles.quickChipText}>Rewards</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.quickChip} onPress={() => handleQuickAction('notifications')}>
+        <TouchableOpacity style={styles.quickChip} onPress={openAlerts}>
           <Text style={styles.quickChipIcon}>🔔</Text>
           <Text style={styles.quickChipText}>Alerts</Text>
+          {inboxUnread > 0 && (
+            <View style={styles.alertsBadge}>
+              <Text style={styles.alertsBadgeText}>
+                {inboxUnread > 99 ? '99+' : inboxUnread}
+              </Text>
+            </View>
+          )}
         </TouchableOpacity>
-      </ScrollView>
+      </View>
 
       <B2BToggle onToggle={handleB2BToggle} currentMode={serviceType} />
 
@@ -622,20 +1029,21 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
         onPress={() => navigation.navigate('Compliance')}
       />
 
-      {/* Section heading for the 4 value propositions below */}
-      <Text style={styles.whyTitle}>Why FliponeX?</Text>
-      <EngagingContentSection content={engagingContent} />
-
-      {/* ─── Trending Services (only renders when backend returned items) ─── */}
-      {trendingServices.length > 0 && (
+      {/* ─── Trending Services — auto-rotates every 3s, same native-
+          thread AutoCarousel pattern used by the trust strip above.
+          Diversified across categories (Aadhaar / PAN / GST / Ayushman /
+          Voter ID / PF / Driving Licence / Passport) by the
+          `displayedTrending` memo so the strip never collapses to a
+          single category. */}
+      {displayedTrending.length > 0 && (
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>📈 Trending Services</Text>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={styles.hScrollContent}
-          >
-            {trendingServices.map((item: any) => (
+          <AutoCarousel
+            items={displayedTrending}
+            cardWidth={150}
+            intervalMs={3000}
+            slideDurationMs={650}
+            renderItem={(item: any) => (
               <TouchableOpacity
                 key={item.id}
                 style={styles.trendingCard}
@@ -650,32 +1058,68 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                   <Text style={styles.trendingCtaText}>Book Now</Text>
                 </View>
               </TouchableOpacity>
-            ))}
-          </ScrollView>
-        </View>
-      )}
-
-      {/* ─── Special Offers — native-thread auto-rotate ─── */}
-      {offers.length > 0 && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🎁 Special Offers</Text>
-          <AutoCarousel
-            items={offers}
-            cardWidth={230}
-            intervalMs={4000}
-            slideDurationMs={650}
-            renderItem={(item: any) => (
-              <View
-                style={[styles.offerCard, { backgroundColor: item.bannerColor || '#0D3B66' }]}
-              >
-                <Text style={styles.offerTitle} numberOfLines={2}>{item.title}</Text>
-                <Text style={styles.offerDescription} numberOfLines={3}>{item.description}</Text>
-              </View>
             )}
-            style={{ paddingLeft: 14 }}
+            style={{ paddingHorizontal: 6 }}
           />
         </View>
       )}
+
+      {/* ─── Promo strip — single horizontal auto-rotating row of all
+          4 hero banners (Consumer / Industrial / Fast Track / Referral).
+          Replaces the old standalone Fast Track full-width banner so the
+          home screen surfaces every value prop in one compact strip.
+          Each card is tinted to match its bannerType and routes the user
+          to the most relevant flow on tap. */}
+      <View style={{ marginTop: 6, marginBottom: 6 }}>
+        <Text style={styles.bannerSectionTitle}>✨ Why FliponeX</Text>
+        <AutoCarousel
+          items={HERO_BANNERS}
+          cardWidth={240}
+          intervalMs={3200}
+          slideDurationMs={650}
+          renderItem={(banner: any) => (
+            <TouchableOpacity
+              activeOpacity={0.9}
+              onPress={() => {
+                haptics.tap();
+                // Route per bannerType — Fast Track + Consumer → scroll
+                // to services in consumer mode; Industrial → switch to
+                // B2B mode + scroll; Referral → Refer & Earn screen.
+                const t = String(banner?.bannerType || '').toLowerCase();
+                if (t.includes('industrial')) {
+                  handleB2BToggle('industrial');
+                  scrollToServices();
+                } else if (t.includes('referral')) {
+                  handleShareApp();
+                } else {
+                  handleB2BToggle('consumer');
+                  scrollToServices();
+                }
+              }}
+              style={[
+                styles.heroBannerCard,
+                { backgroundColor: banner.tint, marginHorizontal: 5 },
+              ]}
+            >
+              <View style={styles.heroBannerLeft}>
+                <View style={[styles.heroBannerBadge, { backgroundColor: banner.badgeBg }]}>
+                  <Text style={[styles.heroBannerBadgeText, { color: banner.badgeFg }]}>
+                    {String(banner.bannerType || '').toUpperCase()}
+                  </Text>
+                </View>
+                <Text
+                  style={[styles.heroBannerTitle, { color: banner.fg }]}
+                  numberOfLines={3}
+                >
+                  {banner.mainText}
+                </Text>
+              </View>
+              <Text style={styles.heroBannerEmoji}>{banner.emoji}</Text>
+            </TouchableOpacity>
+          )}
+          style={{ paddingHorizontal: 6 }}
+        />
+      </View>
 
       <View style={styles.categoriesContainer}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
@@ -700,7 +1144,7 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           <TextInput
             ref={searchInputRef}
             style={styles.inlineSearchInput}
-            placeholder="Search services (e.g. Aadhaar, PAN, Voter ID)"
+            placeholder="Search for any service (e.g. Aadhaar, PAN, Voter ID...)"
             placeholderTextColor="#9AA5B1"
             value={searchQuery}
             onChangeText={handleSearchInputChange}
@@ -725,6 +1169,10 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
               <Text style={styles.inlineSearchClear}>✕</Text>
             </TouchableOpacity>
           )}
+          {/* Voice icon removed — the keyboard's built-in mic key is
+              the canonical voice-search path on Android. We keep
+              handleVoiceSearch around in case we re-add a custom voice
+              UI later, but no inline button on the search bar now. */}
         </View>
 
         {searchQuery.length > 0 && (
@@ -769,7 +1217,9 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                       </Text>
                     </View>
                     <Text style={styles.searchResultPrice}>
-                      ₹{item.total_expense || item.user_cost || '0'}
+                      {/* user_cost is the customer-facing price; fall
+                          back to total_expense / 0 only when missing. */}
+                      ₹{item.user_cost || item.total_expense || '0'}
                     </Text>
                   </Pressable>
                 ))}
@@ -817,15 +1267,39 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   }
 
   return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      // On Android, `softwareKeyboardLayoutMode: "resize"` works once we
+      // wrap with KeyboardAvoidingView (edge-to-edge mode otherwise lets
+      // the keyboard cover focused inputs). 'padding' for iOS,
+      // 'height' for Android — that combination keeps the search bar +
+      // its result dropdown visible above the keyboard.
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
     <View style={styles.container}>
+      {/* Brand block rendered OUTSIDE the ScrollView. Earlier we used
+          ScrollView's `stickyHeaderIndices` which has a known Android
+          bug — the sticky element's TOUCH hit-test stays at its
+          original (scrolled-off) position even though it's visually
+          pinned at the top, so the user-icon button became
+          unclickable after any scroll. Lifting it outside avoids the
+          bug entirely: the brand is a regular fixed View, the
+          ScrollView sits below it, and taps land where they should. */}
+      {renderStickyBrand()}
       <ScrollView
         ref={scrollRef}
         style={styles.scrollView}
-        contentContainerStyle={styles.scrollViewContent}
+        // Reserve space at the bottom for the device's gesture bar /
+        // home indicator AND the bottom-tab nav (~72px). Without this,
+        // the last CTA on the home page was hidden behind the Android
+        // 3-button bar on phones like the Pixel 6 / OnePlus.
+        contentContainerStyle={[
+          styles.scrollViewContent,
+          { paddingBottom: insets.bottom + 96 },
+        ]}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="none"
         showsVerticalScrollIndicator={false}
-        stickyHeaderIndices={[0]}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -834,7 +1308,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           />
         }
       >
-        {renderStickyBrand()}
         {renderRestOfHeader()}
 
         {/* onLayout captures Y offset so the hook's "Book Now, Pay Later"
@@ -855,32 +1328,39 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             return acc;
           }, {} as Record<string, any[]>);
 
-          // Map of category icon emojis (visual cue per group)
-          const catIcon = (name: string) => {
-            const n = name.toLowerCase();
-            if (n.includes('aadhaar')) return '🆔';
-            if (n.includes('pan')) return '💳';
-            if (n.includes('voter')) return '🗳️';
-            if (n.includes('ration')) return '🍱';
-            if (n.includes('driving') || n.includes('license')) return '🚗';
-            if (n.includes('passport')) return '🛂';
-            if (n.includes('income')) return '💼';
-            if (n.includes('birth')) return '👶';
-            if (n.includes('marriage')) return '💍';
-            return '📄';
-          };
+          // Section header icon — reuses the same per-card lookup so the
+          // grouped section emoji matches the cards inside it.
+          const catIcon = iconForCategory;
 
           return Object.entries(groups).map(([category, items]: [string, any]) => (
             <View key={category} style={styles.catSection}>
+              {/* Section header — icon + name + count + "View All →"
+                  link that opens the Services tab pre-filtered. */}
               <View style={styles.catHeader}>
                 <Text style={styles.catIcon}>{catIcon(category)}</Text>
                 <Text style={styles.catTitle}>{category}</Text>
                 <Text style={styles.catCount}>{items.length}</Text>
+                <View style={{ flex: 1 }} />
+                <TouchableOpacity
+                  onPress={() =>
+                    navigation.navigate('HomeTabs', {
+                      screen: 'Services',
+                      params: { category },
+                    })
+                  }
+                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                >
+                  <Text style={styles.catViewAll}>View All →</Text>
+                </TouchableOpacity>
               </View>
+
+              {/* Vertical 2-column grid. ServiceCard already renders the
+                  Prussian-blue Book Now pill internally, so we use the
+                  default renderer with no extra wrapper here. */}
               <FlatList
                 data={items}
                 renderItem={renderServiceCard}
-                keyExtractor={(item: any) => item.id.toString()}
+                keyExtractor={(item: any) => item.id?.toString?.() ?? Math.random().toString()}
                 numColumns={2}
                 contentContainerStyle={styles.servicesGrid}
                 columnWrapperStyle={styles.servicesRow}
@@ -896,7 +1376,73 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           <WhatsAppButton />
         </View>
       </ScrollView>
+
+      {/* Alerts modal — bottom sheet showing the user's notification
+          inbox (booking status changes, quote replies for industrial
+          enquiries, compliance reminders, etc.). Tapping a row marks
+          it as seen and routes via deep_link.route when present. */}
+      <Modal
+        visible={showAlertsModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowAlertsModal(false)}
+      >
+        <View style={styles.alertsModalOverlay}>
+          <View style={styles.alertsModalSheet}>
+            <View style={styles.alertsModalHeader}>
+              <Text style={styles.alertsModalTitle}>🔔 Alerts</Text>
+              <TouchableOpacity onPress={() => setShowAlertsModal(false)} hitSlop={8}>
+                <Text style={styles.alertsModalClose}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            {inboxLoading && inboxItems.length === 0 ? (
+              <ActivityIndicator style={{ marginTop: 30 }} color={COLORS.PRIMARY} />
+            ) : inboxItems.length === 0 ? (
+              <Text style={styles.alertsEmpty}>
+                🎉 You're all caught up — no alerts yet.
+              </Text>
+            ) : (
+              <FlatList
+                data={inboxItems}
+                keyExtractor={(n: InboxItem) => String(n.id)}
+                renderItem={({ item }: { item: InboxItem }) => {
+                  const isUnread = !item.seen_at;
+                  const stamp = item.created_at
+                    ? new Date(item.created_at).toLocaleString('en-IN', {
+                        day: 'numeric',
+                        month: 'short',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                      })
+                    : '';
+                  return (
+                    <TouchableOpacity
+                      style={styles.alertsRow}
+                      onPress={() => handleNotificationTap(item)}
+                      activeOpacity={0.7}
+                    >
+                      <View style={isUnread ? styles.alertsRowUnreadDot : styles.alertsRowReadDot} />
+                      <View style={styles.alertsRowBody}>
+                        <Text style={styles.alertsRowTitle} numberOfLines={2}>
+                          {item.title}
+                        </Text>
+                        {!!item.body && (
+                          <Text style={styles.alertsRowSubtitle} numberOfLines={3}>
+                            {item.body}
+                          </Text>
+                        )}
+                        {!!stamp && <Text style={styles.alertsRowTimestamp}>{stamp}</Text>}
+                      </View>
+                    </TouchableOpacity>
+                  );
+                }}
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
     </View>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -909,6 +1455,14 @@ const styles = StyleSheet.create({
   scrollViewContent: { flexGrow: 1 },
 
   // ─── Combined sticky brand block (greeting + buttons + search all stick together) ───
+  // Sticky header for the scrolled-list view. The user-icon button on
+  // the right was unclickable after scrolling on Android because the
+  // scroll content beneath had elevation 6+ and the sticky header had
+  // matching elevation — Android's touch dispatcher routed the tap
+  // through to the underlying scrolled card. Raising the sticky's
+  // zIndex + elevation well above any descendant fixes it. Also setting
+  // `collapsable: false` on the View (in JSX) prevents Android from
+  // flattening it into a touch-aggregating wrapper.
   stickyBrand: {
     backgroundColor: COLORS.PRIMARY,
     paddingTop: 40,
@@ -920,7 +1474,8 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.2,
     shadowRadius: 6,
-    elevation: 6,
+    elevation: 20,
+    zIndex: 20,
   },
   // Legacy styles kept for any leftover references
   brandHeader: {
@@ -944,13 +1499,33 @@ const styles = StyleSheet.create({
   brandLogo: { width: 38, height: 38, borderRadius: 19 },
   greeting: { color: 'rgba(255,255,255,0.9)', fontSize: 13, fontWeight: '500' },
   brandName: { color: '#fff', fontSize: 22, fontWeight: '800', letterSpacing: 0.5, marginTop: 2 },
+  brandNameAccent: { color: '#FCD34D' },
+  brandTagline: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 999,
+    marginTop: 4,
+  },
+  brandTaglineText: {
+    color: '#0D3B66',
+    fontWeight: '800',
+    fontSize: 11,
+    letterSpacing: 0.3,
+  },
   iconButton: {
     width: 40, height: 40, borderRadius: 20,
     backgroundColor: 'rgba(255,255,255,0.2)',
     justifyContent: 'center', alignItems: 'center',
     marginLeft: 8,
+    overflow: 'hidden',
   },
-  iconButtonText: { fontSize: 18 },
+  iconButtonText: { fontSize: 18, color: '#fff' },
+  iconAvatarImg: {
+    width: '100%',
+    height: '100%',
+  },
 
   // Search pill that overlaps into the white area below
   searchWrap: { position: 'absolute', left: 16, right: 16, bottom: -22 },
@@ -1023,6 +1598,313 @@ const styles = StyleSheet.create({
   promoEmoji: { fontSize: 48 },
 
   // ─── Hero hook banner (compact — all brief text still shown) ───
+  // ─── Trust strip ────────────────────────────────────────────────────
+  trustStrip: {
+    backgroundColor: '#FFFFFF',
+    marginHorizontal: 12,
+    marginTop: 10,
+    borderRadius: 12,
+    paddingVertical: 10,
+    elevation: 2,
+    shadowColor: '#082B4C',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+  },
+  trustStripContent: {
+    paddingHorizontal: 10,
+    gap: 12,
+  },
+  trustItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    width: 160,
+    paddingVertical: 4,
+    paddingHorizontal: 4,
+  },
+  trustItemIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  trustItemIconEmoji: { fontSize: 18 },
+  trustItemImg: { width: 22, height: 22 },
+  trustItemLabel: { fontSize: 11, fontWeight: '800', color: '#0F172A' },
+  trustItemSub: { fontSize: 9, color: '#64748B', marginTop: 1, lineHeight: 12 },
+
+  // ─── Hero card (matches the marketing reference) ────────────────────
+  heroCard: {
+    backgroundColor: '#0D3B66',
+    marginHorizontal: 12,
+    marginTop: 12,
+    borderRadius: 16,
+    paddingVertical: 18,
+    paddingLeft: 16,
+    paddingRight: 8,
+    overflow: 'hidden',
+    elevation: 4,
+    shadowColor: '#082B4C',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+  },
+  heroCardRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 4 },
+  heroCardLeft: { flex: 1 },
+  heroCardTitle: {
+    color: '#FFFFFF',
+    // Slightly smaller so the single-line headline
+    // "Get Any Common & Industrial Services" fits comfortably on a
+    // standard phone width (360-420dp) without needing aggressive
+    // font scaling. adjustsFontSizeToFit on the Text element acts
+    // as a safety net for very narrow devices.
+    fontSize: 14,
+    fontWeight: '900',
+    lineHeight: 18,
+    letterSpacing: 0.1,
+  },
+  heroCardTitleAccent: {
+    color: '#FCD34D',
+    fontSize: 17,
+    fontWeight: '900',
+    lineHeight: 22,
+    letterSpacing: 0.2,
+    marginTop: 2,
+  },
+  heroPills: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 12,
+  },
+  heroPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#FCD34D',
+    backgroundColor: 'rgba(252,211,77,0.08)',
+  },
+  heroPillTick: {
+    color: '#FCD34D',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  heroPillText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  heroTaglineRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    marginTop: 10,
+  },
+  heroTaglineLine: {
+    width: 18,
+    height: 2,
+    backgroundColor: '#FCD34D',
+    borderRadius: 1,
+  },
+  heroTaglineText: {
+    color: '#FCD34D',
+    fontSize: 10,
+    fontWeight: '700',
+    fontStyle: 'italic',
+    letterSpacing: 0.2,
+  },
+  heroCardCta: {
+    backgroundColor: '#FCD34D',
+    paddingHorizontal: 18,
+    paddingVertical: 11,
+    borderRadius: 999,
+    alignSelf: 'flex-start',
+    marginTop: 12,
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.18,
+    shadowRadius: 3,
+  },
+  heroCardCtaText: {
+    color: '#0D3B66',
+    fontWeight: '900',
+    fontSize: 13,
+    letterSpacing: 0.3,
+  },
+  heroCardRight: {
+    width: 138,
+    height: 200,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    position: 'relative',
+    overflow: 'hidden',
+  },
+  // Soft glow circle behind the rep — bigger, lighter, more diffuse so
+  // it reads as ambient lighting on the figure rather than a hard
+  // "framed" disc. The agent should look like they're standing in
+  // front of the scene, not pasted onto a square.
+  heroRepHalo: {
+    position: 'absolute',
+    bottom: 0,
+    alignSelf: 'center',
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    backgroundColor: 'rgba(252,211,77,0.16)',
+  },
+  // Larger figure that overlaps the hero card edges so it doesn't read
+  // as a boxed-in sticker. Slight scale-up + lower bottom anchor makes
+  // the rep feel "standing in the scene".
+  heroRepImage: {
+    width: 130,
+    height: 200,
+    zIndex: 2,
+    marginBottom: -8,
+  },
+
+  // ─── Background scene around the rep ────────────────────────────────
+  // Top-right grid of soft dots — purely decorative, hints at "digital
+  // services" without competing with the rep visually.
+  heroSceneDots: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    width: 30,
+    gap: 3,
+  },
+  heroSceneDot: {
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.30)',
+  },
+  // City skyline silhouettes — lighter navy rectangles peeking from
+  // behind the rep to suggest "doorstep at home/office in the city".
+  heroSceneSkyline: {
+    position: 'absolute',
+    bottom: 30,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+  skyBldg: {
+    width: 12,
+    backgroundColor: 'rgba(255,255,255,0.10)',
+    borderTopLeftRadius: 2,
+    borderTopRightRadius: 2,
+  },
+  // Door panel sits behind the rep on the right side. A thinner brass
+  // handle disc on the right edge of the door reads as a doorknob.
+  heroSceneDoorFrame: {
+    position: 'absolute',
+    top: 6,
+    right: -2,
+    width: 50,
+    height: 150,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 6,
+    padding: 3,
+  },
+  heroSceneDoor: {
+    flex: 1,
+    backgroundColor: '#082B4C',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'flex-end',
+    paddingRight: 4,
+  },
+  heroSceneDoorHandle: {
+    width: 4,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#FCD34D',
+  },
+  // (heroScenePlant / heroScenePot / heroScenePlantTop styles
+  // removed — the floating leaf clip-art was replaced with a cleaner
+  // scene of just door + skyline + dots + halo.)
+
+  // ─── 4-card action row — single horizontal line, 4 equal slots ─────
+  // Each card is `flex: 1` inside a row container with small gaps so
+  // the layout adapts cleanly to any phone width.
+  quadCards: {
+    flexDirection: 'row',
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    gap: 8,
+  },
+  quadCardWrap: {
+    flex: 1,
+    borderRadius: 14,
+    overflow: 'hidden',
+    elevation: 3,
+    shadowColor: '#082B4C',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.16,
+    shadowRadius: 4,
+  },
+  quadCard: {
+    flex: 1,
+    minHeight: 122,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    elevation: 3,
+    shadowColor: '#082B4C',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.16,
+    shadowRadius: 4,
+  },
+  quadCardIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quadCardIconText: { color: '#FFFFFF', fontSize: 18, fontWeight: '900', lineHeight: 20 },
+  quadCardTitle: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '900',
+    lineHeight: 14,
+    textAlign: 'center',
+  },
+  quadCardTitleGold: {
+    color: '#7B4D00',
+    fontSize: 11,
+    fontWeight: '900',
+    lineHeight: 14,
+    textAlign: 'center',
+  },
+  quadCardGiftEmoji: { fontSize: 22 },
+  quadCardCtaText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.4,
+  },
+  quadCardCtaTextGold: {
+    color: '#5C2E00',
+    fontSize: 11,
+    fontWeight: '900',
+    letterSpacing: 0.4,
+  },
+
   heroHook: {
     backgroundColor: '#fff',
     marginHorizontal: 12,
@@ -1031,6 +1913,83 @@ const styles = StyleSheet.create({
     paddingVertical: 12, paddingHorizontal: 12,
     shadowColor: '#082B4C', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.08, shadowRadius: 5, elevation: 2,
     borderLeftWidth: 3, borderLeftColor: '#0D3B66',
+  },
+  // Two-column wrapper: text on the left flexes to fill space, phone
+  // illustration on the right is fixed-width.
+  heroHookRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  heroHookLeft: { flex: 1 },
+  heroHookRight: {
+    width: 130,
+    height: 190,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    position: 'relative',
+  },
+  // ─── FliponeX rep illustration ─────────────────────────────────────
+  // Simple, clean fallback used when no real PNG/SVG illustration has
+  // been added yet. Layers: halo glow → navy circle background → big
+  // person emoji → "FliponeX Rep" gold pill → floor shadow. Each layer
+  // is absolutely positioned so the figure anchors to the right column
+  // regardless of how the surrounding text reflows.
+  repImage: {
+    width: 130,
+    height: 180,
+  },
+  repHaloGlow: {
+    position: 'absolute',
+    top: 4,
+    width: 130,
+    height: 130,
+    borderRadius: 65,
+    backgroundColor: 'rgba(252,211,77,0.30)',
+  },
+  repCircle: {
+    position: 'absolute',
+    top: 14,
+    width: 110,
+    height: 110,
+    borderRadius: 55,
+    backgroundColor: '#0D3B66',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 3,
+    borderColor: '#FCD34D',
+    elevation: 4,
+    shadowColor: '#082B4C',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+  },
+  repBigEmoji: {
+    fontSize: 64,
+    lineHeight: 72,
+  },
+  repBrandPill: {
+    position: 'absolute',
+    bottom: 18,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: '#FCD34D',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
+  },
+  repBrandPillText: {
+    color: '#0D3B66',
+    fontWeight: '900',
+    fontSize: 10,
+    letterSpacing: 0.4,
+  },
+  repFloorShadow: {
+    position: 'absolute',
+    bottom: 4,
+    width: 90,
+    height: 6,
+    borderRadius: 50,
+    backgroundColor: 'rgba(13,59,102,0.18)',
   },
   heroHookBadge: {
     alignSelf: 'flex-start',
@@ -1041,6 +2000,11 @@ const styles = StyleSheet.create({
   heroHookBadgeText: { fontSize: 9, fontWeight: '800', color: '#C99100', letterSpacing: 0.5 },
   heroHookTitle: { fontSize: 13, fontWeight: '800', color: '#1A1A1A', lineHeight: 17 },
   heroHookSubtitle: { fontSize: 11, color: '#5C6A7A', marginTop: 3, lineHeight: 15 },
+  // Trust-factor chips row — sits between subtitle and CTA line
+  trustRow: { flexDirection: 'row', gap: 12, marginTop: 8, marginBottom: 4 },
+  trustChip: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  trustChipIcon: { fontSize: 12 },
+  trustChipLabel: { fontSize: 11, color: '#1A1A1A', fontWeight: '700' },
   heroHookCtaLine: {
     fontSize: 11, fontWeight: '800', color: '#0D3B66',
     marginTop: 8, lineHeight: 15, letterSpacing: 0.1,
@@ -1145,21 +2109,115 @@ const styles = StyleSheet.create({
     marginHorizontal: 14, marginTop: 22, marginBottom: 10,
   },
 
-  // Compact horizontal quick action strip
-  quickStrip: { paddingHorizontal: 12, paddingVertical: 12, gap: 8 },
+  // Quick action strip — full-width 2-up row.
+  quickStrip: {
+    flexDirection: 'row',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    gap: 10,
+  },
   quickChip: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: '#fff',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 20,
+    paddingVertical: 12,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: '#F0F2F5',
-    marginRight: 8,
   },
-  quickChipIcon: { fontSize: 14, marginRight: 6 },
-  quickChipText: { fontSize: 12, fontWeight: '700', color: '#1A1A1A' },
+  quickChipIcon: { fontSize: 16, marginRight: 8 },
+  quickChipText: { fontSize: 13, fontWeight: '700', color: '#1A1A1A' },
+  // Red unread pill anchored to the top-right of the Alerts chip.
+  alertsBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    backgroundColor: '#E63946',
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    paddingHorizontal: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  alertsBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+  },
+  // ─── Alerts modal ──────────────────────────────────────────────────────
+  alertsModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
+  alertsModalSheet: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 24,
+    maxHeight: '85%',
+  },
+  alertsModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F0F2F5',
+    marginBottom: 4,
+  },
+  alertsModalTitle: { fontSize: 17, fontWeight: '800', color: '#1A1A1A' },
+  alertsModalClose: {
+    fontSize: 22,
+    color: '#64748B',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  alertsEmpty: {
+    paddingVertical: 36,
+    textAlign: 'center',
+    color: '#94A3B8',
+    fontSize: 13,
+  },
+  alertsRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  alertsRowUnreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#E63946',
+    marginTop: 7,
+    marginRight: 10,
+  },
+  alertsRowReadDot: {
+    width: 8,
+    height: 8,
+    marginTop: 7,
+    marginRight: 10,
+  },
+  alertsRowBody: { flex: 1 },
+  alertsRowTitle: { fontSize: 14, fontWeight: '700', color: '#1F2937' },
+  alertsRowSubtitle: {
+    fontSize: 12,
+    color: '#475569',
+    marginTop: 2,
+    lineHeight: 16,
+  },
+  alertsRowTimestamp: { fontSize: 10, color: '#94A3B8', marginTop: 4 },
 
   // Services grid (tighter spacing so more cards visible above the fold)
   servicesSectionTitle: {
@@ -1175,6 +2233,34 @@ const styles = StyleSheet.create({
 
   // Category sections (Swiggy/Zomato style grouped lists)
   catSection: { marginTop: 12, marginBottom: 4 },
+  // "View All →" link on each section header — opens ServicesScreen
+  // with the matching category preselected.
+  catViewAll: {
+    color: '#1976D2',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+  // Each card slot in the vertical 2-column grid. The wrapping View
+  // groups the ServiceCard with its dedicated "Book Now" CTA pill below.
+  serviceCardWrap: {
+    width: '48%',
+    marginBottom: 10,
+  },
+  serviceBookNow: {
+    backgroundColor: '#1976D2',
+    borderRadius: 999,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    marginTop: 6,
+  },
+  serviceBookNowText: {
+    color: '#FFFFFF',
+    fontWeight: '900',
+    fontSize: 12,
+    letterSpacing: 0.4,
+  },
   catHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1637,6 +2723,10 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     paddingHorizontal: 6,
   },
+  // (Voice mic image style removed — the inline button was dropped
+  // from the search bar. Use the keyboard's built-in mic key for
+  // dictation. The handleVoiceSearch handler stays defined in case
+  // we wire a different voice-entry UI later.)
 
   // ─── Trending Services + Special Offers (horizontal sections) ──────────
   // Bigger top margin to clearly separate each from "Why FliponeX" above and
@@ -1661,11 +2751,11 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   trendingCard: {
-    width: 140,
+    flex: 1,
+    marginHorizontal: 5,
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 12,
-    marginRight: 10,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
@@ -1697,6 +2787,173 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 0.3,
   },
+  // ─── Fast Track gradient banner (replaces image-based version) ─────
+  fastTrackTouch: {
+    marginHorizontal: 12,
+    marginTop: 16,
+    borderRadius: 16,
+    overflow: 'hidden',
+    elevation: 5,
+    shadowColor: '#7F1D1D',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.30,
+    shadowRadius: 10,
+  },
+  fastTrackBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    minHeight: 140,
+  },
+  fastTrackLeft: { flex: 1, paddingRight: 8 },
+  fastTrackBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#FCD34D',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 999,
+  },
+  fastTrackBadgeText: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#7F1D1D',
+    letterSpacing: 0.6,
+  },
+  fastTrackTitle: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: '#FFFFFF',
+    marginTop: 8,
+    lineHeight: 24,
+  },
+  fastTrackSubtitle: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.92)',
+    marginTop: 3,
+    lineHeight: 16,
+  },
+  fastTrackCta: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#FCD34D',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    marginTop: 10,
+    elevation: 2,
+  },
+  fastTrackCtaText: {
+    color: '#7F1D1D',
+    fontWeight: '900',
+    fontSize: 12,
+    letterSpacing: 0.3,
+  },
+
+  // ─── Stopwatch illustration ─────────────────────────────────────────
+  fastTrackStopwatch: {
+    width: 100,
+    height: 110,
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  swCrown: {
+    position: 'absolute',
+    top: 8,
+    width: 16,
+    height: 8,
+    backgroundColor: '#0F172A',
+    borderRadius: 2,
+    zIndex: 1,
+  },
+  swOuter: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: '#FCD34D',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+  },
+  swFace: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    position: 'relative',
+  },
+  swTick: {
+    position: 'absolute',
+    width: 4,
+    height: 8,
+    backgroundColor: '#0D3B66',
+    borderRadius: 2,
+  },
+  // Tick marks at 12/3/6/9. Top and bottom were missing `left`, so they
+  // defaulted to left:0 and sat at the corner instead of being centred
+  // horizontally on the clock face.
+  swTickTop: { top: 4, left: 34 },     // 36 − 4/2
+  swTickRight: { right: 4, top: 32, transform: [{ rotate: '90deg' }] },
+  swTickBottom: { bottom: 4, left: 34 },
+  swTickLeft: { left: 4, top: 32, transform: [{ rotate: '90deg' }] },
+  swCenter: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#0D3B66',
+    zIndex: 3,
+  },
+  // Clock hands. Two-step trick to make rotation pivot at the clock
+  // face centre (36,36) on a 72-px face:
+  //   1. Position the hand so its bounding-box centre sits on the
+  //      clock centre — `top: 36 - height/2`, `left: 36 - width/2`.
+  //      Without an explicit `left`, RN's absolute positioning
+  //      defaults to left:0 and the hand sat at the FACE's LEFT EDGE.
+  //   2. After rotate, push the hand outward by half its length using
+  //      `translateY: -height/2`. Because RN applies transforms in
+  //      sequence, this happens in the rotated frame, so the BASE of
+  //      the hand stays pinned at the clock centre while the tip
+  //      points along the rotation angle.
+  // Hands are now angled to a "10:10" pose — the universal "clock"
+  // pose where the hands form a wide V around the brand text. Reads
+  // immediately as a clock and doesn't obscure the centre dot.
+  swHand: {
+    position: 'absolute',
+    backgroundColor: '#0D3B66',
+    borderRadius: 2,
+    zIndex: 2,
+  },
+  // Minute hand — long, points to "2" (10:10 minute position = +60°).
+  swHandMin: {
+    width: 2.5,
+    height: 22,
+    top: 25,    // 36 − 22/2
+    left: 34.75, // 36 − 2.5/2
+    transform: [{ rotate: '60deg' }, { translateY: -11 }],
+  },
+  // Hour hand — short, points to "10" (10:10 hour position = −60°).
+  // Reusing the swHandSec class name from before to avoid touching
+  // the JSX (this is the second of the two <View> hands rendered).
+  swHandSec: {
+    width: 3,
+    height: 14,
+    top: 29,    // 36 − 14/2
+    left: 34.5, // 36 − 3/2
+    transform: [{ rotate: '-60deg' }, { translateY: -7 }],
+  },
+  swZap: {
+    position: 'absolute',
+    bottom: -2,
+    right: -2,
+    fontSize: 22,
+  },
+
   offerCard: {
     width: 220,
     borderRadius: 12,

@@ -160,7 +160,7 @@ const CompanyProfileScreen: React.FC<CompanyProfileScreenProps> = ({ navigation,
   return (
     <KeyboardAvoidingView
       style={{ flex: 1, backgroundColor: '#F8F9FA' }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
     >
       <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
         <Text style={styles.pageHint}>

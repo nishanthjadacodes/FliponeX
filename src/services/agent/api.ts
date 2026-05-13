@@ -415,18 +415,51 @@ export interface DashboardData {
 }
 
 export const getDashboard = async (): Promise<DashboardData> => {
-  const tasksResponse = await getTasks();
+  // Pull tasks, profile, AND earnings in parallel:
+  //   • tasks   → list + counts for the dashboard cards
+  //   • profile → canonical online_status (was hard-coded `false` before,
+  //               which made the toggle reset to Offline on every reload)
+  //   • earnings → server-computed today's partner earning. Using the
+  //               dedicated endpoint instead of summing tasks locally so
+  //               the dashboard reflects the SAME partner_earning that
+  //               the Earnings tab shows, with the same null-fallback
+  //               chain (partner_earning → price_quoted → user_cost).
+  //               Updates the moment any booking is closed today — even
+  //               mid-day, even partial hours.
+  const [tasksResponse, profile, earnings] = await Promise.all([
+    getTasks(),
+    getProfile().catch(() => ({} as any)),
+    getEarnings().catch(() => null),
+  ]);
   const tasks = tasksResponse?.tasks || [];
-
-  const today = new Date().toDateString();
   const completedTasks = tasks.filter((t) => t.status === 'completed');
-  const todayCompleted = completedTasks.filter(
-    (t) => new Date(t.completedAt || t.createdAt).toDateString() === today,
+
+  // Prefer the server's `today` (from /earnings, which sums service
+  // partner_earning per completed_at-today booking with the proper
+  // fallback chain). Only fall back to local sum-of-amount if the
+  // earnings endpoint is unreachable — that's a rare cold-start path.
+  //
+  // Local fallback counts BOTH `completed` (customer OTP-verified)
+  // AND `work_completed` (rep finished work, customer hasn't OTP'd
+  // yet — backend status='submitted'). Mirrors the server's
+  // earningsController WHERE-clause so the cold-start path can't
+  // silently zero-out a rep's day.
+  const today = new Date().toDateString();
+  const earnedTodayLocal = tasks.filter(
+    (t) =>
+      (t.status === 'completed' || t.status === 'work_completed') &&
+      new Date(t.completedAt || t.createdAt).toDateString() === today,
   );
-  const todayEarnings = todayCompleted.reduce(
+  const localTodayFallback = earnedTodayLocal.reduce(
     (sum, t) => sum + (parseFloat(String(t.amount)) || 0),
     0,
   );
+  const todayEarnings =
+    earnings && typeof earnings.today === 'number' ? earnings.today : localTodayFallback;
+
+  // Profile response shape varies — backend returns `{ success, user }`,
+  // older code returned the user directly. Cover both.
+  const u: any = (profile as any)?.user || profile || {};
 
   return {
     tasks,
@@ -436,7 +469,7 @@ export const getDashboard = async (): Promise<DashboardData> => {
     pendingTasks: tasks.filter((t) => t.status === 'accepted' || t.status === 'in_progress').length,
     completedJobs: completedTasks.length,
     rating: completedTasks.length > 0 ? 4.5 : 0,
-    isOnline: false,
+    isOnline: !!u.online_status,
   };
 };
 
@@ -609,6 +642,25 @@ export const getEarnings = async (): Promise<EarningsSummary> => {
   try {
     const response: any = await fetchAPI('/earnings');
     if (response?.success && Array.isArray(response.earnings)) {
+      // Diagnostic — visible via `adb logcat *:S ReactNativeJS:V`.
+      // Surfaces the actual server response so we can see why total/
+      // today/week are 0 when there are completed bookings: usually
+      // each booking's commission is 0 because the underlying
+      // service.partner_earning + service.user_cost + booking.price_quoted
+      // are all null/0 in the catalog (e.g. free services).
+      console.log(
+        '[earnings] server response — total:', response.total,
+        'today:', response.today,
+        'week:', response.week,
+        '| per-booking:',
+        response.earnings.map((e: any) => ({
+          id: String(e.id || '').slice(0, 8),
+          status: e.status,
+          date: e.date,
+          amount: e.amount,
+          commission: e.commission,
+        })),
+      );
       return {
         earnings: response.earnings as EarningRecord[],
         total: Number(response.total || 0),
@@ -702,6 +754,44 @@ export const trackReferralClick = async (
   });
 };
 
+// ─── Team Tree + Income Summary ─────────────────────────────────────────
+export interface IncomeRow {
+  index: number;
+  date: string;
+  level: number;
+  gross: number;
+  tds: number;
+  net: number;
+  desc: string;
+  bookingId: string;
+}
+export interface DownlineSummary {
+  refereeId: string;
+  name: string;
+  mobile: string;
+  doj: string;
+  rows: IncomeRow[];
+  totals: { gross: number; tds: number; net: number; rowCount: number };
+}
+export interface TeamIncomeSummary {
+  totals: { gross: number; tds: number; net: number; downlineCount: number };
+  downlines: DownlineSummary[];
+}
+
+export const getTeamIncomeSummary = async (): Promise<TeamIncomeSummary> => {
+  const response = await fetchAPI('/referrals/income-summary');
+  if (response.success) {
+    return {
+      totals: response.totals || { gross: 0, tds: 0, net: 0, downlineCount: 0 },
+      downlines: Array.isArray(response.downlines) ? response.downlines : [],
+    };
+  }
+  return {
+    totals: { gross: 0, tds: 0, net: 0, downlineCount: 0 },
+    downlines: [],
+  };
+};
+
 export interface ReferralStats {
   totalReferrals: number;
   successfulReferrals: number;
@@ -720,6 +810,25 @@ export const applyReferralCode = async (referralCode: string): Promise<FetchAPIR
     method: 'POST',
     body: JSON.stringify({ referralCode }),
   });
+};
+
+// Push the rep's current GPS coordinates to the backend so the
+// Operations Manager's Agent Monitoring view shows a fresh ping. Best-
+// effort: any failure (network, no fix yet, denied permission) is
+// silently swallowed — we don't want to block the rep app's UI on
+// what is essentially telemetry.
+export const pingAgentLocation = async (
+  lat: number,
+  lng: number,
+): Promise<void> => {
+  try {
+    await fetchAPI('/geolocation/update', {
+      method: 'POST',
+      body: JSON.stringify({ latitude: lat, longitude: lng }),
+    });
+  } catch (e: any) {
+    console.log('[location-ping] non-fatal:', e?.message);
+  }
 };
 
 // Re-run the referral reward credit for any of the rep's downlines whose
@@ -763,9 +872,16 @@ export interface OnlineStatusResponse {
 export const updateOnlineStatus = async (isOnline: boolean): Promise<OnlineStatusResponse> => {
   console.log('Updating online status to:', isOnline);
   try {
-    return (await fetchAPI('/agent/status', {
+    // Backend route is PUT /api/profile/online-status with body
+    // { isOnline: boolean }. Earlier this hit a non-existent
+    // /agent/status with the wrong field name (`online_status`),
+    // which 404'd silently — the catch returned a fake-success
+    // response so the toggle felt working in the agent app, but the
+    // DB was never updated and admin's representative-management
+    // page never saw the rep go online.
+    return (await fetchAPI('/profile/online-status', {
       method: 'PUT',
-      body: JSON.stringify({ online_status: isOnline }),
+      body: JSON.stringify({ isOnline }),
     })) as OnlineStatusResponse;
   } catch (error: any) {
     console.log('Update status API failed, using fallback -', error.message);

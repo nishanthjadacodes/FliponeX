@@ -33,6 +33,18 @@ export const fixDocUrl = (raw: string | undefined, category?: string): string | 
   const url = String(raw).trim();
   const apiOrigin = API_BASE_URL.replace(/\/api\/?$/, '');
 
+  // Local file URIs (e.g. file:///data/user/0/.../cache/compliance_xx.jpeg)
+  // and content:// URIs (Android scoped storage / SAF) are already absolute
+  // and resolve directly against the device's filesystem — `<Image
+  // source={{uri}}>` handles them natively. Without this guard the helper
+  // would fall through to the "bare filename" branch below and produce
+  // a malformed URL like `https://api.example/uploads/booking/file:///...`,
+  // which is exactly the 404 that shows up when previewing a downloaded
+  // compliance doc from the cache.
+  if (/^(file|content|data|asset|blob):/i.test(url)) {
+    return url;
+  }
+
   // Already a full http(s) URL → leave as-is, but rewrite localhost.
   if (/^https?:\/\//i.test(url)) {
     if (/localhost|127\.0\.0\.1|0\.0\.0\.0/.test(url)) {

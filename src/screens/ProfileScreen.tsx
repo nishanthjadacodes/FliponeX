@@ -2,11 +2,14 @@ import { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView,
   TextInput, ActivityIndicator, Share, Linking, Modal, RefreshControl,
-  Switch,
+  Switch, KeyboardAvoidingView, Platform, Image,
 } from 'react-native';
+import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { clearAuthSession } from '../utils/storage';
-import { getProfile, updateProfile, getMyBookings, getMyDocuments } from '../services/api';
+import * as Clipboard from 'expo-clipboard';
+import * as ImagePicker from 'expo-image-picker';
+import { clearAuthSession, storeUser, getUser } from '../utils/storage';
+import { getProfile, updateProfile, getMyBookings, getMyDocuments, uploadAvatar, deleteAvatar } from '../services/api';
 import * as api from '../services/api';
 import {
   STRINGS,
@@ -73,6 +76,9 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   const [kycVerified, setKycVerified] = useState<number>(0);
   const [editing, setEditing] = useState<boolean>(false);
   const [formData, setFormData] = useState<{ name: string; email: string; mobile: string; address: string }>({ name: '', email: '', mobile: '', address: '' });
+  // Avatar upload state — flips while the camera/gallery picker is open
+  // and during the multipart upload, dimming the camera-overlay button.
+  const [avatarUploading, setAvatarUploading] = useState<boolean>(false);
 
   // Feature modals
   const [showReferral, setShowReferral] = useState<boolean>(false);
@@ -190,7 +196,13 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
         getMyBookings().catch(() => [] as any),
         getMyDocuments().catch(() => [] as any),
       ]);
-      const data: any = (p as any).data || p;
+      // Backend's GET /profile returns { success, user } — older paths
+      // returned { success, data }. Pull whichever is present, fall back
+      // to the bare object. Without this, `data.name` was always
+      // undefined, so the avatar's first-letter reverted to "U" and the
+      // edit modal opened with empty name/email even after saves.
+      const data: any =
+        (p as any)?.user || (p as any)?.data || p || {};
       setProfile(data);
       setBookingsCount(Array.isArray(b) ? b.length : ((b as any)?.data?.length || 0));
 
@@ -224,13 +236,154 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
   const onRefresh = (): void => { setRefreshing(true); loadProfile(); };
 
+  // Avatar picker — bottom-sheet style choice between Camera and Gallery,
+  // then resizes / crops to a 1:1 square via the picker's allowsEditing
+  // option. Uploads with auth, then patches local state with the returned
+  // URL so the new avatar shows immediately (no refetch needed).
+  const pickAvatar = (): void => {
+    if (avatarUploading) return;
+    haptics.tap();
+    // Build the action sheet dynamically so the destructive "Remove
+    // current photo" option only appears when there's actually a photo
+    // to remove. Avoids a stale entry that would no-op + confuse users.
+    const hasExistingPhoto = !!profile?.profile_pic;
+    const buttons: any[] = [
+      { text: 'Camera', onPress: () => doPickAvatar('camera') },
+      { text: 'Gallery', onPress: () => doPickAvatar('gallery') },
+    ];
+    if (hasExistingPhoto) {
+      buttons.push({
+        text: 'Remove current photo',
+        style: 'destructive',
+        onPress: confirmRemoveAvatar,
+      });
+    }
+    buttons.push({ text: 'Cancel', style: 'cancel' });
+
+    Alert.alert(
+      'Profile picture',
+      hasExistingPhoto
+        ? 'Replace your photo, or remove it to use the letter avatar.'
+        : 'Choose where to pick the photo from',
+      buttons,
+      { cancelable: true },
+    );
+  };
+
+  // Two-step destructive flow — never let a single accidental tap wipe
+  // the photo. Shows a confirm dialog, then on Yes calls the DELETE
+  // endpoint and clears local state + AsyncStorage cache so the header
+  // avatar in HomeScreen reverts on next focus.
+  const confirmRemoveAvatar = (): void => {
+    Alert.alert(
+      'Remove profile photo?',
+      'Your avatar will go back to showing the first letter of your name. You can upload a new photo any time.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setAvatarUploading(true);
+              await deleteAvatar();
+              setProfile((prev: any) => ({ ...(prev || {}), profile_pic: null }));
+              try {
+                const cached = (await getUser()) || {};
+                await storeUser({ ...cached, profile_pic: null });
+              } catch (_) { /* non-fatal */ }
+              haptics.success();
+            } catch (e: any) {
+              console.log('avatar delete error:', e?.message || e);
+              haptics.error();
+              Alert.alert('Could not remove', e?.message || 'Please try again.');
+            } finally {
+              setAvatarUploading(false);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const doPickAvatar = async (source: 'camera' | 'gallery'): Promise<void> => {
+    try {
+      // Permissions
+      if (source === 'camera') {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert('Permission needed', 'Camera access is required to take a photo.');
+          return;
+        }
+      } else {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert('Permission needed', 'Photo library access is required.');
+          return;
+        }
+      }
+
+      const result: any = source === 'camera'
+        ? await ImagePicker.launchCameraAsync({
+            mediaTypes: ImagePicker.MediaTypeOptions.Images,
+            allowsEditing: true,
+            aspect: [1, 1],
+            quality: 0.7,
+          })
+        : await ImagePicker.launchImageLibraryAsync({
+            mediaTypes: ImagePicker.MediaTypeOptions.Images,
+            allowsEditing: true,
+            aspect: [1, 1],
+            quality: 0.7,
+          });
+
+      if (result?.canceled || !result?.assets?.[0]) return;
+      const asset = result.assets[0];
+      const uri: string = asset.uri;
+      const name: string =
+        asset.fileName || `avatar_${Date.now()}.${(asset.uri.split('.').pop() || 'jpg')}`;
+      const type: string = asset.mimeType || 'image/jpeg';
+
+      setAvatarUploading(true);
+      const { profile_pic } = await uploadAvatar({ uri, name, type });
+      // Optimistic update so the camera overlay flips back to the new pic
+      // immediately — the next loadProfile refresh would set the same value.
+      setProfile((prev: any) => ({ ...(prev || {}), profile_pic }));
+      // Mirror to AsyncStorage so HomeScreen's header avatar picks it up
+      // on the next focus, without waiting for a full /profile re-fetch.
+      try {
+        const cached = (await getUser()) || {};
+        await storeUser({ ...cached, profile_pic });
+      } catch (_) { /* non-fatal */ }
+      haptics.success();
+    } catch (e: any) {
+      console.log('avatar pick error:', e?.message || e);
+      haptics.error();
+      Alert.alert('Upload failed', e?.message || 'Could not update profile picture.');
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
+
   const handleSave = async (): Promise<void> => {
     try {
+      // Persist via the API.
       await updateProfile(formData);
-      setProfile({ ...profile, ...formData });
+      const merged = { ...(profile || {}), ...formData };
+      setProfile(merged);
+      // Mirror the change into the AsyncStorage `user` cache so other
+      // screens (HomeScreen header avatar / first-letter fallback) pick
+      // up the new name + email on their next focus-driven reload.
+      try {
+        const cached = (await getUser()) || {};
+        await storeUser({ ...cached, ...formData });
+      } catch (_) { /* cache miss is non-fatal */ }
       setEditing(false);
       haptics.success();
       Alert.alert('Success', 'Profile updated');
+      // Re-fetch in the background so local state matches the server's
+      // canonical view (and the avatar initial sticks across navigations).
+      loadProfile();
     } catch (error) {
       haptics.error();
       Alert.alert('Error', 'Failed to update profile');
@@ -313,10 +466,15 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   const initial = (profile?.name || profile?.mobile || 'U').charAt(0).toUpperCase();
 
   return (
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+    >
     <View style={styles.container}>
       <ScrollView
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#0D3B66']} />}
         stickyHeaderIndices={[0]}
+        keyboardShouldPersistTaps="handled"
       >
 
         {/* Compact sticky bar — stays pinned at the top while everything
@@ -348,12 +506,35 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
           </TouchableOpacity>
         </View>
 
-        {/* Branded hero header with big avatar (scrolls under the sticky bar) */}
+        {/* Branded hero header with big avatar (scrolls under the sticky bar).
+            If the user has uploaded a profile picture it renders the image;
+            otherwise it shows the same letter-initial fallback as before.
+            The camera button overlay lets them pick a new photo at any time. */}
         <View style={styles.header}>
           <View style={styles.avatarRing}>
             <View style={styles.avatar}>
-              <Text style={styles.avatarText}>{initial}</Text>
+              {profile?.profile_pic ? (
+                <Image
+                  source={{ uri: profile.profile_pic }}
+                  style={styles.avatarImg}
+                  resizeMode="cover"
+                />
+              ) : (
+                <Text style={styles.avatarText}>{initial}</Text>
+              )}
             </View>
+            <TouchableOpacity
+              style={styles.avatarCameraBtn}
+              onPress={pickAvatar}
+              disabled={avatarUploading}
+              accessibilityLabel="Change profile picture"
+            >
+              {avatarUploading ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Text style={styles.avatarCameraIcon}>📷</Text>
+              )}
+            </TouchableOpacity>
           </View>
           <Text style={styles.userName}>{profile?.name || 'Guest User'}</Text>
           <Text style={styles.userMobile}>+91 {profile?.mobile || 'N/A'}</Text>
@@ -452,7 +633,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
           <MenuRow icon="📝" iconBg="#E3F2FD" iconColor="#1565C0" label="Digital NDA" subtitle="Review / accept for B2B services" onPress={() => navigation.navigate('NDA')} />
           <MenuRow icon="📅" iconBg="#FFEBEE" iconColor="#C62828" label="Compliance Vault" subtitle="Track license expiries · 90/60/30-day alerts" onPress={() => navigation.navigate('Compliance')} />
           <MenuRow icon="🎁" iconBg="#FFF8E1" iconColor="#F9A825" label="Refer & Earn" subtitle="Earn ₹50 per friend" onPress={() => setShowReferral(true)} />
-          <MenuRow icon="👛" iconBg="#FFF7D6" iconColor="#C99100" label="My Wallet" subtitle="View balance & history" onPress={() => navigation.navigate('Wallet')} />
+          <MenuRow icon="💰" iconBg="#FFEFD5" iconColor="#D97706" label="My Wallet" subtitle="View balance & history" onPress={() => navigation.navigate('Wallet')} />
           <MenuRow icon="💳" iconBg="#E8F5E9" iconColor="#2E7D32" label="Payment Methods" subtitle="UPI, cards, wallet" onPress={() => setShowPayments(true)} />
         </View>
 
@@ -521,12 +702,30 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
               keyboardType="email-address"
             />
 
+            {/* Mobile is the OTP-verified login identity — locked here.
+                Changing it would invalidate the user's auth token and
+                break their session. Surfaces a "Verified" badge + hint
+                so users see "this is locked on purpose", not "this is
+                broken". To actually change a mobile number, the user has
+                to contact support (separate manual flow). */}
             <Text style={styles.inputLabel}>Mobile</Text>
-            <TextInput
-              style={[styles.input, { backgroundColor: '#F5F5F5', color: '#9E9E9E' }]}
-              value={formData.mobile}
-              editable={false}
-            />
+            <View style={{ position: 'relative' }}>
+              <TextInput
+                style={[styles.input, { backgroundColor: '#F5F5F5', color: '#1A1A1A', paddingRight: 90 }]}
+                value={formData.mobile ? `+91 ${formData.mobile}` : ''}
+                editable={false}
+              />
+              <View style={{
+                position: 'absolute', right: 8, top: 8,
+                backgroundColor: '#D1FAE5', paddingHorizontal: 8, paddingVertical: 4,
+                borderRadius: 10,
+              }}>
+                <Text style={{ color: '#065F46', fontSize: 11, fontWeight: '700' }}>✓ Verified</Text>
+              </View>
+            </View>
+            <Text style={{ fontSize: 11, color: '#6C757D', marginTop: 4, marginBottom: 8 }}>
+              Mobile is your login — to change it, contact support.
+            </Text>
 
             <Text style={styles.inputLabel}>Address</Text>
             <TextInput
@@ -633,10 +832,52 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
             <View style={styles.referralCodeBox}>
               <Text style={styles.referralCodeLabel}>YOUR REFERRAL CODE</Text>
-              <Text style={styles.referralCode}>{referralCode}</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+                <Text style={styles.referralCode}>{referralCode}</Text>
+                <TouchableOpacity
+                  style={{
+                    backgroundColor: '#F9A825',
+                    paddingHorizontal: 14,
+                    paddingVertical: 8,
+                    borderRadius: 8,
+                  }}
+                  onPress={async () => {
+                    try {
+                      await Clipboard.setStringAsync(String(referralCode));
+                      haptics.success();
+                      Alert.alert('Copied', `Referral code "${referralCode}" copied to clipboard.`);
+                    } catch (_) {
+                      Alert.alert('Copy failed', 'Could not copy code. Please try again.');
+                    }
+                  }}
+                >
+                  <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12, letterSpacing: 0.5 }}>
+                    📋 COPY
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </View>
 
-            <HapticButton title="📤 Share with Friends" onPress={shareReferral} hapticType="press" style={[styles.modalBtn, { backgroundColor: '#1976D2' }]} textStyle={{ color: '#fff', fontWeight: '700' }} />
+            {/* Share row — explicit "Share Code" button alongside the
+                main blue CTA so the share affordance is unmistakable
+                even on a quick glance. */}
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+              <TouchableOpacity
+                style={{
+                  flex: 1,
+                  backgroundColor: '#1976D2',
+                  paddingVertical: 14,
+                  borderRadius: 10,
+                  alignItems: 'center',
+                }}
+                onPress={shareReferral}
+                activeOpacity={0.85}
+              >
+                <Text style={{ color: '#fff', fontWeight: '800', fontSize: 14 }}>
+                  📤 Share with Friends
+                </Text>
+              </TouchableOpacity>
+            </View>
 
             <TouchableOpacity onPress={() => setShowReferral(false)} style={{ marginTop: 12, alignSelf: 'center' }}>
               <Text style={{ color: '#6C757D', fontWeight: '700' }}>Close</Text>
@@ -652,18 +893,24 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
             <Text style={styles.modalTitle}>💳 Payment Methods</Text>
             <Text style={styles.modalSubtitle}>Add a payment method for faster checkout</Text>
 
+            {/* MaterialIcons — much cleaner than emoji. UPI gets a
+                phone+arrow ("send-to-mobile"), wallet gets the proper
+                account-balance-wallet icon, netbanking → account-
+                balance (bank columns). All tinted to match the brand. */}
             {[
-              { icon: '🏦', label: 'UPI', subtitle: 'Pay via Google Pay, PhonePe, Paytm' },
-              { icon: '💳', label: 'Credit / Debit Card', subtitle: 'Visa, Mastercard, RuPay' },
-              { icon: '👛', label: 'Wallets', subtitle: 'Paytm, Amazon Pay, Mobikwik' },
-              { icon: '🏧', label: 'Net Banking', subtitle: 'All major Indian banks' },
+              { iconName: 'send-to-mobile', label: 'UPI', subtitle: 'Pay via Google Pay, PhonePe, Paytm', tint: '#0D3B66' },
+              { iconName: 'credit-card', label: 'Credit / Debit Card', subtitle: 'Visa, Mastercard, RuPay', tint: '#1976D2' },
+              { iconName: 'account-balance-wallet', label: 'Wallets', subtitle: 'Paytm, Amazon Pay, Mobikwik', tint: '#F9A825' },
+              { iconName: 'account-balance', label: 'Net Banking', subtitle: 'All major Indian banks', tint: '#0D3B66' },
             ].map((m) => (
               <TouchableOpacity
                 key={m.label}
                 style={styles.paymentRow}
                 onPress={() => Alert.alert(m.label, 'Add this payment method during your next checkout.')}
               >
-                <Text style={styles.paymentIcon}>{m.icon}</Text>
+                <View style={styles.paymentIconWrap}>
+                  <Icon name={m.iconName} size={22} color={m.tint} />
+                </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.paymentLabel}>{m.label}</Text>
                   <Text style={styles.paymentSub}>{m.subtitle}</Text>
@@ -865,6 +1112,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
         </View>
       </Modal>
     </View>
+    </KeyboardAvoidingView>
   );
 };
 
@@ -945,13 +1193,40 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.2)',
     justifyContent: 'center', alignItems: 'center',
     marginBottom: 12,
+    position: 'relative',
   },
   avatar: {
     width: 80, height: 80, borderRadius: 40,
     backgroundColor: '#FFC107',
     justifyContent: 'center', alignItems: 'center',
+    overflow: 'hidden',
+  },
+  avatarImg: {
+    width: '100%', height: '100%',
   },
   avatarText: { fontSize: 36, fontWeight: '900', color: '#1A1A1A' },
+  // Camera-overlay button — sits at the lower-right of the avatar so
+  // it reads as "tap here to change photo" the moment you see it.
+  // Matches the mockup's circular blue badge with a white camera icon.
+  avatarCameraBtn: {
+    position: 'absolute',
+    right: 0,
+    bottom: 4,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: '#0D3B66',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.25,
+    shadowRadius: 2,
+  },
+  avatarCameraIcon: { fontSize: 14, color: '#FFFFFF' },
   userName: { color: '#fff', fontSize: 20, fontWeight: '800', marginBottom: 2 },
   userMobile: { color: 'rgba(255,255,255,0.85)', fontSize: 13, marginBottom: 14 },
   editProfileBtn: {
@@ -1097,6 +1372,17 @@ const styles = StyleSheet.create({
     backgroundColor: '#F8F9FA', padding: 12, borderRadius: 12, marginBottom: 8,
   },
   paymentIcon: { fontSize: 22, marginRight: 12 },
+  // Square tile that hosts the MaterialIcon — gives the icon a clear
+  // boundary and consistent size against varying icon glyph widths.
+  paymentIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: '#F1F5F9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
   paymentLabel: { fontSize: 14, fontWeight: '700', color: '#1A1A1A' },
   paymentSub: { fontSize: 11, color: '#6C757D', marginTop: 1 },
   paymentArrow: { fontSize: 22, color: '#0D3B66', fontWeight: '800' },

@@ -10,12 +10,17 @@ import {
   Image,
   Easing,
   StatusBar,
+  Switch,
+  AppState,
+  type AppStateStatus,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import * as Location from 'expo-location';
 import {
   getDashboard,
   updateOnlineStatus,
+  pingAgentLocation,
   type AgentTask,
   type AgentTaskStatus,
 } from '../../services/agent/api';
@@ -68,6 +73,15 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
   const logoSpin = useRef(new Animated.Value(0)).current;
   const glowAnim = useRef(new Animated.Value(0.3)).current;
 
+  // Online toggle = LOCAL ONLY. Source of truth is AsyncStorage +
+  // React state. The dashboard polls getDashboard() every 15s, but we
+  // explicitly do NOT read online_status from those polls — the prior
+  // grace-window approach still let the server flip the toggle back
+  // after the window expired. Now: only the user's manual tap
+  // changes the toggle. The poll value is ignored entirely. This
+  // means once the rep flips ON, they stay ON until they tap OFF.
+  const ONLINE_STATUS_KEY = 'agent_online_status';
+
   useEffect(() => {
     (async () => {
       const cached = await readCache<DashboardCache>('dashboard');
@@ -79,14 +93,86 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
         setNewRequests(d.newRequests || 0);
         setRating(d.rating || 0);
       }
+      // Don't auto-restore the rep's previous online state on app
+      // launch — explicit "Go Online" click is required EVERY app
+      // open. Per spec: "Access should only be granted when the
+      // representative has explicitly clicked the Go Online button".
+      // Default to offline; if any stale flag is in storage, clear it.
+      try {
+        await AsyncStorage.setItem(ONLINE_STATUS_KEY, 'false');
+      } catch {}
+      setIsOnline(false);
       loadDashboardData();
     })();
   }, []);
 
+  // Auto-offline the rep whenever the app backgrounds (home button,
+  // app switcher, screen lock, etc.). Without this the admin's
+  // representative-management page kept seeing reps as ONLINE for
+  // hours after they'd put their phone down. Backend update is
+  // fire-and-forget — local state still flips to false immediately
+  // so the rep sees their toggle off the moment they return.
+  useEffect(() => {
+    const handleAppStateChange = (next: AppStateStatus): void => {
+      if (next === 'background' || next === 'inactive') {
+        // Only push if we were online — saves a network call when
+        // already offline. Errors swallowed: the next foreground
+        // login flow will sync state anyway.
+        setIsOnline((curr) => {
+          if (curr) {
+            updateOnlineStatus(false).catch(() => {});
+            AsyncStorage.setItem(ONLINE_STATUS_KEY, 'false').catch(() => {});
+          }
+          return false;
+        });
+      }
+    };
+    const sub = AppState.addEventListener('change', handleAppStateChange);
+    return () => sub.remove();
+  }, []);
+
+  // Online heartbeat — while the rep is Online + app is foreground,
+  // re-ping isOnline=true every 30s. Two reasons:
+  //   1. If the AppState 'background' handler above fails to send the
+  //      offline update (e.g. app killed before the network call lands),
+  //      the backend can detect a stale heartbeat (>90s old) and treat
+  //      the rep as offline anyway.
+  //   2. Survives transient network drops — the next heartbeat re-syncs
+  //      the rep's online state without manual toggle.
+  useEffect(() => {
+    if (!isOnline) return undefined;
+    // Fire one immediately so the timestamp is fresh after toggle-on.
+    updateOnlineStatus(true).catch(() => {});
+    const id = setInterval(() => {
+      updateOnlineStatus(true).catch(() => {});
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [isOnline]);
+
   useEffect(() => {
     let pollId: ReturnType<typeof setInterval> | null = null;
-    const start = (): void => {
-      loadDashboardData();
+    const start = async (): Promise<void> => {
+      // If TaskExecution flagged a force-refresh (rep just marked
+      // work_completed), wait a beat for the backend to commit the
+      // status transition, then fetch. Without the small delay, the
+      // immediate fetch could land on the same DB read replica
+      // before the write has propagated, returning the stale
+      // todayEarnings=0.
+      let force = false;
+      try {
+        const flag = await AsyncStorage.getItem('dashboard_force_refresh');
+        if (flag) {
+          force = true;
+          await AsyncStorage.removeItem('dashboard_force_refresh');
+        }
+      } catch {}
+      if (force) {
+        // 600ms window — generous enough for Sequelize to commit
+        // and for the next /earnings query to pick up the new row.
+        setTimeout(() => loadDashboardData(), 600);
+      } else {
+        loadDashboardData();
+      }
       pollId = setInterval(loadDashboardData, 15000);
     };
     const stop = (): void => {
@@ -160,12 +246,23 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
       const agentData = await AsyncStorage.getItem('agent_data');
       if (agentData) setAgent(JSON.parse(agentData) as AgentProfile);
       const data = await getDashboard();
+      // Diagnostic — visible via `adb logcat *:S ReactNativeJS:V` on
+      // the device. Helps verify the backend is returning a non-zero
+      // todayEarnings after a rep completes work.
+      console.log('[dashboard] todayEarnings from server:', data.todayEarnings,
+        '| totalJobs:', data.totalJobs, '| tasks status counts:',
+        (data.tasks || []).reduce<Record<string, number>>((acc, t) => {
+          acc[t.status] = (acc[t.status] || 0) + 1;
+          return acc;
+        }, {}));
       setTasks(data.tasks || []);
       setTodayEarnings(data.todayEarnings || 0);
       setTotalJobs(data.totalJobs || 0);
       setNewRequests(data.newRequests || 0);
       setRating(data.rating || 0);
-      setIsOnline(data.isOnline || false);
+      // Deliberately NOT setting isOnline from polled data. The toggle
+      // is purely local + AsyncStorage-backed; only manual taps change
+      // it. data.isOnline is ignored here on purpose.
       writeCache<DashboardCache>('dashboard', {
         tasks: data.tasks || [],
         todayEarnings: data.todayEarnings || 0,
@@ -188,9 +285,72 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
 
   const handleToggleOnlineStatus = async (): Promise<void> => {
     const newStatus = !isOnline;
+    // 1. Update local state immediately — UI flips right away.
     setIsOnline(newStatus);
-    updateOnlineStatus(newStatus).catch(() => setIsOnline(!newStatus));
+    // 2. Persist locally so a restart / poll cycle can't revert it.
+    //    AsyncStorage write is fire-and-forget; even if it fails the
+    //    React state still wins for this session.
+    AsyncStorage.setItem(ONLINE_STATUS_KEY, String(newStatus)).catch(() => {});
+    // 3. Notify backend so admin / dispatch see the change. Failure
+    //    here is non-fatal — the rep's local toggle is the source of
+    //    truth and survives any backend flake.
+    updateOnlineStatus(newStatus).catch((e: any) => {
+      console.log('[online-status] backend update failed (non-fatal):', e?.message);
+    });
   };
+
+  // ─── Real-time location ping (Agent Monitoring) ────────────────────────
+  // While the rep is Online we ping their GPS to the backend every 60s
+  // so the Operations Manager's dashboard sees a fresh location heatbeat.
+  // First fix can take 5-10s; we don't block the toggle on that. When
+  // the rep flips to Offline (or unmounts the screen), the timer is
+  // torn down so we never ping an offline rep.
+  useEffect(() => {
+    if (!isOnline) return undefined;
+    let cancelled = false;
+
+    const sendOnePing = async (): Promise<void> => {
+      try {
+        // Reuse a recent fix if the OS has one — saves battery vs a fresh
+        // satellite lock every minute.
+        let pos = await Location.getLastKnownPositionAsync({
+          maxAge: 30_000,
+          requiredAccuracy: 200,
+        });
+        if (!pos) {
+          // Fall back to a fresh fix with balanced accuracy. Times out at
+          // 8s so we don't spin forever on poor signal.
+          pos = await Promise.race([
+            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+          ]);
+        }
+        if (cancelled || !pos?.coords) return;
+        await pingAgentLocation(pos.coords.latitude, pos.coords.longitude);
+      } catch (e: any) {
+        console.log('[location-ping] error:', e?.message);
+      }
+    };
+
+    // Confirm permission once when the rep goes online; if denied we
+    // silently skip pings rather than nagging.
+    (async () => {
+      try {
+        const { status } = await Location.getForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          const req = await Location.requestForegroundPermissionsAsync();
+          if (req.status !== 'granted') return;
+        }
+        await sendOnePing();
+      } catch (_) { /* permission flow failure → silent */ }
+    })();
+
+    const id = setInterval(sendOnePing, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isOnline]);
 
   const newRequestTasks = tasks.filter((t) => t.status === 'new');
   // Recent Activity surfaces what the rep is actively working on first
@@ -293,35 +453,39 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                     </Text>
                   </View>
 
-                  <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-                    <TouchableOpacity
-                      style={styles.onlineBadge}
-                      onPress={handleToggleOnlineStatus}
-                      activeOpacity={0.85}
+                  {/* Online/Offline switch — push right turns the rep ON
+                      (admin can dispatch tasks), push left turns OFF.
+                      State syncs to backend immediately via
+                      updateOnlineStatus(); on failure we revert the
+                      optimistic UI change. The sliding pulse animation
+                      stays only while the toggle is ON for visual
+                      reinforcement. */}
+                  <View style={styles.onlineToggleWrap}>
+                    <Animated.View
+                      style={[
+                        styles.onlineDot,
+                        {
+                          backgroundColor: isOnline ? '#10B981' : '#DC2626',
+                          transform: isOnline ? [{ scale: pulseAnim }] : undefined,
+                        },
+                      ]}
+                    />
+                    <Text
+                      style={[
+                        styles.onlineLabel,
+                        { color: isOnline ? '#10B981' : '#FFFFFF' },
+                      ]}
                     >
-                      <View
-                        style={[
-                          styles.onlineBadgeInner,
-                          { backgroundColor: isOnline ? '#FCD34D' : '#FFFFFF' },
-                        ]}
-                      >
-                        <View
-                          style={[
-                            styles.onlineDot,
-                            { backgroundColor: isOnline ? '#003153' : '#DC2626' },
-                          ]}
-                        />
-                        <Text
-                          style={[
-                            styles.onlineBadgeText,
-                            { color: isOnline ? '#003153' : '#003153' },
-                          ]}
-                        >
-                          {isOnline ? 'Online' : 'Offline'}
-                        </Text>
-                      </View>
-                    </TouchableOpacity>
-                  </Animated.View>
+                      {isOnline ? 'Online' : 'Offline'}
+                    </Text>
+                    <Switch
+                      value={isOnline}
+                      onValueChange={handleToggleOnlineStatus}
+                      trackColor={{ false: '#475569', true: '#10B981' }}
+                      thumbColor="#FFFFFF"
+                      ios_backgroundColor="#475569"
+                    />
+                  </View>
                 </View>
               </LinearGradient>
             </View>
@@ -333,14 +497,18 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                 onPress={() => navigation.navigate('Earnings')}
               >
                 <Text style={[styles.statLabel, { color: '#92700A' }]}>Today's Earnings</Text>
-                <Animated.Text style={[styles.statValue, { color: '#003153' }]}>
-                  {'₹'}
-                  {Math.floor(
-                    (earningsAnim as unknown as { __getValue?: () => number }).__getValue
-                      ? (earningsAnim as unknown as { __getValue: () => number }).__getValue()
-                      : todayEarnings,
-                  )}
-                </Animated.Text>
+                {/* Display the React state directly. The previous version
+                    routed through `earningsAnim.__getValue()` on Animated.Text,
+                    which froze at whatever value the animation last
+                    targeted (the initial 0 from cache / cold start). React
+                    re-renders triggered by setTodayEarnings(...) didn't
+                    update the indirection because Animated.Text doesn't
+                    animate text children — only style props. Reading the
+                    state directly means every poll's update appears
+                    instantly. */}
+                <Text style={[styles.statValue, { color: '#003153' }]}>
+                  {'₹'}{Math.floor(todayEarnings)}
+                </Text>
                 <View style={styles.statAccentBar}>
                   <LinearGradient
                     colors={['#F4A100', '#FCD34D']}
@@ -545,8 +713,16 @@ const getStatusColor = (status: AgentTaskStatus | string): string => {
       return '#003153';
     case 'in_progress':
       return '#F4A100';
+    case 'documents_collected':
+      return '#0EA5E9';
+    case 'work_completed':
+      // Rep finished the work but customer hasn't OTP'd yet — still
+      // green because the rep has earned the commission.
+      return '#10B981';
     case 'completed':
-      return '#003153';
+      // Emerald green — completed = earned. Was Prussian blue before
+      // which read as "in progress" alongside the new/in-progress badges.
+      return '#10B981';
     case 'cancelled':
       return '#DC2626';
     default:
@@ -562,6 +738,10 @@ const formatStatus = (status: AgentTaskStatus | string): string => {
       return 'Accepted';
     case 'in_progress':
       return 'In Progress';
+    case 'documents_collected':
+      return 'Docs Collected';
+    case 'work_completed':
+      return 'Completed';
     case 'completed':
       return 'Completed';
     default:
@@ -660,32 +840,30 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     letterSpacing: 0.2,
   },
-  onlineBadge: {
-    borderRadius: 18,
-    overflow: 'hidden',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.15,
-    shadowRadius: 6,
-    elevation: 4,
-  },
-  onlineBadgeInner: {
+  // Online/Offline toggle — sits in the hero on the rep's home screen.
+  // Status dot + label sit to the LEFT of the slider so push-right reads
+  // as "switch ON" and push-left as "switch OFF" exactly like the user
+  // asked. Stays compact so it fits next to the welcome text.
+  onlineToggleWrap: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderRadius: 18,
     gap: 6,
+    backgroundColor: 'rgba(0,0,0,0.20)',
+    paddingLeft: 10,
+    paddingRight: 4,
+    paddingVertical: 4,
+    borderRadius: 22,
   },
   onlineDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 3.5,
+    width: 8,
+    height: 8,
+    borderRadius: 4,
   },
-  onlineBadgeText: {
+  onlineLabel: {
     fontWeight: '800',
     fontSize: 11,
-    letterSpacing: 0.4,
+    letterSpacing: 0.3,
+    marginRight: 2,
   },
 
   statsRow: {

@@ -16,6 +16,21 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getBookingDetails } from '../services/api';
 import { formatBookingId } from '../utils/bookingId';
 import DocPreviewModal, { fixDocUrl } from '../components/DocPreviewModal';
+// react-native-maps is already in package.json. Defensive require so a
+// dev-client missing the native module falls back to the placeholder
+// instead of crashing.
+let MapView: any = null;
+let Marker: any = null;
+let mapAvailable = false;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+  const m = require('react-native-maps');
+  MapView = m.default || m;
+  Marker = m.Marker;
+  mapAvailable = !!MapView && !!Marker;
+} catch (_) {
+  mapAvailable = false;
+}
 
 interface Navigation {
   navigate: (route: string, params?: Record<string, unknown>) => void;
@@ -45,6 +60,17 @@ const TrackingScreen: React.FC<Props> = ({ navigation, route }) => {
 
   useEffect(() => {
     loadBookingDetails();
+  }, [bookingId]);
+
+  // Poll booking details every 30s so the rep's `current_lat/lng`
+  // (refreshed by the rep app's location ping every 60s) propagates to
+  // the customer's map without a manual pull-to-refresh. Stops when
+  // the screen unmounts so we don't leak intervals.
+  useEffect(() => {
+    const t = setInterval(() => {
+      loadBookingDetails();
+    }, 30_000);
+    return () => clearInterval(t);
   }, [bookingId]);
 
   const loadBookingDetails = async (): Promise<void> => {
@@ -305,18 +331,107 @@ const TrackingScreen: React.FC<Props> = ({ navigation, route }) => {
           </View>
         </View>
 
-        {/* Live Location Map Placeholder */}
+        {/* Live Location — real react-native-maps MapView showing the
+            rep's last-known position (refreshed every 30s) + the
+            customer's destination. Falls back to the old placeholder
+            text only when the native map module isn't bundled, or
+            when no coords are available yet. */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Live Location</Text>
-          <View style={styles.mapPlaceholder}>
-            <Text style={styles.mapText}>📍 Map View</Text>
-            <Text style={styles.mapSubtext}>
-              {booking?.latitude && booking?.longitude
-                ? `Lat: ${booking.latitude}, Lng: ${booking.longitude}`
-                : 'Location tracking will be available once representative is assigned'
-              }
-            </Text>
-          </View>
+          {(() => {
+            const agentLat =
+              Number(booking?.agent?.current_lat ?? booking?.assigned_agent?.current_lat ?? NaN);
+            const agentLng =
+              Number(booking?.agent?.current_lng ?? booking?.assigned_agent?.current_lng ?? NaN);
+            const hasAgentCoords =
+              Number.isFinite(agentLat) && Number.isFinite(agentLng) &&
+              (agentLat !== 0 || agentLng !== 0);
+
+            const destLat = Number(booking?.latitude ?? booking?.customer?.current_lat ?? NaN);
+            const destLng = Number(booking?.longitude ?? booking?.customer?.current_lng ?? NaN);
+            const hasDestCoords =
+              Number.isFinite(destLat) && Number.isFinite(destLng) &&
+              (destLat !== 0 || destLng !== 0);
+
+            // Map needs at least one coord to render. If neither side
+            // has shared a position yet, fall back to the helpful
+            // hint card so the user knows what's coming.
+            if (!mapAvailable || (!hasAgentCoords && !hasDestCoords)) {
+              return (
+                <View style={styles.mapPlaceholder}>
+                  <Text style={styles.mapText}>📍 Live Map</Text>
+                  <Text style={styles.mapSubtext}>
+                    {!mapAvailable
+                      ? 'Map module not bundled yet — update the app to see live tracking.'
+                      : booking?.agent
+                        ? 'Waiting for the representative to share their location… (refreshes every 30s)'
+                        : 'Location tracking will be available once a representative is assigned.'}
+                  </Text>
+                </View>
+              );
+            }
+
+            // Centre the map on whichever coord is available; if both,
+            // bias slightly toward the midpoint so both markers fit
+            // inside a reasonable zoom level.
+            const centreLat = hasAgentCoords && hasDestCoords
+              ? (agentLat + destLat) / 2
+              : hasAgentCoords ? agentLat : destLat;
+            const centreLng = hasAgentCoords && hasDestCoords
+              ? (agentLng + destLng) / 2
+              : hasAgentCoords ? agentLng : destLng;
+            const latDelta = hasAgentCoords && hasDestCoords
+              ? Math.max(0.02, Math.abs(agentLat - destLat) * 1.6)
+              : 0.02;
+            const lngDelta = hasAgentCoords && hasDestCoords
+              ? Math.max(0.02, Math.abs(agentLng - destLng) * 1.6)
+              : 0.02;
+
+            return (
+              <View style={styles.mapWrap}>
+                <MapView
+                  style={styles.mapView}
+                  region={{
+                    latitude: centreLat,
+                    longitude: centreLng,
+                    latitudeDelta: latDelta,
+                    longitudeDelta: lngDelta,
+                  }}
+                  showsUserLocation={false}
+                  showsMyLocationButton={false}
+                >
+                  {hasAgentCoords && (
+                    <Marker
+                      coordinate={{ latitude: agentLat, longitude: agentLng }}
+                      title={booking?.agent?.name || 'Representative'}
+                      description="Live position"
+                      pinColor="#0D3B66"
+                    />
+                  )}
+                  {hasDestCoords && (
+                    <Marker
+                      coordinate={{ latitude: destLat, longitude: destLng }}
+                      title="Service address"
+                      description={booking?.address || ''}
+                      pinColor="#E63946"
+                    />
+                  )}
+                </MapView>
+                <View style={styles.mapLegend}>
+                  <View style={styles.mapLegendItem}>
+                    <View style={[styles.mapLegendDot, { backgroundColor: '#0D3B66' }]} />
+                    <Text style={styles.mapLegendText}>
+                      {hasAgentCoords ? 'Rep' : 'Rep (waiting)'}
+                    </Text>
+                  </View>
+                  <View style={styles.mapLegendItem}>
+                    <View style={[styles.mapLegendDot, { backgroundColor: '#E63946' }]} />
+                    <Text style={styles.mapLegendText}>Service address</Text>
+                  </View>
+                </View>
+              </View>
+            );
+          })()}
         </View>
 
         {/* Timeline — spec stages: Dispatched → Arrived → Work In-Progress → Completed */}
@@ -564,6 +679,43 @@ const styles = StyleSheet.create({
     fontSize: SIZES.SMALL,
     color: COLORS.GRAY,
     textAlign: 'center',
+  },
+  // Real MapView container — fixed height so it doesn't collapse
+  // inside the ScrollView. Legend pinned to bottom-left.
+  mapWrap: {
+    backgroundColor: COLORS.WHITE,
+    borderRadius: BORDER_RADIUS.MEDIUM,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: COLORS.LIGHT_GRAY,
+  },
+  mapView: {
+    width: '100%',
+    height: 240,
+  },
+  mapLegend: {
+    flexDirection: 'row',
+    gap: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#F0F2F5',
+    backgroundColor: '#FFFFFF',
+  },
+  mapLegendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  mapLegendDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  mapLegendText: {
+    fontSize: 11,
+    color: '#475569',
+    fontWeight: '600',
   },
   timeline: {
     paddingLeft: SIZES.BASE,

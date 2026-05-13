@@ -13,15 +13,25 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  Share,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
-// expo-file-system v18 split the API — `cacheDirectory` + the resumable
-// downloader live under the legacy export. Cast to any so our usage works
-// across the version range without fighting the new typed API.
-import * as FileSystem from 'expo-file-system';
-const FS: any = FileSystem;
+import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
+// expo-file-system v18 (Expo SDK 54+) deprecated `createDownloadResumable`
+// + `cacheDirectory` on the main entry — they now live under the
+// `expo-file-system/legacy` sub-path. Trying that first means the resumable
+// downloader keeps working without rewriting against the new File/Directory
+// classes; we fall back to the main entry for older SDK builds.
+let FS: any;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+  FS = require('expo-file-system/legacy');
+} catch (_) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+  FS = require('expo-file-system');
+}
 import DocPreviewModal from '../components/DocPreviewModal';
 import { Image as RNImage } from 'react-native';
 import * as Sharing from 'expo-sharing';
@@ -29,6 +39,8 @@ import { COLORS, BORDER_RADIUS, SHADOWS } from '../constants/colors';
 import {
   getComplianceDocs,
   uploadComplianceDoc,
+  updateComplianceDoc,
+  deleteComplianceDoc,
   renewComplianceDoc,
   type ComplianceDoc,
   type ComplianceType,
@@ -146,6 +158,34 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
   const [pickedFile, setPickedFile] = useState<PickedFile | null>(null);
   const [note, setNote] = useState<string>('');
 
+  // Register-specific upload fields. Free-text alongside the type chip
+  // so users can register any renewable document, not just the predefined
+  // enum types (e.g. "Bike Insurance", "Flat Rent Agreement").
+  const [documentName, setDocumentName] = useState<string>('');
+  const [issuingAuthority, setIssuingAuthority] = useState<string>('');
+  const [documentNumber, setDocumentNumber] = useState<string>('');
+  const [issueDate, setIssueDate] = useState<Date | null>(null);
+  const [showIssueDatePicker, setShowIssueDatePicker] = useState<boolean>(false);
+
+  // Inline-edit state for the register table. When set, opens the edit
+  // modal pre-filled with the row's current values.
+  const [editingDoc, setEditingDoc] = useState<ComplianceDoc | null>(null);
+  const [editName, setEditName] = useState<string>('');
+  // Lightweight rename-only modal — separate from the full edit sheet so
+  // the common "I just want to rename this doc" path doesn't make the
+  // user scroll through expiry/issuer/number fields.
+  const [renamingDoc, setRenamingDoc] = useState<ComplianceDoc | null>(null);
+  const [renameValue, setRenameValue] = useState<string>('');
+  const [savingRename, setSavingRename] = useState<boolean>(false);
+  const [editAuthority, setEditAuthority] = useState<string>('');
+  const [editNumber, setEditNumber] = useState<string>('');
+  const [editIssueDate, setEditIssueDate] = useState<Date | null>(null);
+  const [editExpiryDate, setEditExpiryDate] = useState<Date | null>(null);
+  const [editShowIssue, setEditShowIssue] = useState<boolean>(false);
+  const [editShowExpiry, setEditShowExpiry] = useState<boolean>(false);
+  const [savingEdit, setSavingEdit] = useState<boolean>(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
   // Toast state
   const [toast, setToast] = useState<{
     visible: boolean;
@@ -228,11 +268,23 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
   }, [docs]);
 
   const onMonthTap = (key: string): void => {
-    // Find the first doc whose section contains this month and scroll to it.
-    const target = docs.find((d) => monthKey(d.expiry_date) === key);
-    if (!target) return;
+    // Find every doc expiring in this month. Used to: (a) tell the user
+    // exactly what's expiring (toast) so the colored box isn't a mystery,
+    // and (b) scroll to the matching section so they can act on it.
+    const expiring = docs.filter((d) => monthKey(d.expiry_date) === key);
+    if (expiring.length === 0) return;
     haptics.tap();
-    const sectionKey = target.status; // 'red' | 'yellow' | 'green'
+    const labels = expiring
+      .map((d) => d.document_name || d.label || 'Compliance doc')
+      .slice(0, 3)
+      .join(', ');
+    const more = expiring.length > 3 ? ` +${expiring.length - 3} more` : '';
+    showToast(
+      `${expiring.length} doc${expiring.length === 1 ? '' : 's'} expiring`,
+      `${labels}${more}`,
+      'info',
+    );
+    const sectionKey = expiring[0].status; // 'red' | 'yellow' | 'green'
     const y = sectionPositions.current[sectionKey];
     if (typeof y === 'number' && scrollRef.current) {
       scrollRef.current.scrollTo({ y: Math.max(0, y - 12), animated: true });
@@ -268,25 +320,20 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
 
   const pickFromCamera = async (): Promise<void> => {
     try {
-      const perm = await ImagePicker.requestCameraPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert(
-          'Permission required',
-          'Camera access is needed to take a photo of your document.',
-        );
-        return;
-      }
-      const result: any = await ImagePicker.launchCameraAsync({
-        mediaTypes: 'images' as any,
-        allowsEditing: true,
-        quality: 0.85,
+      // Styled crop UI — branded toolbar + clearly-coloured tick to
+      // confirm the crop, instead of Android's faint "CROP" text.
+      // Wrapped in a tiny setTimeout (same as the prior expo version)
+      // because launching from inside a Modal racing with the activity
+      // result registry — gives the native side a frame to wire up.
+      const file = await new Promise<any>((resolve, reject) => {
+        setTimeout(async () => {
+          try {
+            resolve(await captureWithCrop({ namePrefix: 'compliance' }));
+          } catch (err) { reject(err); }
+        }, 100);
       });
-      if (result?.canceled || !result?.assets?.[0]) return;
-      setPickedFile({
-        uri: result.assets[0].uri,
-        name: `compliance_${Date.now()}.jpg`,
-        type: 'image/jpeg',
-      });
+      if (!file) return;
+      setPickedFile(file);
     } catch (e: any) {
       console.log('camera pick error:', e?.message || e);
       showToast('Camera error', e?.message || 'Could not open camera', 'error');
@@ -295,22 +342,15 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
 
   const pickFromGallery = async (): Promise<void> => {
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert('Permission required', 'Gallery access is needed to pick an image.');
-        return;
-      }
-      const result: any = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: 'images' as any,
-        allowsEditing: true,
-        quality: 0.85,
+      const file = await new Promise<any>((resolve, reject) => {
+        setTimeout(async () => {
+          try {
+            resolve(await pickWithCrop({ namePrefix: 'compliance' }));
+          } catch (err) { reject(err); }
+        }, 100);
       });
-      if (result?.canceled || !result?.assets?.[0]) return;
-      setPickedFile({
-        uri: result.assets[0].uri,
-        name: `compliance_${Date.now()}.jpg`,
-        type: 'image/jpeg',
-      });
+      if (!file) return;
+      setPickedFile(file);
     } catch (e: any) {
       console.log('gallery pick error:', e?.message || e);
       showToast('Gallery error', e?.message || 'Could not open gallery', 'error');
@@ -324,11 +364,22 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
     setPickedType('factory_license');
     setPickedFile(null);
     setNote('');
+    setDocumentName('');
+    setIssuingAuthority('');
+    setDocumentNumber('');
+    setIssueDate(null);
   };
 
   const submitUpload = async (): Promise<void> => {
     if (!pickedFile) {
       showToast('Pick a file', 'Choose a document to upload first.', 'error');
+      return;
+    }
+    // Either the type chip OR a free-text Document Name must identify
+    // what this is. The mockup explicitly supports docs that aren't in
+    // the enum (e.g. "Bike Insurance", "Flat Rent Agreement").
+    if (!pickedType && !documentName.trim()) {
+      showToast('Document name needed', 'Pick a type or enter a name.', 'error');
       return;
     }
     try {
@@ -337,6 +388,10 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
       const expiry_date = expiryDate.toISOString().slice(0, 10); // YYYY-MM-DD
       await uploadComplianceDoc(pickedFile, {
         compliance_type: pickedType,
+        document_name: documentName.trim() || undefined,
+        issuing_authority: issuingAuthority.trim() || undefined,
+        document_number: documentNumber.trim() || undefined,
+        issue_date: issueDate ? issueDate.toISOString().slice(0, 10) : undefined,
         expiry_date,
         note: note.trim() || undefined,
       });
@@ -351,6 +406,97 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
     } finally {
       setUploading(false);
     }
+  };
+
+  // Open the inline-edit modal for an existing register row. Values
+  // pre-fill from the row's current state; saving sends only diff via PATCH.
+  const openEdit = (doc: ComplianceDoc): void => {
+    haptics.tap();
+    setEditingDoc(doc);
+    setEditName(doc.document_name || doc.label || '');
+    setEditAuthority(doc.issuing_authority || '');
+    setEditNumber(doc.document_number || '');
+    setEditIssueDate(doc.issue_date ? new Date(doc.issue_date) : null);
+    setEditExpiryDate(doc.expiry_date ? new Date(doc.expiry_date) : null);
+  };
+
+  const saveEdit = async (): Promise<void> => {
+    if (!editingDoc) return;
+    if (!editExpiryDate) {
+      showToast('Expiry required', 'Pick a Valid Upto date.', 'error');
+      return;
+    }
+    try {
+      setSavingEdit(true);
+      await updateComplianceDoc(editingDoc.id, {
+        document_name: editName.trim() || null,
+        issuing_authority: editAuthority.trim() || null,
+        document_number: editNumber.trim() || null,
+        issue_date: editIssueDate ? editIssueDate.toISOString().slice(0, 10) : null,
+        expiry_date: editExpiryDate.toISOString().slice(0, 10),
+      });
+      setEditingDoc(null);
+      showToast('Updated', 'Register row saved.', 'success');
+      load();
+    } catch (e: any) {
+      showToast('Could not save', e?.message || 'Please try again.', 'error');
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const openRename = (doc: ComplianceDoc): void => {
+    haptics.tap();
+    setRenamingDoc(doc);
+    setRenameValue(doc.document_name || doc.label || '');
+  };
+
+  const submitRename = async (): Promise<void> => {
+    if (!renamingDoc) return;
+    const trimmed = renameValue.trim();
+    if (!trimmed) {
+      showToast('Name required', 'Please type a document name.', 'error');
+      return;
+    }
+    try {
+      setSavingRename(true);
+      await updateComplianceDoc(renamingDoc.id, { document_name: trimmed });
+      setRenamingDoc(null);
+      setRenameValue('');
+      showToast('Renamed', 'Document name updated.', 'success');
+      load();
+    } catch (e: any) {
+      showToast('Could not rename', e?.message || 'Please try again.', 'error');
+    } finally {
+      setSavingRename(false);
+    }
+  };
+
+  const confirmDelete = (doc: ComplianceDoc): void => {
+    Alert.alert(
+      'Remove from register?',
+      `This will remove "${doc.document_name || doc.label}" from your register. The file is preserved on your device's downloads.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setDeletingId(doc.id);
+              await deleteComplianceDoc(doc.id);
+              setEditingDoc(null);
+              showToast('Removed', 'Row removed from register.', 'success');
+              load();
+            } catch (e: any) {
+              showToast('Could not remove', e?.message || 'Please try again.', 'error');
+            } finally {
+              setDeletingId(null);
+            }
+          },
+        },
+      ],
+    );
   };
 
   const handleRenew = async (doc: ComplianceDoc): Promise<void> => {
@@ -445,11 +591,36 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
       setPreviewingId(null);
     }
   };
+  // Build the human-readable text we share when there's no attached file
+  // (Smart Alert entries with no upload). Used as a fallback so the Share
+  // button always does something visible — previously it silently returned
+  // when `downloadUrl` was missing.
+  const buildAlertShareMessage = (doc: ComplianceDoc): string => {
+    const lines: string[] = [];
+    lines.push(`📌 ${doc.label}`);
+    if ((doc as any).document_number) lines.push(`Doc No: ${(doc as any).document_number}`);
+    if ((doc as any).issuing_authority) lines.push(`Issued by: ${(doc as any).issuing_authority}`);
+    if (doc.expiry_date) lines.push(`Valid upto: ${formatExpiry(doc.expiry_date).replace(/^expires\s*/, '')}`);
+    lines.push('');
+    lines.push('Tracked on FliponeX Smart Alert.');
+    return lines.join('\n');
+  };
+
   const handleDownload = async (doc: ComplianceDoc): Promise<void> => {
-    if (!doc.downloadUrl || downloadingId) return;
+    if (downloadingId) return;
     setDownloadingId(doc.id);
     try {
       haptics.tap();
+      // No file attached → fall back to text-only share of the alert info
+      // (date, doc number, issuing authority). Previously the handler
+      // returned early and the Share button looked broken to the user.
+      if (!doc.downloadUrl) {
+        await Share.share({
+          title: doc.label,
+          message: buildAlertShareMessage(doc),
+        });
+        return;
+      }
       const uri = await ensureLocalCopy(doc);
       const canShare = await Sharing.isAvailableAsync();
       if (canShare) {
@@ -459,12 +630,17 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
           UTI: doc.mime_type?.includes('pdf') ? 'com.adobe.pdf' : 'public.image',
         });
       } else {
-        showToast('Saved', `Saved to ${uri}`, 'success');
+        // expo-sharing not available on this device — fall back to the
+        // RN built-in Share which doesn't need a native module rebuild.
+        await Share.share({
+          title: doc.label,
+          message: buildAlertShareMessage(doc) + (uri ? `\n\nFile: ${uri}` : ''),
+        });
       }
     } catch (e: any) {
-      console.log('compliance download error:', e?.message || e);
+      console.log('compliance share error:', e?.message || e);
       Alert.alert(
-        'Could not download',
+        'Could not share',
         e?.message || 'Please check your connection and try again.',
       );
     } finally {
@@ -550,13 +726,26 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
             style={styles.lockerBtn}
             onPress={() => handleDownload(doc)}
             disabled={downloadingId === doc.id}
-            accessibilityLabel={`Download ${doc.label}`}
+            accessibilityLabel={`Share ${doc.label}`}
           >
             {downloadingId === doc.id ? (
               <ActivityIndicator color={COLORS.PRIMARY_DARK} size="small" />
             ) : (
-              <Text style={styles.lockerBtnText}>📥 Download / Share</Text>
+              // Tap opens the OS share sheet (WhatsApp, Drive, Gmail, etc.)
+              // — the user can save-to-device from there if they want, so
+              // exposing a separate "Download" entry-point was redundant.
+              <Text style={styles.lockerBtnText}>📤 Share</Text>
             )}
+          </TouchableOpacity>
+
+          {/* Quick-rename — for when the doc was uploaded with the wrong
+              name or the user wants to make it easier to find later. */}
+          <TouchableOpacity
+            style={styles.lockerBtn}
+            onPress={() => openRename(doc)}
+            accessibilityLabel={`Rename ${doc.label}`}
+          >
+            <Text style={styles.lockerBtnText}>✏️ Rename</Text>
           </TouchableOpacity>
 
           {showCta && cta && (
@@ -665,38 +854,72 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
         {!loading && !needsCompanyProfile && docs.length > 0 && (
           <View style={styles.calendarWrap}>
             <Text style={styles.calendarTitle}>Next 12 months</Text>
+            <Text style={styles.calendarHint}>
+              Each box = one month. Coloured boxes mean a document expires
+              that month. Tap a box to jump to the matching document below.
+            </Text>
+            <View style={styles.calendarLegend}>
+              <View style={styles.calendarLegendItem}>
+                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.ERROR }]} />
+                <Text style={styles.calendarLegendText}>Critical (≤30 days)</Text>
+              </View>
+              <View style={styles.calendarLegendItem}>
+                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.WARNING }]} />
+                <Text style={styles.calendarLegendText}>Action soon (≤60 days)</Text>
+              </View>
+              <View style={styles.calendarLegendItem}>
+                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.SUCCESS }]} />
+                <Text style={styles.calendarLegendText}>Safe</Text>
+              </View>
+            </View>
             <ScrollView
               horizontal
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={styles.calendarRow}
             >
               {calendar.map((m) => {
-                const dotColor =
+                const fillColor =
                   m.status === 'red'
                     ? COLORS.ERROR
                     : m.status === 'yellow'
                       ? COLORS.WARNING
                       : m.status === 'green'
                         ? COLORS.SUCCESS
-                        : 'transparent';
+                        : null;
+                // When the month has expiring docs, the whole cell is now
+                // a filled colored box (was a small 8px dot before — too
+                // subtle to scan at a glance). Text colors flip to white
+                // on the colored fill for legibility.
+                const isFilled = !!fillColor;
                 return (
                   <TouchableOpacity
                     key={m.key}
                     style={[
                       styles.calendarCell,
-                      m.status ? { borderColor: dotColor } : null,
+                      isFilled && {
+                        backgroundColor: fillColor!,
+                        borderColor: fillColor!,
+                      },
                     ]}
                     disabled={!m.status}
                     onPress={() => onMonthTap(m.key)}
                   >
-                    <Text style={styles.calendarMonth}>{m.label}</Text>
-                    <Text style={styles.calendarYear}>{String(m.year).slice(2)}</Text>
-                    <View
+                    <Text
                       style={[
-                        styles.calendarDot,
-                        { backgroundColor: m.status ? dotColor : 'transparent' },
+                        styles.calendarMonth,
+                        isFilled && styles.calendarMonthFilled,
                       ]}
-                    />
+                    >
+                      {m.label}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.calendarYear,
+                        isFilled && styles.calendarYearFilled,
+                      ]}
+                    >
+                      {String(m.year).slice(2)}
+                    </Text>
                   </TouchableOpacity>
                 );
               })}
@@ -704,26 +927,150 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
           </View>
         )}
 
-        {/* Upload CTA */}
-        {!needsCompanyProfile && (
-          <TouchableOpacity
-            style={styles.uploadCta}
-            onPress={() => {
-              haptics.tap();
-              setUploadOpen(true);
-            }}
-          >
-            <Text style={styles.uploadCtaPlus}>+</Text>
-            <Text style={styles.uploadCtaText}>Upload new compliance document</Text>
-          </TouchableOpacity>
-        )}
-
         {loading ? (
           <ActivityIndicator color={COLORS.PRIMARY} style={{ marginTop: 28 }} />
         ) : docs.length === 0 ? (
-          renderEmpty()
+          <>
+            {renderEmpty()}
+            {/* Even with zero rows, surface the Row Add Button so the
+                empty state is self-explanatory. */}
+            <TouchableOpacity
+              style={styles.rowAddBtn}
+              onPress={() => {
+                haptics.tap();
+                setUploadOpen(true);
+              }}
+            >
+              <Text style={styles.rowAddBtnText}>Row Add Button</Text>
+              <Text style={styles.rowAddPlus}>+</Text>
+            </TouchableOpacity>
+          </>
         ) : (
           <>
+            {/* ─── Personal Compliance Register ──────────────────────
+                Spreadsheet-style table — wide enough that we wrap it in
+                a horizontal ScrollView. Sticky-ish first column shows the
+                row index + tap-to-edit. Status pill auto-colors green /
+                yellow / red from days-till-expiry (>60 / 30-60 / <30). */}
+            <View style={styles.registerWrap}>
+              <Text style={styles.registerTitle}>📋 Compliance Register</Text>
+              <Text style={styles.registerSubtitle}>
+                Tap any row to edit · Status auto-updates from Valid Upto date
+              </Text>
+
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator
+                style={styles.registerScroll}
+              >
+                <View style={styles.registerTable}>
+                  {/* Header row */}
+                  <View style={[styles.regRow, styles.regHeader]}>
+                    <Text style={[styles.cellSno, styles.regHeaderText]}>S. No</Text>
+                    <Text style={[styles.cellName, styles.regHeaderText]}>Document Name</Text>
+                    <Text style={[styles.cellAuthority, styles.regHeaderText]}>
+                      Statutory Department / Concerned Office
+                    </Text>
+                    <Text style={[styles.cellDocNo, styles.regHeaderText]}>Document No</Text>
+                    <Text style={[styles.cellDate, styles.regHeaderText]}>Date of Issue</Text>
+                    <Text style={[styles.cellDate, styles.regHeaderText]}>Valid Upto</Text>
+                    <Text style={[styles.cellStatus, styles.regHeaderText]}>Status</Text>
+                    <Text style={[styles.cellPdf, styles.regHeaderText]}>PDF/JPEG</Text>
+                  </View>
+
+                  {/* Data rows — sorted by urgency (most critical first) */}
+                  {[...grouped.red, ...grouped.yellow, ...grouped.green].map((d, i) => {
+                    const dotColor = statusColor(d.status);
+                    const statusWord =
+                      d.status === 'red'
+                        ? 'High alert'
+                        : d.status === 'yellow'
+                          ? 'Little alert'
+                          : 'Safe';
+                    return (
+                      <TouchableOpacity
+                        key={d.id}
+                        style={styles.regRow}
+                        activeOpacity={0.7}
+                        onPress={() => openEdit(d)}
+                      >
+                        <Text style={styles.cellSno}>{i + 1}</Text>
+                        <Text style={styles.cellName} numberOfLines={2}>
+                          {d.document_name || d.label}
+                        </Text>
+                        <Text style={styles.cellAuthority} numberOfLines={2}>
+                          {d.issuing_authority || '—'}
+                        </Text>
+                        <Text style={styles.cellDocNo} numberOfLines={1}>
+                          {d.document_number || '—'}
+                        </Text>
+                        <Text style={styles.cellDate}>
+                          {d.issue_date
+                            ? new Date(d.issue_date).toLocaleDateString('en-GB').replace(/\//g, '.')
+                            : '—'}
+                        </Text>
+                        <Text style={styles.cellDate}>
+                          {d.expiry_date
+                            ? new Date(d.expiry_date).toLocaleDateString('en-GB').replace(/\//g, '.')
+                            : '—'}
+                        </Text>
+                        <View style={styles.cellStatus}>
+                          <View
+                            style={[styles.regStatusPill, { backgroundColor: dotColor }]}
+                          >
+                            <Text style={styles.regStatusPillText}>{statusWord}</Text>
+                          </View>
+                          <Text style={styles.statusDays}>
+                            {d.daysLeft != null
+                              ? d.daysLeft < 0
+                                ? `Expired ${Math.abs(d.daysLeft)}d ago`
+                                : `${d.daysLeft}d left`
+                              : ''}
+                          </Text>
+                        </View>
+                        <TouchableOpacity
+                          style={styles.cellPdf}
+                          onPress={(e) => {
+                            e.stopPropagation();
+                            handlePreview(d);
+                          }}
+                        >
+                          {previewingId === d.id ? (
+                            <ActivityIndicator size="small" color={COLORS.PRIMARY} />
+                          ) : (
+                            <View style={styles.pdfThumb}>
+                              <Text style={styles.pdfThumbIcon}>
+                                {d.mime_type?.includes('pdf') ? '📄' : '🖼️'}
+                              </Text>
+                              <Text style={styles.pdfThumbText} numberOfLines={1}>
+                                View
+                              </Text>
+                            </View>
+                          )}
+                        </TouchableOpacity>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </ScrollView>
+
+              {/* Row Add Button — matches the mockup's red dashed-border CTA */}
+              <TouchableOpacity
+                style={styles.rowAddBtn}
+                onPress={() => {
+                  haptics.tap();
+                  setUploadOpen(true);
+                }}
+              >
+                <Text style={styles.rowAddBtnText}>Row Add Button</Text>
+                <Text style={styles.rowAddPlus}>+</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Existing grouped card view — kept below the spreadsheet
+                so customers who prefer the visual cards still have them
+                available. Surfaces Renew CTA + Download/Share actions
+                that the table view doesn't include. */}
             {renderSection('red', '🚨 Critical', grouped.red)}
             {renderSection('yellow', '⏳ Action soon', grouped.yellow)}
             {renderSection('green', '✅ Up to date', grouped.green)}
@@ -739,7 +1086,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
         onRequestClose={() => setUploadOpen(false)}
       >
         <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           style={styles.modalRoot}
         >
           <TouchableOpacity
@@ -767,6 +1114,19 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                       onPress={() => {
                         haptics.tap();
                         setPickedType(t.value);
+                        // Auto-fill the document name from the chip label so
+                        // the user doesn't have to retype it. ALWAYS
+                        // overwrite (except for "Other" which has no
+                        // canonical label) — the user can still edit the
+                        // text afterwards if they want a custom title.
+                        // Previous behaviour preserved user typing, which
+                        // meant tapping a chip after typing one letter
+                        // by accident left the field stuck without
+                        // updating, confusing users into thinking the
+                        // chip didn't auto-fill at all.
+                        if (t.value !== 'other') {
+                          setDocumentName(t.label);
+                        }
                       }}
                       style={[styles.chip, active && styles.chipActive]}
                     >
@@ -778,8 +1138,66 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 })}
               </View>
 
+              {/* Document Name (free-text, overrides the chip label in the
+                  register view — mockup wants e.g. "Bike Insurance",
+                  "Flat Rent Agreement" which aren't in the chip set). */}
+              <Text style={styles.fieldLabel}>Document Name</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={documentName}
+                onChangeText={setDocumentName}
+                placeholder="e.g. Car Registration, Bike Insurance, Shop Lease Deed"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+              />
+
+              {/* Statutory Department / Concerned Office */}
+              <Text style={styles.fieldLabel}>Statutory Department / Concerned Office</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={issuingAuthority}
+                onChangeText={setIssuingAuthority}
+                placeholder="e.g. RTO Goa, Pollution Dept (Govt. of Goa), Ashok Kumar"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+              />
+
+              {/* Document Number */}
+              <Text style={styles.fieldLabel}>Document No</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={documentNumber}
+                onChangeText={setDocumentNumber}
+                placeholder="e.g. CTO-10559/2025/150"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+                autoCapitalize="characters"
+              />
+
+              {/* Issue date */}
+              <Text style={styles.fieldLabel}>Date of Issue (optional)</Text>
+              <TouchableOpacity
+                style={styles.dateBtn}
+                onPress={() => setShowIssueDatePicker(true)}
+              >
+                <Text style={styles.dateBtnText}>
+                  {issueDate
+                    ? `${issueDate.getDate()} ${MONTH_LABELS[issueDate.getMonth()]} ${issueDate.getFullYear()}`
+                    : 'Tap to pick issue date'}
+                </Text>
+              </TouchableOpacity>
+              {showIssueDatePicker && (
+                <DateTimePicker
+                  value={issueDate || new Date()}
+                  mode="date"
+                  display="default"
+                  maximumDate={new Date()}
+                  onChange={(_event: any, selected: Date | undefined) => {
+                    setShowIssueDatePicker(false);
+                    if (selected) setIssueDate(selected);
+                  }}
+                />
+              )}
+
               {/* Expiry */}
-              <Text style={styles.fieldLabel}>Expiry date</Text>
+              <Text style={styles.fieldLabel}>Valid Upto (Expiry)</Text>
               <TouchableOpacity
                 style={styles.dateBtn}
                 onPress={() => setShowDatePicker(true)}
@@ -802,13 +1220,33 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 />
               )}
 
-              {/* File picker */}
+              {/* File picker — once a file is selected, show a thumbnail
+                  for images (so the user sees what they're uploading) or
+                  a 📄 file tile with size + extension for PDFs. */}
               <Text style={styles.fieldLabel}>Document file</Text>
               {pickedFile ? (
                 <View style={styles.filePickedRow}>
-                  <Text style={styles.filePickedName} numberOfLines={1}>
-                    {pickedFile.name}
-                  </Text>
+                  {pickedFile.type?.startsWith('image/') ? (
+                    <RNImage
+                      source={{ uri: pickedFile.uri }}
+                      style={styles.filePickedThumb}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View style={styles.filePickedFileTile}>
+                      <Text style={styles.filePickedFileTileIcon}>📄</Text>
+                    </View>
+                  )}
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.filePickedName} numberOfLines={1}>
+                      {pickedFile.name}
+                    </Text>
+                    <Text style={styles.filePickedHint}>
+                      {pickedFile.type?.startsWith('image/')
+                        ? 'Image · Tap Upload to save'
+                        : 'PDF / File · Tap Upload to save'}
+                    </Text>
+                  </View>
                   <TouchableOpacity onPress={() => setPickedFile(null)}>
                     <Text style={styles.fileRemove}>Remove</Text>
                   </TouchableOpacity>
@@ -856,6 +1294,200 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                   <ActivityIndicator color="#fff" />
                 ) : (
                   <Text style={styles.submitBtnText}>Upload</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Quick-rename modal — single-field "what should this be called?"
+          shortcut. Avoids the full edit sheet when the user only wants
+          to fix the document's display name. */}
+      <Modal
+        visible={!!renamingDoc}
+        transparent
+        animationType="fade"
+        onRequestClose={() => !savingRename && setRenamingDoc(null)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.modalRoot}
+        >
+          <TouchableOpacity
+            style={styles.modalBackdrop}
+            activeOpacity={1}
+            onPress={() => !savingRename && setRenamingDoc(null)}
+          />
+          <View style={[styles.sheet, { paddingBottom: 18 }]}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Rename Document</Text>
+            <Text style={styles.fieldLabel}>Document Name</Text>
+            <TextInput
+              style={styles.noteInput}
+              value={renameValue}
+              onChangeText={setRenameValue}
+              placeholder="e.g. Car Registration, Bike Insurance"
+              placeholderTextColor={COLORS.TEXT_SECONDARY}
+              autoFocus
+            />
+            <View style={styles.sheetActions}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => !savingRename && setRenamingDoc(null)}
+                disabled={savingRename}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.submitBtn, savingRename && { opacity: 0.6 }]}
+                onPress={submitRename}
+                disabled={savingRename}
+              >
+                {savingRename ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.submitBtnText}>Save</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Inline-edit modal — opens when the user taps any register row.
+          Pre-filled with the row's current values; saving sends only the
+          changed fields via PATCH. Delete button at the bottom removes
+          the row entirely (with confirmation). */}
+      <Modal
+        visible={!!editingDoc}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setEditingDoc(null)}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.modalRoot}
+        >
+          <TouchableOpacity
+            style={styles.modalBackdrop}
+            activeOpacity={1}
+            onPress={() => !savingEdit && setEditingDoc(null)}
+          />
+          <View style={styles.sheet}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Edit Register Row</Text>
+
+            <ScrollView
+              style={{ maxHeight: 480 }}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
+              <Text style={styles.fieldLabel}>Document Name</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={editName}
+                onChangeText={setEditName}
+                placeholder="e.g. Car Registration"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+              />
+
+              <Text style={styles.fieldLabel}>Statutory Department / Concerned Office</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={editAuthority}
+                onChangeText={setEditAuthority}
+                placeholder="e.g. RTO Goa"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+              />
+
+              <Text style={styles.fieldLabel}>Document No</Text>
+              <TextInput
+                style={styles.noteInput}
+                value={editNumber}
+                onChangeText={setEditNumber}
+                placeholder="e.g. CTO-10559/2025/150"
+                placeholderTextColor={COLORS.TEXT_SECONDARY}
+                autoCapitalize="characters"
+              />
+
+              <Text style={styles.fieldLabel}>Date of Issue</Text>
+              <TouchableOpacity
+                style={styles.dateBtn}
+                onPress={() => setEditShowIssue(true)}
+              >
+                <Text style={styles.dateBtnText}>
+                  {editIssueDate
+                    ? `${editIssueDate.getDate()} ${MONTH_LABELS[editIssueDate.getMonth()]} ${editIssueDate.getFullYear()}`
+                    : 'Tap to pick issue date'}
+                </Text>
+              </TouchableOpacity>
+              {editShowIssue && (
+                <DateTimePicker
+                  value={editIssueDate || new Date()}
+                  mode="date"
+                  display="default"
+                  maximumDate={new Date()}
+                  onChange={(_event: any, selected: Date | undefined) => {
+                    setEditShowIssue(false);
+                    if (selected) setEditIssueDate(selected);
+                  }}
+                />
+              )}
+
+              <Text style={styles.fieldLabel}>Valid Upto</Text>
+              <TouchableOpacity
+                style={styles.dateBtn}
+                onPress={() => setEditShowExpiry(true)}
+              >
+                <Text style={styles.dateBtnText}>
+                  {editExpiryDate
+                    ? `${editExpiryDate.getDate()} ${MONTH_LABELS[editExpiryDate.getMonth()]} ${editExpiryDate.getFullYear()}`
+                    : 'Tap to pick expiry'}
+                </Text>
+              </TouchableOpacity>
+              {editShowExpiry && (
+                <DateTimePicker
+                  value={editExpiryDate || new Date()}
+                  mode="date"
+                  display="default"
+                  onChange={(_event: any, selected: Date | undefined) => {
+                    setEditShowExpiry(false);
+                    if (selected) setEditExpiryDate(selected);
+                  }}
+                />
+              )}
+
+              {editingDoc && (
+                <TouchableOpacity
+                  style={styles.deleteRowBtn}
+                  onPress={() => editingDoc && confirmDelete(editingDoc)}
+                  disabled={!!deletingId}
+                >
+                  <Text style={styles.deleteRowBtnText}>
+                    {deletingId ? 'Removing…' : '🗑  Remove from register'}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </ScrollView>
+
+            <View style={styles.sheetActions}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => !savingEdit && setEditingDoc(null)}
+                disabled={savingEdit}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.submitBtn, savingEdit && { opacity: 0.6 }]}
+                onPress={saveEdit}
+                disabled={savingEdit}
+              >
+                {savingEdit ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.submitBtnText}>Save</Text>
                 )}
               </TouchableOpacity>
             </View>
@@ -943,17 +1575,45 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '800',
     color: COLORS.PRIMARY_DARK,
-    marginBottom: 8,
+    marginBottom: 4,
     letterSpacing: 0.4,
     textTransform: 'uppercase',
+  },
+  calendarHint: {
+    fontSize: 11,
+    color: COLORS.TEXT_SECONDARY,
+    marginBottom: 8,
+    lineHeight: 15,
+  },
+  calendarLegend: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 10,
+  },
+  calendarLegendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  calendarLegendSwatch: {
+    width: 10,
+    height: 10,
+    borderRadius: 2,
+  },
+  calendarLegendText: {
+    fontSize: 10,
+    color: COLORS.TEXT_SECONDARY,
+    fontWeight: '600',
   },
   calendarRow: { paddingRight: 8 },
   calendarCell: {
     width: 56,
-    paddingVertical: 8,
+    paddingVertical: 14,
     marginRight: 6,
     borderRadius: BORDER_RADIUS.MEDIUM,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: COLORS.SURFACE,
     borderWidth: 1,
     borderColor: COLORS.BORDER,
@@ -963,16 +1623,149 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '800',
   },
+  calendarMonthFilled: {
+    color: '#FFFFFF',
+  },
   calendarYear: {
     color: COLORS.TEXT_SECONDARY,
     fontSize: 10,
     marginTop: 1,
   },
-  calendarDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginTop: 4,
+  calendarYearFilled: {
+    color: 'rgba(255,255,255,0.9)',
+  },
+
+  // ─── Compliance Register (spreadsheet layout) ───────────────────────────
+  registerWrap: {
+    backgroundColor: COLORS.WHITE,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingTop: 14,
+    paddingBottom: 16,
+    marginBottom: 18,
+    ...SHADOWS.light,
+  },
+  registerTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: COLORS.TEXT,
+    marginBottom: 4,
+  },
+  registerSubtitle: {
+    fontSize: 11,
+    color: COLORS.TEXT_SECONDARY,
+    marginBottom: 12,
+    fontStyle: 'italic',
+  },
+  registerScroll: {
+    marginHorizontal: -4,
+  },
+  registerTable: {
+    backgroundColor: COLORS.WHITE,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: 10,
+    overflow: 'hidden',
+  },
+  regRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+    minHeight: 56,
+  },
+  regHeader: {
+    backgroundColor: '#5B7FB8',
+  },
+  regHeaderText: {
+    color: COLORS.WHITE,
+    fontWeight: '800',
+    fontSize: 11,
+    letterSpacing: 0.2,
+  },
+  cellSno: { width: 44, fontSize: 12, color: COLORS.TEXT, textAlign: 'center' },
+  cellName: { width: 130, fontSize: 12, color: COLORS.TEXT, paddingHorizontal: 6, fontWeight: '600' },
+  cellAuthority: { width: 170, fontSize: 11, color: COLORS.TEXT_SECONDARY, paddingHorizontal: 6 },
+  cellDocNo: { width: 130, fontSize: 11, color: COLORS.TEXT, paddingHorizontal: 6, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
+  cellDate: { width: 90, fontSize: 11, color: COLORS.TEXT, paddingHorizontal: 6 },
+  cellStatus: { width: 100, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  cellPdf: { width: 70, alignItems: 'center', justifyContent: 'center' },
+  // Renamed from statusPill / statusPillText to avoid collision with the
+  // existing card view's status badges.
+  regStatusPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    minWidth: 80,
+    alignItems: 'center',
+  },
+  regStatusPillText: {
+    color: COLORS.WHITE,
+    fontWeight: '800',
+    fontSize: 10,
+    letterSpacing: 0.2,
+  },
+  statusDays: {
+    fontSize: 9,
+    color: COLORS.TEXT_SECONDARY,
+    marginTop: 3,
+  },
+  pdfThumb: {
+    width: 50,
+    height: 44,
+    borderRadius: 6,
+    backgroundColor: '#F1F5F9',
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 4,
+  },
+  pdfThumbIcon: { fontSize: 18 },
+  pdfThumbText: { fontSize: 9, color: COLORS.TEXT_SECONDARY, fontWeight: '700' },
+
+  // Row Add Button — red dashed border per the mockup, full-width
+  rowAddBtn: {
+    marginTop: 16,
+    paddingVertical: 14,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderStyle: 'dashed',
+    borderColor: COLORS.ERROR,
+    backgroundColor: '#FEF2F2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rowAddBtnText: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: COLORS.ERROR,
+    letterSpacing: 0.3,
+    marginBottom: 4,
+  },
+  rowAddPlus: {
+    color: COLORS.ERROR,
+    fontSize: 22,
+    fontWeight: '900',
+    lineHeight: 22,
+  },
+
+  // Inline-edit modal — Remove-row button
+  deleteRowBtn: {
+    marginTop: 16,
+    paddingVertical: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.ERROR,
+    backgroundColor: '#FEF2F2',
+    alignItems: 'center',
+  },
+  deleteRowBtnText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.ERROR,
   },
 
   // Upload CTA (also acts as a "FAB-ish" inline button at the top)
@@ -1255,16 +2048,55 @@ const styles = StyleSheet.create({
     borderRadius: BORDER_RADIUS.MEDIUM,
   },
   filePickedName: {
-    flex: 1,
     color: COLORS.PRIMARY_DARK,
     fontWeight: '700',
     fontSize: 12,
     marginRight: 8,
   },
+  filePickedHint: {
+    color: COLORS.TEXT_SECONDARY,
+    fontSize: 10,
+    marginTop: 2,
+  },
+  filePickedThumb: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+    marginRight: 10,
+    backgroundColor: '#E5E7EB',
+  },
+  filePickedFileTile: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+    marginRight: 10,
+    backgroundColor: '#FEF3C7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  filePickedFileTileIcon: {
+    fontSize: 22,
+  },
   fileRemove: {
     color: COLORS.ERROR,
     fontWeight: '700',
     fontSize: 12,
+    marginLeft: 8,
+  },
+  // Crop pill on the picked-file row — bright green so the user
+  // sees they can re-crop without removing + re-picking.
+  filePickedCropBtn: {
+    backgroundColor: '#10B981',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 14,
+    marginRight: 8,
+  },
+  filePickedCropBtnText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.3,
   },
   noteInput: {
     backgroundColor: COLORS.PRIMARY_LIGHT,

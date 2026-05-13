@@ -14,6 +14,10 @@ export interface B2BToggleProps {
 const B2BToggle: React.FC<B2BToggleProps> = ({ onToggle, currentMode }) => {
   const [isIndustrial, setIsIndustrial] = useState(false);
   const [animatedValue] = useState(new Animated.Value(0));
+  // Container width is needed to slide the indicator by exactly half.
+  // Captured via onLayout once the toggle paints — until then, the
+  // indicator just doesn't slide (avoids a flash to a hard-coded 48px).
+  const [trackWidth, setTrackWidth] = useState<number>(0);
 
   useEffect(() => {
     if (currentMode) {
@@ -26,7 +30,7 @@ const B2BToggle: React.FC<B2BToggleProps> = ({ onToggle, currentMode }) => {
   useEffect(() => {
     Animated.timing(animatedValue, {
       toValue: isIndustrial ? 1 : 0,
-      duration: 300,
+      duration: 250,
       useNativeDriver: false,
     }).start();
   }, [isIndustrial, animatedValue]);
@@ -54,80 +58,111 @@ const B2BToggle: React.FC<B2BToggleProps> = ({ onToggle, currentMode }) => {
     }
   };
 
+  // Slide distance = (track width / 2) - the 4px padding on either side
+  // of the indicator. Until trackWidth is measured, slide stays at 0 so
+  // there's no jump on first paint.
+  const slideDistance = trackWidth > 0 ? trackWidth / 2 - 4 : 0;
   const toggleStyle = {
     transform: [
       {
         translateX: animatedValue.interpolate({
           inputRange: [0, 1],
-          outputRange: [0, SIZES.BASE * 6],
+          outputRange: [0, slideDistance],
         }),
       },
     ],
   };
 
   return (
-    <View style={styles.container}>
+    <View
+      style={styles.container}
+      onLayout={(e) => setTrackWidth(e.nativeEvent.layout.width)}
+    >
+      {/* Indicator BEHIND the labels — z-index handled via order in JSX
+          (RN respects last-rendered-on-top). Indicator is rendered first
+          via absolute positioning so labels sit on top. */}
+      <Animated.View style={[styles.toggleIndicator, toggleStyle]} />
+
       <TouchableOpacity
-        style={[styles.option, !isIndustrial && styles.activeOption]}
+        style={styles.option}
         onPress={() => handleToggle('consumer')}
+        activeOpacity={0.7}
       >
+        {/* 🏠 next to "Common Services" — house glyph reads as "doorstep
+            consumer". Active text turns navy on the gold pill. */}
+        <Text style={styles.optionEmoji}>🏠</Text>
         <Text style={[styles.optionText, !isIndustrial && styles.activeText]}>
           {STRINGS.COMMON}
         </Text>
       </TouchableOpacity>
 
       <TouchableOpacity
-        style={[styles.option, isIndustrial && styles.activeOption]}
+        style={styles.option}
         onPress={() => handleToggle('industrial')}
+        activeOpacity={0.7}
       >
+        {/* 🏭 factory glyph next to "Industrial Services". */}
+        <Text style={styles.optionEmoji}>🏭</Text>
         <Text style={[styles.optionText, isIndustrial && styles.activeText]}>
           {STRINGS.INDUSTRIAL}
         </Text>
       </TouchableOpacity>
-
-      <Animated.View style={[styles.toggleIndicator, toggleStyle]} />
     </View>
   );
 };
 
 const styles = StyleSheet.create({
+  // Pill-style segmented toggle: light-gray track with a deep-blue
+  // pill that slides between Common / Industrial. Matches the design
+  // mock — wider rounded corners, bolder active text, more padding.
   container: {
     flexDirection: 'row',
-    backgroundColor: COLORS.LIGHT_GRAY,
-    borderRadius: BORDER_RADIUS.LARGE,
-    padding: SIZES.BASE / 2,
+    backgroundColor: '#EEF2F6',
+    borderRadius: 999,
+    padding: 4,
     position: 'relative',
+    minHeight: 48,
   },
   option: {
     flex: 1,
+    flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: SIZES.BASE,
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
     paddingHorizontal: SIZES.BASE * 2,
-    borderRadius: BORDER_RADIUS.MEDIUM,
+    borderRadius: 999,
     zIndex: 1,
   },
-  activeOption: {
-    backgroundColor: 'transparent',
+  optionEmoji: {
+    fontSize: 16,
   },
   optionText: {
     fontSize: SIZES.FONT,
-    color: COLORS.GRAY,
+    color: '#64748B',
     fontWeight: '600',
   },
+  // Active state — white text on Prussian-blue pill. The blue is the
+  // brand primary so it visually anchors the toggle to the rest of the
+  // navy header / hero card on the home screen.
   activeText: {
-    color: COLORS.WHITE,
+    color: '#FFFFFF',
+    fontWeight: '800',
   },
   toggleIndicator: {
     position: 'absolute',
-    top: SIZES.BASE / 2,
-    left: SIZES.BASE / 2,
+    top: 4,
+    left: 4,
+    bottom: 4,
     width: '50%',
-    // Note: 'calc()' is a CSS string here — RN tolerates it on native;
-    // we keep the original behavior to avoid layout regressions.
-    height: 'calc(100% - 8px)' as unknown as number,
-    backgroundColor: COLORS.PRIMARY,
-    borderRadius: BORDER_RADIUS.MEDIUM,
+    backgroundColor: '#0D3B66',
+    borderRadius: 999,
     zIndex: 0,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
   },
 });
 

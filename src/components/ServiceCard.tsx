@@ -8,17 +8,92 @@ const BRAND = { bg: '#E3EEF8', accent: '#0D3B66' } as const;
 
 const styleForService = () => BRAND;
 
-const iconForCategory = (text: string): string => {
+// Maps a service / category name → an emoji that hints at what the
+// service is. Order matters: more-specific keywords first, broader
+// catch-alls later. Surfaces in two places — ServiceCard (per-card
+// badge) and HomeScreen's catIcon (per-section header) — keep them
+// in sync.
+export const iconForCategory = (text: string): string => {
   const t = (text || '').toLowerCase();
-  if (t.includes('aadhaar')) return '🆔';
+
+  // ─── Identity / govt ID documents ────────────────────────────────
+  if (t.includes('aadhaar') || t.includes('aadhar')) return '🆔';
   if (t.includes('pan')) return '💳';
-  if (t.includes('voter')) return '🗳️';
-  if (t.includes('ration')) return '🍱';
-  if (t.includes('driving') || t.includes('license')) return '🚗';
+  if (t.includes('voter') || t.includes('epic') || t.includes('electoral')) return '🗳️';
+  if (t.includes('ration') || t.includes('pds')) return '🍱';
+  if (t.includes('driving') || t.includes('dl ') || t.includes('learner')) return '🚗';
   if (t.includes('passport')) return '🛂';
-  if (t.includes('income')) return '💼';
+  if (t.includes('visa') || t.includes('immigration')) return '🛃';
+
+  // ─── Travel ──────────────────────────────────────────────────────
+  if (t.includes('flight') || t.includes('airline') || t.includes('air ticket')) return '✈️';
+  if (t.includes('train') || t.includes('railway') || t.includes('irctc')) return '🚆';
+  if (t.includes('bus')) return '🚌';
+  if (t.includes('cab') || t.includes('taxi') || t.includes('uber') || t.includes('ola')) return '🚖';
+  if (t.includes('hotel') || t.includes('stay')) return '🏨';
+  if (t.includes('travel') || t.includes('tour')) return '🧳';
+
+  // ─── Recharge / utility / bill payment ───────────────────────────
+  if (t.includes('mobile recharge') || t.includes('prepaid')) return '📱';
+  if (t.includes('dth') || t.includes('cable')) return '📺';
+  if (t.includes('electric') || t.includes('electricity') || t.includes('bescom') || t.includes('mseb')) return '💡';
+  if (t.includes('water bill') || (t.includes('water') && !t.includes('connection'))) return '💧';
+  if (t.includes('gas') || t.includes('lpg') || t.includes('cylinder')) return '🔥';
+  if (t.includes('broadband') || t.includes('wifi') || t.includes('fiber') || t.includes('internet')) return '📶';
+  if (t.includes('telephone') || t.includes('landline')) return '☎️';
+  if (t.includes('recharge') || t.includes('utility') || t.includes('bill pay')) return '🔌';
+
+  // ─── Finance / banking ───────────────────────────────────────────
+  if (t.includes('mutual fund') || t.includes('sip')) return '📊';
+  if (t.includes('insurance') || t.includes('policy') || t.includes('lic')) return '🛡️';
+  if (t.includes('loan') || t.includes('emi') || t.includes('credit')) return '💰';
+  if (t.includes('demat') || t.includes('stock') || t.includes('shares')) return '📈';
+  if (t.includes('bank') || t.includes('account opening')) return '🏦';
+  if (t.includes('finance') || t.includes('investment')) return '💵';
+
+  // ─── PF / ESI / employment / pension ─────────────────────────────
+  if (t.includes('pf ') || t.includes('epfo') || t.includes('provident fund')) return '🏛️';
+  if (t.includes('esi') || t.includes('esic')) return '🏥';
+  if (t.includes('pension') || t.includes('npsl') || t.includes('nps ')) return '👴';
+  if (t.includes('employment') || t.includes('job ') || t.includes('mgnrega') || t.includes('skill')) return '💼';
+  if (t.includes('udyam') || t.includes('msme') || t.includes('startup') || t.includes('business reg')) return '🏢';
+
+  // ─── Welfare / social schemes / state schemes ────────────────────
+  if (t.includes('scholarship') || t.includes('education')) return '🎓';
+  if (t.includes('housing') || t.includes('pmay') || t.includes('home') || t.includes('flat')) return '🏠';
+  if (t.includes('subsidy') || t.includes('disability') || t.includes('handicap')) return '♿';
+  if (t.includes('welfare') || t.includes('social security')) return '🤝';
+  if (t.includes('state scheme') || t.includes('govt scheme') || t.includes('government scheme')) return '🏛️';
+  if (t.includes('agriculture') || t.includes('farmer') || t.includes('kisan')) return '🌾';
+
+  // ─── Health / medical ────────────────────────────────────────────
+  if (t.includes('ayushman') || t.includes('health card') || t.includes('abha')) return '❤️‍🩹';
+  if (t.includes('vaccine') || t.includes('covid') || t.includes('cowin')) return '💉';
+  if (t.includes('hospital') || t.includes('medical')) return '🏥';
+
+  // ─── Civic certificates ──────────────────────────────────────────
+  if (t.includes('income certificate') || t.includes('income proof')) return '📑';
+  if (t.includes('caste') || t.includes('obc') || t.includes('sc ') || t.includes('st ')) return '📜';
+  if (t.includes('domicile') || t.includes('residence')) return '🏘️';
   if (t.includes('birth')) return '👶';
+  if (t.includes('death')) return '🕯️';
   if (t.includes('marriage')) return '💍';
+  if (t.includes('divorce')) return '⚖️';
+
+  // ─── Property / vehicle / RTO ────────────────────────────────────
+  if (t.includes('vehicle') || t.includes('rto') || t.includes('registration certificate')) return '🚘';
+  if (t.includes('property') || t.includes('land') || t.includes('khata') || t.includes('survey')) return '📐';
+  if (t.includes('rent') || t.includes('lease')) return '📑';
+
+  // ─── Tax / GST ───────────────────────────────────────────────────
+  if (t.includes('gst')) return '🧾';
+  if (t.includes('income tax') || t.includes('itr') || t.includes('tax return')) return '🧮';
+  if (t.includes('tax')) return '🧾';
+
+  // ─── Generic catch-alls ──────────────────────────────────────────
+  if (t.includes('government') || t.includes('govt') || t.includes('statutory')) return '🏛️';
+  if (t.includes('service') || t.includes('certificate') || t.includes('document')) return '📄';
+
   return '📄';
 };
 
@@ -94,18 +169,46 @@ const ServiceCard: React.FC<ServiceCardProps> = ({ service, onPress }) => {
               ) : (
                 <Text style={styles.price}>
                   <Text style={styles.priceCurrency}>₹</Text>
-                  {service.total_expense || service.price || 0}
+                  {/* user_cost is the customer-facing price (govt + partner
+                      + company margin). Was previously showing total_expense
+                      which is just (govt + partner) — caused the home-page
+                      card to show ₹175 even though checkout charges ₹275. */}
+                  {service.user_cost || service.total_expense || service.price || 0}
                 </Text>
               )}
               <View style={[styles.timePill, { backgroundColor: palette.bg }]}>
                 <Text style={[styles.timeText, { color: palette.accent }]}>
                   {service.pricing_model === 'quote'
                     ? 'B2B'
-                    : service.processing_time || service.estimated_time || 'Quick'}
+                    : (() => {
+                        // Prefer the canonical rate-chart timeline
+                        // (service.expected_timeline) over the older
+                        // generic processing_time / estimated_time
+                        // columns. Strip "Instant"/"Quick"/"N/A"
+                        // placeholders so the pill shows a real
+                        // duration whenever the DB has one.
+                        const placeholder = /^(instant|quick|n\/?a|tbd|—|-)$/i;
+                        const candidates = [
+                          service.expected_timeline,
+                          service.processing_time,
+                          service.estimated_time,
+                        ];
+                        const found = candidates.find(
+                          (v) => v && !placeholder.test(String(v).trim()),
+                        );
+                        return found || 'See details';
+                      })()}
                 </Text>
               </View>
             </View>
           </View>
+        </View>
+
+        {/* Book Now CTA — Prussian blue pill INSIDE the card itself.
+            Tapping it routes through the same `onPress` so the card and
+            the button share one handler — no double-binding. */}
+        <View style={styles.bookNowBtn}>
+          <Text style={styles.bookNowBtnText}>Book Now  →</Text>
         </View>
 
         <View style={[styles.accentStripe, { backgroundColor: palette.accent }]} />
@@ -155,6 +258,23 @@ const styles = StyleSheet.create({
   timePill: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
   timeText: { fontSize: 10, fontWeight: '700' },
   accentStripe: { height: 2, width: '100%' },
+  // Prussian-blue Book Now CTA inside the card. Sits below the meta
+  // row + above the accent stripe so every card shows the explicit
+  // call-to-action without the user needing to read the price hint.
+  bookNowBtn: {
+    backgroundColor: '#0D3B66',
+    marginHorizontal: 12,
+    marginBottom: 10,
+    paddingVertical: 8,
+    borderRadius: 999,
+    alignItems: 'center',
+  },
+  bookNowBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '900',
+    fontSize: 12,
+    letterSpacing: 0.4,
+  },
 });
 
 export default ServiceCard;

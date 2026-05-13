@@ -5,14 +5,17 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
  *
  * Backends store booking_number / id in many shapes — UUIDs, BK123456,
  * raw numbers, etc. This helper normalises whatever it gets into the
- * brand-friendly "Flip#001" format that customers see in the app and on
- * receipts.
+ * brand-friendly "Flip#0001" format that customers see in the app and on
+ * receipts. 4-digit padding (was 3) — gives room up to 9,999 bookings
+ * before the format breaks visually, and makes early IDs read as
+ * "Flip#0014" instead of the cramped "Flip#014".
  *
  * Examples:
- *   formatBookingId('BK14')              → 'Flip#014'
- *   formatBookingId(7)                   → 'Flip#007'
- *   formatBookingId('BK000123')          → 'Flip#123'
- *   formatBookingId('BK234567')          → 'Flip#234567'  (long timestamps stay long)
+ *   formatBookingId('BK14')              → 'Flip#0014'
+ *   formatBookingId(7)                   → 'Flip#0007'
+ *   formatBookingId(1002)                → 'Flip#1002'
+ *   formatBookingId('BK000123')          → 'Flip#0123'
+ *   formatBookingId('BK234567')          → 'Flip#234567'  (long IDs stay long)
  *   formatBookingId('a1b2c3d4-e5f6-...') → 'Flip#A1B2'    (UUID fallback)
  *   formatBookingId(null)                → ''
  */
@@ -26,7 +29,7 @@ export const formatBookingId = (input: string | number | null | undefined): stri
   if (digitMatch) {
     const n = parseInt(digitMatch[1], 10);
     if (!Number.isNaN(n)) {
-      return `Flip#${String(n).padStart(3, '0')}`;
+      return `Flip#${String(n).padStart(4, '0')}`;
     }
   }
 

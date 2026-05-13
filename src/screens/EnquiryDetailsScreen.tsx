@@ -25,12 +25,22 @@ import { getToken } from '../utils/storage';
 // Defensive load for expo-file-system + expo-sharing — both are native
 // modules and need a dev-client rebuild to show up. Until then, the vault
 // download falls back gracefully.
+//
+// Expo SDK 54+ deprecated `createDownloadResumable` + `cacheDirectory` on
+// the main `expo-file-system` entry; they live under the `/legacy`
+// sub-path now. Try the legacy path first, fall back to main for older
+// SDKs so this keeps working across the version range.
 let FileSystem: any = null;
 let Sharing: any = null;
 let fileSystemReady = false;
 try {
-  // eslint-disable-next-line global-require
-  FileSystem = require('expo-file-system');
+  try {
+    // eslint-disable-next-line global-require
+    FileSystem = require('expo-file-system/legacy');
+  } catch (_) {
+    // eslint-disable-next-line global-require
+    FileSystem = require('expo-file-system');
+  }
   // eslint-disable-next-line global-require
   Sharing = require('expo-sharing');
   fileSystemReady = typeof FileSystem?.createDownloadResumable === 'function'
@@ -516,14 +526,15 @@ const EnquiryDetailsScreen: FC<Props> = ({ route, navigation }) => {
         </View>
       )}
 
-      {/* Post-acceptance — invoice placeholder */}
+      {/* Post-acceptance — admin-handoff message. */}
       {status === 'accepted' && (
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>🧾 Invoice</Text>
+          <Text style={styles.sectionTitle}>✅ Acceptance Recorded</Text>
           <View style={styles.infoCard}>
             <Text style={styles.infoText}>
-              Your accepted quote has been forwarded to our finance team. You will receive a formal GST
-              invoice via email. Settle it by NEFT / bank transfer; work begins once payment is received.
+              Thanks for accepting the quote. Our admin will review and assign a service
+              representative shortly — you'll get a push notification the moment they're on
+              the way. Track progress under My Bookings once the rep is assigned.
             </Text>
           </View>
         </View>

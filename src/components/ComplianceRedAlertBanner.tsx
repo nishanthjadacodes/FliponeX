@@ -88,9 +88,22 @@ const ComplianceRedAlertBanner: React.FC<ComplianceRedAlertBannerProps> = ({ onP
       // a second time on the same screen.
       setRedDocs((prev) => prev.filter((d) => d.id !== target.id));
     } catch (e: any) {
+      // The renew API helper now extracts the real backend message
+      // (e.g. "Document not found" / "Company profile required") into
+      // e.message — no more opaque "Request failed with status code".
+      // We also offer a fallback CTA to open the Compliance Vault so
+      // the user has a clear next step instead of being stuck on the
+      // banner.
       Alert.alert(
         'Could not start renewal',
         e?.message || 'Please try again from the Compliance Vault.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Open Compliance Vault',
+            onPress: () => onPress?.(),
+          },
+        ],
       );
     } finally {
       setRenewing(false);

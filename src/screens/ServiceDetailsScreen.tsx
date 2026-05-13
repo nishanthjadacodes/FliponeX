@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   Alert,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import { STRINGS } from '../constants/strings';
 import { getServiceById, getB2BReadiness } from '../services/api';
@@ -29,6 +30,10 @@ interface Props {
 }
 
 const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
+  // Pull safe-area insets so the fixed bottom CTA (Book Now / Request
+  // Quote) doesn't get clipped by the gesture bar, home indicator, or
+  // rounded screen edges on modern phones.
+  const insets = useSafeAreaInsets();
   const [service, setService] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -39,12 +44,90 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     loadServiceDetails();
   }, [serviceId]);
 
+  // Rate-chart safety override — same idea as in BookingScreen. If the
+  // backend service row is missing partner_earning / company_margin /
+  // total_expense (older seed) we patch them client-side so the
+  // breakdown card still renders correct numbers. Reads off the same
+  // canonical rate-chart values; never overrides anything the backend
+  // already provided non-zero.
+  const RATE_CHART_OVERRIDES: Array<{
+    category: RegExp; name: RegExp;
+    user_cost: number; govt_fees: number; partner_earning: number;
+    total_expense: number; company_margin: number; expected_timeline: string;
+  }> = [
+    { category: /aadhaar|aadhar/i, name: /new\s+aadhaar\s+enrolment/i, user_cost:  200, govt_fees:    0, partner_earning: 100, total_expense:  100, company_margin: 100, expected_timeline: '1 week'  },
+    { category: /aadhaar|aadhar/i, name: /husband\s+name\s+update/i,    user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '3 weeks' },
+    { category: /aadhaar|aadhar/i, name: /address\s+update/i,           user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '4 weeks' },
+    { category: /aadhaar|aadhar/i, name: /date\s+of\s+birth/i,          user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '5 weeks' },
+    { category: /aadhaar|aadhar/i, name: /gender\s+update/i,            user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '6 weeks' },
+    { category: /aadhaar|aadhar/i, name: /biometric/i,                  user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '7 weeks' },
+    { category: /aadhaar|aadhar/i, name: /mobile\s*no\.?\s+update/i,    user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '8 weeks' },
+    { category: /aadhaar|aadhar/i, name: /email\s+id\s+update/i,        user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '9 weeks' },
+    { category: /aadhaar|aadhar/i, name: /order\s+aadhaar\s+pvc/i,      user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '10 weeks' },
+    { category: /aadhaar|aadhar/i, name: /download\s+aadhaar/i,         user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '11 weeks' },
+    { category: /aadhaar|aadhar/i, name: /verify\s+email\/?mobile/i,    user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '12 weeks' },
+    { category: /aadhaar|aadhar/i, name: /name\s+update/i,              user_cost:  275, govt_fees:   75, partner_earning: 100, total_expense:  175, company_margin: 100, expected_timeline: '2 weeks' },
+    { category: /pan/i, name: /link\s+pan\s+to\s+aadhaar/i,             user_cost: 1100, govt_fees: 1000, partner_earning:  75, total_expense: 1075, company_margin:  25, expected_timeline: '48-72 hrs' },
+    { category: /pan/i, name: /new\s+pan/i,                             user_cost:  220, govt_fees:  107, partner_earning:  75, total_expense:  182, company_margin:  38, expected_timeline: '24-48 hrs' },
+    { category: /pan/i, name: /(name|address|date\s+of\s+birth|gender|mobile|email|order|download|verify)/i, user_cost: 220, govt_fees: 107, partner_earning: 75, total_expense: 182, company_margin: 38, expected_timeline: '48-72 hrs' },
+    { category: /voter|epic|electoral/i, name: /.*/i,                   user_cost:  150, govt_fees:    0, partner_earning: 100, total_expense:  100, company_margin:  50, expected_timeline: '10-15 Days' },
+    { category: /ration|pds/i,           name: /.*/i,                   user_cost:  150, govt_fees:    0, partner_earning: 100, total_expense:  100, company_margin:  50, expected_timeline: '20-30 Days' },
+    // Driving Licence — per 09.04.26 rate chart. More-specific names
+    // sit first so e.g. "Driving Licence Heavy" hits the heavy row
+    // before the generic 4-wheeler one.
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /learner.?licen/i,            user_cost:  5000, govt_fees:  4000, partner_earning:  500, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /heavy/i,                     user_cost: 22000, govt_fees: 19000, partner_earning: 2000, total_expense: 21000, company_margin: 1000, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /renewal/i,                   user_cost:  3500, govt_fees:  2500, partner_earning:  500, total_expense:  3000, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(2.?wheeler|two.?wheeler)/i, user_cost: 4500, govt_fees: 4000, partner_earning:  500, total_expense:  4500, company_margin:    0, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(4.?wheeler|four.?wheeler)/i, user_cost: 5000, govt_fees: 4000, partner_earning:  500, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /duplicate/i,                 user_cost:  1500, govt_fees:  1000, partner_earning:  300, total_expense:  1300, company_margin:  200, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /change.?of.?address|address.?change/i, user_cost: 1500, govt_fees: 800, partner_earning: 500, total_expense: 1300, company_margin: 200, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /international|idp/i,         user_cost:  5000, govt_fees:  3500, partner_earning: 1000, total_expense:  4500, company_margin:  500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /add.?class|class.?of.?vehicle/i, user_cost: 5000, govt_fees: 4000, partner_earning: 500, total_expense: 4500, company_margin: 500, expected_timeline: '5-10 Days' },
+    { category: /driving|licen[cs]e|\bdl\b/i, name: /(ll.?test|stall)/i,          user_cost:   800, govt_fees:   500, partner_earning:  200, total_expense:   700, company_margin:  100, expected_timeline: '5-10 Days' },
+    // Other services — per rate chart, all timelines are "5-12 Hrs".
+    { category: /msme|udhyog|udyog/i,           name: /.*/i, user_cost:  300, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 200, expected_timeline: '5-12 Hrs' },
+    { category: /food.?license|fssai/i,         name: /.*/i, user_cost:  200, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 100, expected_timeline: '5-12 Hrs' },
+    { category: /trade.?license/i,              name: /.*/i, user_cost: 1000, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 900, expected_timeline: '5-12 Hrs' },
+    { category: /caste/i,                       name: /.*/i, user_cost:  300, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 200, expected_timeline: '5-12 Hrs' },
+    { category: /domicile/i,                    name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    { category: /income/i,                      name: /.*/i, user_cost:  250, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 150, expected_timeline: '5-12 Hrs' },
+    { category: /birth.?certificate/i,          name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    { category: /death.?certificate/i,          name: /.*/i, user_cost:  400, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: 300, expected_timeline: '5-12 Hrs' },
+    { category: /life.?certificate/i,           name: /.*/i, user_cost:   50, govt_fees: 0, partner_earning: 100, total_expense: 100, company_margin: -50, expected_timeline: '5-12 Hrs' },
+  ];
+
+  const applyRateChartOverride = (svc: any): any => {
+    if (!svc?.name || !svc?.category) return svc;
+    const hit = RATE_CHART_OVERRIDES.find(
+      (r) => r.category.test(String(svc.category)) && r.name.test(String(svc.name)),
+    );
+    if (!hit) return svc;
+    // Treat "Instant" / "Quick" / "N/A" / empty as missing — backend
+    // seed had these placeholder strings for many rows, which leaked
+    // into the customer-facing Expected Timeline. When a rate-chart
+    // row matches we always prefer ITS timeline string (canonical from
+    // the PDF). Numeric fields still defer to DB values when set.
+    const placeholder = /^(instant|quick|n\/?a|tbd|varies|—|-)$/i;
+    const dbTimeline = String(svc.expected_timeline || '').trim();
+    const useDbTimeline = !!dbTimeline && !placeholder.test(dbTimeline);
+    return {
+      ...svc,
+      user_cost:        Number(svc.user_cost) || hit.user_cost,
+      govt_fees:        svc.govt_fees != null ? Number(svc.govt_fees) : hit.govt_fees,
+      partner_earning:  Number(svc.partner_earning) || hit.partner_earning,
+      company_margin:   Number(svc.company_margin) || hit.company_margin,
+      total_expense:    Number(svc.total_expense) || hit.total_expense,
+      expected_timeline: useDbTimeline ? dbTimeline : hit.expected_timeline,
+    };
+  };
+
   const loadServiceDetails = async (): Promise<void> => {
     try {
       setLoading(true);
       setError(null);
       const response: any = await getServiceById(serviceId);
-      setService(response.data);
+      setService(applyRateChartOverride(response.data));
     } catch (error: any) {
       console.error('Error loading service details:', error);
       setError(error.message || STRINGS.ERROR_LOADING_SERVICE_DETAILS);
@@ -136,7 +219,15 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     const isQuoteBased = service.pricing_model === 'quote';
 
     return (
-      <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.container}
+        showsVerticalScrollIndicator={false}
+        // Bottom space matches the height of the fixed Book Now / Request
+        // Quote container so the last bit of service detail isn't hidden
+        // behind it. Insets get added on top because the container itself
+        // already pads for them.
+        contentContainerStyle={{ paddingBottom: 96 + (insets.bottom || 0) }}
+      >
         <View style={styles.content}>
           {/* Service Name */}
           <Text style={styles.serviceName}>{service.name}</Text>
@@ -197,62 +288,62 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           ) : (
             <>
-              {/* Pricing breakdown — customer-facing only. We deliberately
-                  hide partner_earning, company_margin, and total_expense as
-                  those are internal accounting fields the customer should
-                  never see. The sum the customer pays = user_cost + govt_fees. */}
-              <View style={styles.pricingContainer}>
-                <Text style={styles.sectionTitle}>Pricing Details</Text>
-                <View style={styles.pricingRow}>
-                  <Text style={styles.pricingLabel}>Service Fee</Text>
-                  <Text style={styles.pricingValue}>₹ {service.user_cost || 0}</Text>
-                </View>
-                {Number(service.govt_fees) > 0 && (
-                  <View style={styles.pricingRow}>
-                    <Text style={styles.pricingLabel}>Government Fees</Text>
-                    <Text style={styles.pricingValue}>₹ {service.govt_fees}</Text>
+              {/* Pricing — single line. Customer pays `user_cost`
+                  (the rate-chart customer price). The internal split
+                  (govt + partner + company margin) is intentionally
+                  hidden — it lives in the admin dashboard and on the
+                  booking payload for commission accounting only. */}
+              {(() => {
+                // user_cost is the canonical customer price. If a stale
+                // service row is missing it, fall back to total_expense
+                // → indicative_price_from so the customer still sees a
+                // number rather than ₹0.
+                const userCost =
+                  Number(service.user_cost) ||
+                  Number(service.total_expense) ||
+                  Number(service.indicative_price_from) ||
+                  0;
+                return (
+                  <View style={styles.pricingContainer}>
+                    <Text style={styles.sectionTitle}>Pricing</Text>
+                    <View style={[styles.pricingRow, styles.totalRow]}>
+                      <Text style={styles.totalLabel}>Total Payable</Text>
+                      <Text style={styles.totalValue}>₹ {userCost}</Text>
+                    </View>
                   </View>
-                )}
-                <View style={[styles.pricingRow, styles.totalRow]}>
-                  <Text style={styles.totalLabel}>Total Payable</Text>
-                  <Text style={styles.totalValue}>
-                    ₹ {(Number(service.user_cost) || 0) + (Number(service.govt_fees) || 0)}
-                  </Text>
-                </View>
-              </View>
+                );
+              })()}
 
-              {/* Timeline — only for fixed-price services */}
+              {/* Timeline — single line. The previous version showed
+                  three rows each prefixed with a stray "?" character
+                  (Unicode-icon font wasn't loading). Processing Time
+                  and Expected Delivery were always 'N/A' anyway since
+                  the backend doesn't carry those fields. Collapsed to
+                  the one row that actually has data. */}
               <View style={styles.timelineContainer}>
                 <Text style={styles.sectionTitle}>Expected Timeline</Text>
                 <View style={styles.timelineRow}>
-                  <Text style={styles.timelineIcon}>?</Text>
                   <View style={styles.timelineContent}>
-                    <Text style={styles.timelineLabel}>Expected Timeline:</Text>
-                    <Text style={styles.timelineValue}>{service.expected_timeline || 'N/A'}</Text>
-                  </View>
-                </View>
-                <View style={styles.timelineRow}>
-                  <Text style={styles.timelineIcon}>?</Text>
-                  <View style={styles.timelineContent}>
-                    <Text style={styles.timelineLabel}>Processing Time:</Text>
-                    <Text style={styles.timelineValue}>{service.processing_time || service.estimated_time || 'N/A'}</Text>
-                  </View>
-                </View>
-                <View style={styles.timelineRow}>
-                  <Text style={styles.timelineIcon}>?</Text>
-                  <View style={styles.timelineContent}>
-                    <Text style={styles.timelineLabel}>Expected Delivery:</Text>
-                    <Text style={styles.timelineValue}>{service.expected_delivery || 'N/A'}</Text>
+                    <Text style={styles.timelineValue}>
+                      {service.expected_timeline || 'Varies by service — confirmed on booking.'}
+                    </Text>
                   </View>
                 </View>
               </View>
             </>
           )}
 
-          {/* Required Documents */}
+          {/* Checklist — matches the spec's "Please keep ready" wording so
+              the customer treats this as a pre-visit preparation list, not
+              a generic info dump. Saves the rep time on-site (single-visit
+              completion). */}
           {service.required_documents && (
             <View style={styles.documentsContainer}>
-              <Text style={styles.sectionTitle}>{STRINGS.REQUIRED_DOCUMENTS}</Text>
+              <Text style={styles.sectionTitle}>📋 Please Keep Ready</Text>
+              <Text style={{ fontSize: 13, color: '#6C757D', marginBottom: 10, lineHeight: 18 }}>
+                Have these handy before the representative visits — it helps
+                us complete your service in a single visit.
+              </Text>
               {(() => {
                 // Backend may return either a plain array or {documents: [...]}
                 const raw = service.required_documents;
@@ -300,6 +391,17 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           )}
 
+          {/* Disclaimer (per spec) — sets expectations about external
+              dependencies the customer can't see (govt portals, etc.). */}
+          <View style={styles.disclaimerCard}>
+            <Text style={styles.disclaimerLabel}>Please Note</Text>
+            <Text style={styles.disclaimerText}>
+              FliponeX will not be held responsible for delays caused by slow
+              government portals or technical issues. Our experts will provide
+              full cooperation until the task is completed.
+            </Text>
+          </View>
+
           {/* Additional padding for fixed button */}
           <View style={styles.bottomPadding} />
         </View>
@@ -319,8 +421,19 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     <View style={styles.mainContainer}>
       {renderServiceDetails()}
 
-      {/* Fixed CTA — label depends on pricing model */}
-      <View style={styles.buttonContainer}>
+      {/* Fixed CTA — label depends on pricing model. Horizontal +
+          bottom padding driven by safe-area insets so the button never
+          clips against a rounded screen edge or gesture bar. */}
+      <View
+        style={[
+          styles.buttonContainer,
+          {
+            paddingBottom: SIZES.BASE + (insets.bottom || 0),
+            paddingLeft: SIZES.BASE + (insets.left || 0),
+            paddingRight: SIZES.BASE + (insets.right || 0),
+          },
+        ]}
+      >
         <TouchableOpacity style={styles.bookButton} onPress={handleBookNow}>
           <Text style={styles.bookButtonText}>
             {service?.pricing_model === 'quote' ? 'Request Quote' : STRINGS.BOOK_NOW}
@@ -614,13 +727,40 @@ const styles = StyleSheet.create({
   bottomPadding: {
     height: SIZES.BASE * 8,
   },
+
+  // Disclaimer card — small, muted, separated from the main content so
+  // it reads as a footnote rather than a warning.
+  disclaimerCard: {
+    backgroundColor: '#FFFBEB',
+    borderLeftWidth: 4,
+    borderLeftColor: '#F4A100',
+    padding: 14,
+    borderRadius: 8,
+    marginTop: SIZES.BASE * 2,
+    marginBottom: SIZES.BASE,
+  },
+  disclaimerLabel: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#92400E',
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  disclaimerText: {
+    fontSize: 12,
+    color: '#78350F',
+    lineHeight: 18,
+  },
   buttonContainer: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
     backgroundColor: COLORS.WHITE,
-    padding: SIZES.BASE,
+    // Padding driven by safe-area insets inline; only the top
+    // padding stays a flat value since there's no inset there.
+    paddingTop: SIZES.BASE,
     borderTopWidth: 1,
     borderTopColor: COLORS.LIGHT_GRAY,
     shadowColor: COLORS.CARD_SHADOW,
