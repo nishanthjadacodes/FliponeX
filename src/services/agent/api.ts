@@ -620,6 +620,11 @@ export interface EarningRecord {
   id: string;
   taskId: string;
   customerName: string;
+  // Person the service was actually rendered to. Same as customerName
+  // when the booker is the applicant; differs when the customer booked
+  // on behalf of a family member. Always populated server-side (falls
+  // back to customerName when no separate applicant was captured).
+  applicantName: string;
   serviceName: string;
   amount: number;
   commission: number;
@@ -683,6 +688,10 @@ export const getEarnings = async (): Promise<EarningsSummary> => {
     id: t.id,
     taskId: t.id?.substring(0, 8) || t.id,
     customerName: t.customerName || 'Customer',
+    // Local-compute fallback path can't see applicant_name (it's not on
+    // the AgentTask shape), so we mirror customerName — the server path
+    // does the real differentiation when reachable.
+    applicantName: t.customerName || 'Customer',
     serviceName: t.serviceName || 'Service',
     amount: parseFloat(String(t.amount)) || 0,
     commission: parseFloat(String(t.amount)) || 0,

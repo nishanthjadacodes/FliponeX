@@ -276,7 +276,19 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
               <View key={earning.id} style={styles.earningCard}>
                 <View style={styles.earningHeader}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.earningCustomer}>{earning.customerName}</Text>
+                    {/* Applicant = whom the service was rendered to (may
+                        differ from customer when the customer booked
+                        for a family member). When they're the same we
+                        only show one line to avoid visual noise. */}
+                    <Text style={styles.earningCustomer}>
+                      {earning.applicantName || earning.customerName}
+                    </Text>
+                    {earning.applicantName &&
+                      earning.applicantName !== earning.customerName && (
+                        <Text style={styles.earningBookedBy}>
+                          Booked by {earning.customerName}
+                        </Text>
+                      )}
                     <Text style={styles.earningService}>{earning.serviceName}</Text>
                     <Text style={styles.earningDate}>{formatDate(earning.date)}</Text>
                   </View>
@@ -376,6 +388,7 @@ const styles = StyleSheet.create({
   },
   earningHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
   earningCustomer: { fontSize: 14, fontWeight: '700', color: '#0F172A', marginBottom: 2 },
+  earningBookedBy: { fontSize: 11, color: '#64748B', fontStyle: 'italic', marginBottom: 2 },
   earningService: { fontSize: 12, color: '#475569', marginBottom: 2 },
   earningDate: { fontSize: 11, color: '#94A3B8' },
   earningAmount: { fontSize: 16, fontWeight: '900', color: '#F4A100', marginBottom: 4 },
