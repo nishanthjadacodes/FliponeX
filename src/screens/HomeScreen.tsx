@@ -68,17 +68,15 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const [error, setError] = useState<any>(null);
   const [user, setUser] = useState<any>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
-  // Per-category expansion state for the home services grid. By default
-  // each category shows only the first INITIAL_SERVICES_PER_CAT items
-  // so the home screen fits more sections on one screen; tapping
-  // "View All" expands that category in-place to reveal the rest.
-  // Stored as a Set so toggling is O(1) and adding new categories is
-  // free. Resets on B2B toggle / category-chip filter via the user's
-  // navigation away + back.
-  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
-    new Set(),
-  );
-  const INITIAL_SERVICES_PER_CAT = 6;
+  // Global home-page services-grid expansion. By default we show only
+  // TOTAL_INITIAL_SERVICES (across ALL categories combined, in the
+  // service list's natural order — typically the first few Aadhaar
+  // services since Aadhaar comes first in the rate chart). The "View
+  // All Services" button at the bottom of the visible slice expands
+  // to the full categorised view. Resets on B2B toggle so each mode
+  // (consumer / industrial) starts collapsed again.
+  const [showAllServices, setShowAllServices] = useState<boolean>(false);
+  const TOTAL_INITIAL_SERVICES = 8;
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
@@ -1319,61 +1317,92 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           // grouped section emoji matches the cards inside it.
           const catIcon = iconForCategory;
 
-          return Object.entries(groups).map(([category, items]: [string, any]) => {
-            const isExpanded = expandedCategories.has(category);
-            const visibleItems = isExpanded
-              ? items
-              : items.slice(0, INITIAL_SERVICES_PER_CAT);
-            const hasMore = items.length > INITIAL_SERVICES_PER_CAT;
-            const toggleExpand = () => {
-              haptics.tap();
-              setExpandedCategories((prev) => {
-                const next = new Set(prev);
-                if (next.has(category)) next.delete(category);
-                else next.add(category);
-                return next;
-              });
-            };
-            return (
-              <View key={category} style={styles.catSection}>
-                {/* Section header — icon + name + count + "View All →"
-                    toggle that expands this category IN PLACE (no nav
-                    away). Each section starts with just the first few
-                    services; tapping View All reveals the rest in the
-                    same scroll position so the user stays on home. */}
-                <View style={styles.catHeader}>
-                  <Text style={styles.catIcon}>{catIcon(category)}</Text>
-                  <Text style={styles.catTitle}>{category}</Text>
-                  <Text style={styles.catCount}>{items.length}</Text>
-                  <View style={{ flex: 1 }} />
-                  {hasMore && (
-                    <TouchableOpacity
-                      onPress={toggleExpand}
-                      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                    >
-                      <Text style={styles.catViewAll}>
-                        {isExpanded ? 'Show Less ↑' : 'View All →'}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
-                </View>
+          // Build the visible categories list. When collapsed, we walk
+          // categories in their natural order and accept services until
+          // we hit TOTAL_INITIAL_SERVICES; categories that fall entirely
+          // outside that slice don't render. When expanded, every
+          // category renders in full — same look as before.
+          const categoryEntries = Object.entries(groups) as [string, any[]][];
+          let visibleEntries: [string, any[]][];
+          const totalServicesCount = categoryEntries.reduce(
+            (sum, [, arr]) => sum + arr.length,
+            0,
+          );
+          const hasGlobalMore = totalServicesCount > TOTAL_INITIAL_SERVICES;
 
-                {/* Vertical 2-column grid. ServiceCard already renders the
-                    Prussian-blue Book Now pill internally. visibleItems
-                    is sliced to INITIAL_SERVICES_PER_CAT unless the user
-                    expanded this category. */}
-                <FlatList
-                  data={visibleItems}
-                  renderItem={renderServiceCard}
-                  keyExtractor={(item: any) => item.id?.toString?.() ?? Math.random().toString()}
-                  numColumns={2}
-                  contentContainerStyle={styles.servicesGrid}
-                  columnWrapperStyle={styles.servicesRow}
-                  scrollEnabled={false}
-                />
-              </View>
-            );
-          });
+          if (showAllServices || !hasGlobalMore) {
+            visibleEntries = categoryEntries;
+          } else {
+            visibleEntries = [];
+            let remaining = TOTAL_INITIAL_SERVICES;
+            for (const [cat, arr] of categoryEntries) {
+              if (remaining <= 0) break;
+              const slice = arr.slice(0, remaining);
+              visibleEntries.push([cat, slice]);
+              remaining -= slice.length;
+            }
+          }
+
+          return (
+            <>
+              {visibleEntries.map(([category, items]: [string, any]) => (
+                <View key={category} style={styles.catSection}>
+                  {/* Section header — icon + name + count. The per-
+                      category "View All" link was removed in favour
+                      of a single global "View All Services" button
+                      below the entire visible slice. */}
+                  <View style={styles.catHeader}>
+                    <Text style={styles.catIcon}>{catIcon(category)}</Text>
+                    <Text style={styles.catTitle}>{category}</Text>
+                    <Text style={styles.catCount}>
+                      {showAllServices
+                        ? items.length
+                        : `${items.length}${
+                            (groups as any)[category]?.length > items.length
+                              ? ` of ${(groups as any)[category].length}`
+                              : ''
+                          }`}
+                    </Text>
+                  </View>
+
+                  {/* Vertical 2-column grid — ServiceCard renders the
+                      Prussian-blue Book Now pill internally. */}
+                  <FlatList
+                    data={items}
+                    renderItem={renderServiceCard}
+                    keyExtractor={(item: any) =>
+                      item.id?.toString?.() ?? Math.random().toString()
+                    }
+                    numColumns={2}
+                    contentContainerStyle={styles.servicesGrid}
+                    columnWrapperStyle={styles.servicesRow}
+                    scrollEnabled={false}
+                  />
+                </View>
+              ))}
+
+              {/* Single global toggle below all visible categories.
+                  Only renders when there are more services to reveal.
+                  When expanded, the same button collapses everything
+                  back to the initial slice so the user can quickly
+                  return to a compact home view. */}
+              {hasGlobalMore && (
+                <TouchableOpacity
+                  style={styles.globalViewAllBtn}
+                  onPress={() => {
+                    haptics.tap();
+                    setShowAllServices((v) => !v);
+                  }}
+                >
+                  <Text style={styles.globalViewAllBtnText}>
+                    {showAllServices
+                      ? `Show Less ↑`
+                      : `View All Services (${totalServicesCount}) →`}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </>
+          );
         })()}
         </View>
 
@@ -2336,6 +2365,30 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '800',
     letterSpacing: 0.2,
+  },
+  // Single global "View All Services" CTA — sits below ALL visible
+  // category sections. Centered pill so it reads as a clear next step,
+  // not a tertiary inline link like the per-category View All used to.
+  globalViewAllBtn: {
+    marginTop: 12,
+    marginHorizontal: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 12,
+    backgroundColor: '#0D3B66',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#0D3B66',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.18,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  globalViewAllBtnText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '800',
+    letterSpacing: 0.3,
   },
   // Each card slot in the vertical 2-column grid. The wrapping View
   // groups the ServiceCard with its dedicated "Book Now" CTA pill below.
