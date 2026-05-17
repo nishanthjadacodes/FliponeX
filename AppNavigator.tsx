@@ -33,6 +33,7 @@ const HomeHeaderButton: React.FC<{
 
 // ─── Customer screens ───────────────────────────────────────────────────
 import SplashScreen from './src/screens/SplashScreen';
+import FlashNotificationsScreen from './src/screens/FlashNotificationsScreen';
 import LanguageSelectScreen from './src/screens/LanguageSelectScreen';
 import ModeSelectScreen from './src/screens/ModeSelectScreen';
 import HomeScreen from './src/screens/HomeScreen';
@@ -237,6 +238,10 @@ const AppNavigator = () => {
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }} initialRouteName="Splash">
       <Stack.Screen name="Splash" component={SplashScreen} />
+      <Stack.Screen
+        name="FlashNotifications"
+        component={FlashNotificationsScreen}
+      />
       <Stack.Screen name="LanguageSelect" component={LanguageSelectScreen} />
       <Stack.Screen name="ModeSelect" component={ModeSelectScreen} />
 

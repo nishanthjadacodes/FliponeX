@@ -5,6 +5,10 @@ import type { NavigatorScreenParams } from '@react-navigation/native';
 
 export type RootStackParamList = {
   Splash: undefined;
+  // Pre-login splash banners (festive offers, important announcements).
+  // SplashScreen routes here when there's at least one unseen active
+  // notification; this screen then forwards to nextRoute on dismiss.
+  FlashNotifications: { nextRoute?: string; nextParams?: Record<string, unknown> } | undefined;
   LanguageSelect: undefined;
   ModeSelect: undefined;
 
