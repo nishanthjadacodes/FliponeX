@@ -76,7 +76,7 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   // to the full categorised view. Resets on B2B toggle so each mode
   // (consumer / industrial) starts collapsed again.
   const [showAllServices, setShowAllServices] = useState<boolean>(false);
-  const TOTAL_INITIAL_SERVICES = 8;
+  const TOTAL_INITIAL_SERVICES = 7;
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
@@ -1345,12 +1345,30 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
 
           return (
             <>
+              {/* Toggle pinned at the TOP of the services area — sits
+                  directly below the category chips strip so the user
+                  can flip between the compact 7-service home view and
+                  the full catalogue without scrolling. Right-aligned
+                  pill so it doesn't span the row. */}
+              {hasGlobalMore && (
+                <TouchableOpacity
+                  style={styles.globalViewAllBtn}
+                  onPress={() => {
+                    haptics.tap();
+                    setShowAllServices((v) => !v);
+                  }}
+                >
+                  <Text style={styles.globalViewAllBtnText}>
+                    {showAllServices
+                      ? `Show Less ↑`
+                      : `View All Services (${totalServicesCount}) →`}
+                  </Text>
+                </TouchableOpacity>
+              )}
+
               {visibleEntries.map(([category, items]: [string, any]) => (
                 <View key={category} style={styles.catSection}>
-                  {/* Section header — icon + name + count. The per-
-                      category "View All" link was removed in favour
-                      of a single global "View All Services" button
-                      below the entire visible slice. */}
+                  {/* Section header — icon + name + count. */}
                   <View style={styles.catHeader}>
                     <Text style={styles.catIcon}>{catIcon(category)}</Text>
                     <Text style={styles.catTitle}>{category}</Text>
@@ -1380,27 +1398,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                   />
                 </View>
               ))}
-
-              {/* Single global toggle below all visible categories.
-                  Only renders when there are more services to reveal.
-                  When expanded, the same button collapses everything
-                  back to the initial slice so the user can quickly
-                  return to a compact home view. */}
-              {hasGlobalMore && (
-                <TouchableOpacity
-                  style={styles.globalViewAllBtn}
-                  onPress={() => {
-                    haptics.tap();
-                    setShowAllServices((v) => !v);
-                  }}
-                >
-                  <Text style={styles.globalViewAllBtnText}>
-                    {showAllServices
-                      ? `Show Less ↑`
-                      : `View All Services (${totalServicesCount}) →`}
-                  </Text>
-                </TouchableOpacity>
-              )}
             </>
           );
         })()}
@@ -2366,29 +2363,26 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 0.2,
   },
-  // Single global "View All Services" CTA — sits below ALL visible
-  // category sections. Centered pill so it reads as a clear next step,
-  // not a tertiary inline link like the per-category View All used to.
+  // Right-aligned "View All Services / Show Less" link — sits below
+  // the visible categories, only as wide as the text + chip padding.
+  // Tucked to the right edge so it reads as a quiet secondary action
+  // (like Gmail/Inbox's "More" link) rather than a full-width primary
+  // CTA that would compete with the actual Book Now buttons inside
+  // the service cards above.
   globalViewAllBtn: {
-    marginTop: 12,
-    marginHorizontal: 16,
-    paddingVertical: 12,
-    paddingHorizontal: 18,
-    borderRadius: 12,
-    backgroundColor: '#0D3B66',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#0D3B66',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.18,
-    shadowRadius: 6,
-    elevation: 3,
+    marginTop: 10,
+    marginRight: 16,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    backgroundColor: '#E3F2FD',
+    alignSelf: 'flex-end',
   },
   globalViewAllBtnText: {
-    color: '#FFFFFF',
-    fontSize: 14,
+    color: '#1976D2',
+    fontSize: 12,
     fontWeight: '800',
-    letterSpacing: 0.3,
+    letterSpacing: 0.2,
   },
   // Each card slot in the vertical 2-column grid. The wrapping View
   // groups the ServiceCard with its dedicated "Book Now" CTA pill below.
