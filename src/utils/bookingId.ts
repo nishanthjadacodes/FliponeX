@@ -41,23 +41,32 @@ export const formatBookingId = (input: string | number | null | undefined): stri
 /**
  * Per-device sequential counter — used as a CLIENT-SIDE FALLBACK only when
  * the backend hasn't yet assigned a booking_number. Stored in AsyncStorage
- * so it persists across app restarts. Returns 1, 2, 3, …
+ * so it persists across app restarts. Returns 1000, 1001, 1002, … so the
+ * local fallback ID always reads as a real 4-digit order number (matches
+ * the backend's floor at 1000). Old devices that previously had a
+ * pre-1000 counter value are bumped to 1000 the next time this runs.
  *
  * Usage:
  *   const n = await nextLocalBookingNumber();
- *   const display = formatBookingId(n);   // "Flip#001"
+ *   const display = formatBookingId(n);   // "Flip#1000"
  *   const raw     = `BK${n}`;             // for backend submission
  */
 const COUNTER_KEY = '@flipon_local_booking_counter';
+const LOCAL_BOOKING_FLOOR = 1000;
 export const nextLocalBookingNumber = async (): Promise<number> => {
   try {
     const current = await AsyncStorage.getItem(COUNTER_KEY);
-    const next = (parseInt(current ?? '', 10) || 0) + 1;
+    const stored = parseInt(current ?? '', 10) || 0;
+    // Bump to floor on every read. If the device's counter is already
+    // above the floor we just increment normally; if it's below (older
+    // installs that ran with the pre-1000 fallback) we skip straight
+    // to 1000 so the next booking displays as Flip#1000.
+    const next = Math.max(stored + 1, LOCAL_BOOKING_FLOOR);
     await AsyncStorage.setItem(COUNTER_KEY, String(next));
     return next;
   } catch (_) {
-    // AsyncStorage failed — fall back to a low timestamp-derived number
-    // so the user still sees something short, not a 6-digit timestamp.
-    return Math.floor(Date.now() / 1000) % 999;
+    // AsyncStorage failed — fall back to a deterministic 4-digit number
+    // that's still ≥ floor so the displayed ID looks consistent.
+    return LOCAL_BOOKING_FLOOR + (Math.floor(Date.now() / 1000) % 9000);
   }
 };
