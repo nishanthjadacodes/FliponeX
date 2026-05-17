@@ -277,4 +277,9 @@ const styles = StyleSheet.create({
   },
 });
 
-export default ServiceCard;
+// React.memo so HomeScreen's View All ↔ Show Less toggle doesn't
+// rerender 156 cards when only `showAllServices` flipped. Default
+// shallow equality on `service` + `onPress` is enough — service
+// objects come from a stable API response, and HomeScreen wraps
+// onPress in useCallback.
+export default React.memo(ServiceCard);

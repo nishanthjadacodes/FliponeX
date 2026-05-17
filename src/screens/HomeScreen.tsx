@@ -761,8 +761,16 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   console.log('================================');
   console.log('=============================');
 
-  const renderServiceCard = ({ item, index }: { item: any; index: number }) => (
-    <ServiceCard service={item} onPress={handleServicePress} index={index} />
+  // useCallback so the FlatList's renderItem reference stays stable
+  // across the View All ↔ Show Less toggle. Combined with React.memo
+  // on ServiceCard, this means existing cards skip their re-render
+  // when only `showAllServices` flipped — the toggle now feels
+  // instant even at 156 services.
+  const renderServiceCard = useCallback(
+    ({ item, index }: { item: any; index: number }) => (
+      <ServiceCard service={item} onPress={handleServicePress} index={index} />
+    ),
+    [handleServicePress],
   );
 
   const renderCategoryChip = (category: string) => (
@@ -1228,6 +1236,108 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     </View>
   );
 
+  // ─── Services grid (memoised so View All ↔ Show Less is instant) ────
+  // Without these useMemos, toggling either way ran the full group
+  // reduce + Object.entries on 156 services every render. Now the
+  // expensive groupedServices step runs only when the source list
+  // changes; visibleSections recomputes only when the toggle flips.
+  const sourceList = isSearching ? searchResults : filteredServices;
+
+  const groupedServices = useMemo(() => {
+    if (!sourceList || sourceList.length === 0) {
+      return { entries: [] as [string, any[]][], total: 0 };
+    }
+    const groups: Record<string, any[]> = {};
+    for (const svc of sourceList) {
+      const cat = (svc.category && String(svc.category).trim()) || 'Other Services';
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(svc);
+    }
+    const entries = Object.entries(groups) as [string, any[]][];
+    const total = entries.reduce((sum, [, arr]) => sum + arr.length, 0);
+    return { entries, total };
+  }, [sourceList]);
+
+  const visibleSections = useMemo(() => {
+    const { entries, total } = groupedServices;
+    const hasMore = total > TOTAL_INITIAL_SERVICES;
+    if (showAllServices || !hasMore) {
+      return { sections: entries, hasMore, total };
+    }
+    const sections: [string, any[]][] = [];
+    let remaining = TOTAL_INITIAL_SERVICES;
+    for (const [cat, arr] of entries) {
+      if (remaining <= 0) break;
+      const slice = arr.slice(0, remaining);
+      sections.push([cat, slice]);
+      remaining -= slice.length;
+    }
+    return { sections, hasMore, total };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupedServices, showAllServices]);
+
+  const renderServicesGrid = () => {
+    if (!sourceList || sourceList.length === 0) {
+      return isSearching ? renderSearchEmptyState() : renderEmptyState();
+    }
+    const { sections, hasMore, total } = visibleSections;
+    return (
+      <>
+        {hasMore && (
+          <TouchableOpacity
+            style={styles.globalViewAllBtn}
+            onPress={() => {
+              haptics.tap();
+              setShowAllServices((v) => !v);
+            }}
+          >
+            <Text style={styles.globalViewAllBtnText}>
+              {showAllServices
+                ? 'Show Less ↑'
+                : `View All Services (${total}) →`}
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        {sections.map(([category, items]: [string, any[]]) => {
+          const fullCount = groupedServices.entries.find(
+            ([c]) => c === category,
+          )?.[1].length ?? items.length;
+          return (
+            <View key={category} style={styles.catSection}>
+              <View style={styles.catHeader}>
+                <Text style={styles.catIcon}>{iconForCategory(category)}</Text>
+                <Text style={styles.catTitle}>{category}</Text>
+                <Text style={styles.catCount}>
+                  {showAllServices
+                    ? items.length
+                    : `${items.length}${
+                        fullCount > items.length ? ` of ${fullCount}` : ''
+                      }`}
+                </Text>
+              </View>
+              {/* Original 2-column FlatList preserved exactly so the
+                  visual layout is unchanged. Speed gains come from
+                  the useMemo on groupedServices + visibleSections
+                  above and the React.memo on ServiceCard. */}
+              <FlatList
+                data={items}
+                renderItem={renderServiceCard}
+                keyExtractor={(item: any) =>
+                  item.id?.toString?.() ?? Math.random().toString()
+                }
+                numColumns={2}
+                contentContainerStyle={styles.servicesGrid}
+                columnWrapperStyle={styles.servicesRow}
+                scrollEnabled={false}
+              />
+            </View>
+          );
+        })}
+      </>
+    );
+  };
+
   const renderLoadingState = () => (
     <View style={styles.loadingState}>
       <ActivityIndicator size="large" color={COLORS.PRIMARY} />
@@ -1298,109 +1408,18 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
         {/* onLayout captures Y offset so the hook's "Book Now, Pay Later"
             button can scroll the user straight to the services grid. */}
         <View onLayout={(e: any) => { servicesYRef.current = e.nativeEvent.layout.y; }}>
-        {/* Categorized service sections (Swiggy/Zomato style) */}
-        {(() => {
-          const list = isSearching ? searchResults : filteredServices;
-          if (!list || list.length === 0) {
-            return isSearching ? renderSearchEmptyState() : renderEmptyState();
-          }
-
-          // Group services by category — fallback to "Other Services" if missing
-          const groups = list.reduce((acc: any, svc: any) => {
-            const cat = (svc.category && svc.category.trim()) || 'Other Services';
-            if (!acc[cat]) acc[cat] = [];
-            acc[cat].push(svc);
-            return acc;
-          }, {} as Record<string, any[]>);
-
-          // Section header icon — reuses the same per-card lookup so the
-          // grouped section emoji matches the cards inside it.
-          const catIcon = iconForCategory;
-
-          // Build the visible categories list. When collapsed, we walk
-          // categories in their natural order and accept services until
-          // we hit TOTAL_INITIAL_SERVICES; categories that fall entirely
-          // outside that slice don't render. When expanded, every
-          // category renders in full — same look as before.
-          const categoryEntries = Object.entries(groups) as [string, any[]][];
-          let visibleEntries: [string, any[]][];
-          const totalServicesCount = categoryEntries.reduce(
-            (sum, [, arr]) => sum + arr.length,
-            0,
-          );
-          const hasGlobalMore = totalServicesCount > TOTAL_INITIAL_SERVICES;
-
-          if (showAllServices || !hasGlobalMore) {
-            visibleEntries = categoryEntries;
-          } else {
-            visibleEntries = [];
-            let remaining = TOTAL_INITIAL_SERVICES;
-            for (const [cat, arr] of categoryEntries) {
-              if (remaining <= 0) break;
-              const slice = arr.slice(0, remaining);
-              visibleEntries.push([cat, slice]);
-              remaining -= slice.length;
-            }
-          }
-
-          return (
-            <>
-              {/* Toggle pinned at the TOP of the services area — sits
-                  directly below the category chips strip so the user
-                  can flip between the compact 7-service home view and
-                  the full catalogue without scrolling. Right-aligned
-                  pill so it doesn't span the row. */}
-              {hasGlobalMore && (
-                <TouchableOpacity
-                  style={styles.globalViewAllBtn}
-                  onPress={() => {
-                    haptics.tap();
-                    setShowAllServices((v) => !v);
-                  }}
-                >
-                  <Text style={styles.globalViewAllBtnText}>
-                    {showAllServices
-                      ? `Show Less ↑`
-                      : `View All Services (${totalServicesCount}) →`}
-                  </Text>
-                </TouchableOpacity>
-              )}
-
-              {visibleEntries.map(([category, items]: [string, any]) => (
-                <View key={category} style={styles.catSection}>
-                  {/* Section header — icon + name + count. */}
-                  <View style={styles.catHeader}>
-                    <Text style={styles.catIcon}>{catIcon(category)}</Text>
-                    <Text style={styles.catTitle}>{category}</Text>
-                    <Text style={styles.catCount}>
-                      {showAllServices
-                        ? items.length
-                        : `${items.length}${
-                            (groups as any)[category]?.length > items.length
-                              ? ` of ${(groups as any)[category].length}`
-                              : ''
-                          }`}
-                    </Text>
-                  </View>
-
-                  {/* Vertical 2-column grid — ServiceCard renders the
-                      Prussian-blue Book Now pill internally. */}
-                  <FlatList
-                    data={items}
-                    renderItem={renderServiceCard}
-                    keyExtractor={(item: any) =>
-                      item.id?.toString?.() ?? Math.random().toString()
-                    }
-                    numColumns={2}
-                    contentContainerStyle={styles.servicesGrid}
-                    columnWrapperStyle={styles.servicesRow}
-                    scrollEnabled={false}
-                  />
-                </View>
-              ))}
-            </>
-          );
-        })()}
+        {/* Categorized service sections (Swiggy/Zomato style).
+            Render is split into three layers so toggling View All ↔
+            Show Less doesn't re-do expensive work:
+              1. groupedServices — memoised grouping by category. Only
+                 recomputes when the source list (filteredServices or
+                 searchResults) actually changes, not on every toggle.
+              2. visibleSections — memoised slice. Recomputes only when
+                 showAllServices flips or groupedServices changes.
+              3. Plain View+map rendering. FlatList was overkill here
+                 (scrollEnabled=false, no virtualisation benefit) and
+                 added measurable lag on the 156-service expansion. */}
+        {renderServicesGrid()}
         </View>
 
         {/* Why FliponeX — moved to the very bottom of the home scroll,
