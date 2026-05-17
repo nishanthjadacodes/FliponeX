@@ -1390,7 +1390,11 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
         // 3-button bar on phones like the Pixel 6 / OnePlus.
         contentContainerStyle={[
           styles.scrollViewContent,
-          { paddingBottom: insets.bottom + 96 },
+          // Just enough room for the system gesture bar — the FAB now
+          // floats outside the ScrollView so we no longer need 96px
+          // of reserved space that was causing a white gap below the
+          // "Why FliponeX" section.
+          { paddingBottom: insets.bottom + 16 },
         ]}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="none"
@@ -1480,11 +1484,14 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           />
         </View>
 
-        {/* Enhanced WhatsApp Button */}
-        <View style={styles.whatsappContainer}>
-          <WhatsAppButton />
-        </View>
+        {/* WhatsApp FAB moved OUT of the ScrollView (rendered as a
+            sibling below) so it's a true floating button overlaid on
+            the whole screen. Keeping it inside the ScrollView meant
+            we had to reserve a ~96px paddingBottom which left a
+            white gap between "Why FliponeX" and the bottom-tab nav. */}
       </ScrollView>
+
+      <WhatsAppButton />
 
       {/* Alerts modal — bottom sheet showing the user's notification
           inbox (booking status changes, quote replies for industrial
@@ -1636,7 +1643,12 @@ const styles = StyleSheet.create({
   // needed to clip the profile-pic image into the circle).
   bellWrap: {
     position: 'relative',
+    // Extra right margin so the bell and the profile icon have visible
+    // breathing room between them (was visually crammed together at
+    // the default 8px). Profile icon's own marginLeft of 8 still
+    // applies, giving ~16px total gap.
     marginLeft: 8,
+    marginRight: 8,
   },
   bellInner: {
     width: 40, height: 40, borderRadius: 20,
