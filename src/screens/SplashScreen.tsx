@@ -198,7 +198,46 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           }
         };
 
-        const goToLogin = (loginRoute: 'Login' | 'AgentLogin'): void => {
+        // Probe /flash-notifications/active. Returns true only when at
+        // least one ACTIVE notification hasn't been dismissed on this
+        // device. Backend down / empty / all-seen → returns false so
+        // launch isn't blocked.
+        const hasUnseenFlashNotifications = async (): Promise<boolean> => {
+          try {
+            const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
+            const json = await resp.json();
+            const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
+            if (all.length === 0) return false;
+            const seenRaw = await AsyncStorage.getItem('@flipon_flash_notifications_seen');
+            const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
+            const seenSet = new Set(seen);
+            return all.some((n) => !seenSet.has(n.id));
+          } catch (_) {
+            return false;
+          }
+        };
+
+        const goToLogin = async (loginRoute: 'Login' | 'AgentLogin'): Promise<void> => {
+          // Customer login path → hop through FlashNotifications first
+          // when there's a pre-login splash banner to show. Mirrors the
+          // ModeSelect → customer tile flow so the banner always
+          // appears between any path → customer Login (warm-launch
+          // logged-out users would otherwise skip ModeSelect entirely
+          // and bypass the carousel). Agent login skips the hop.
+          if (loginRoute === 'Login' && (await hasUnseenFlashNotifications())) {
+            if (navigation.reset) {
+              navigation.reset({
+                index: 1,
+                routes: [
+                  { name: 'ModeSelect' },
+                  { name: 'FlashNotifications', params: { nextRoute: 'Login' } },
+                ],
+              });
+            } else {
+              navigation.replace?.('FlashNotifications', { nextRoute: 'Login' });
+            }
+            return;
+          }
           if (navigation.reset) {
             navigation.reset({
               index: 1,
@@ -219,7 +258,7 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           const guest = isGuestUser(userRaw, '1111111111');
           if (!existing || demoOrOffline || guest) {
             await AsyncStorage.multiRemove(['agent_token', 'agent_data']);
-            goToLogin('AgentLogin');
+            await goToLogin('AgentLogin');
             return;
           }
           navigation.replace?.('AgentTabs');
@@ -232,7 +271,7 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           const guest = isGuestUser(userRaw, '0000000000');
           if (!existing || guest) {
             await AsyncStorage.multiRemove(['token', 'user', 'auth_token']);
-            goToLogin('Login');
+            await goToLogin('Login');
             return;
           }
           navigation.replace?.('HomeTabs');
