@@ -1815,6 +1815,49 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   const customerBase = userCost > 0 ? userCost : totalExpense;
   const doorstepCharges = Math.max(0, customerBase - govtFees);
 
+  // ── Display-only customer-facing split ───────────────────────────
+  // The internal rate-chart numbers (govtFees / partnerEarning /
+  // companyMargin) are used by finance + agent commission. The user
+  // wants the Payment Summary card to instead show TWO friendlier
+  // lines that always sum to the list price:
+  //   • Basic / Government Fees   — pseudo-random, ≥ ₹100
+  //   • Doorstep / Convenience    — remainder, ≥ ₹0
+  // Stable across sessions for the same service (seeded by service id)
+  // so the customer sees the same numbers every time they reopen the
+  // booking. NOT sent to the backend — booking payload still carries
+  // the real rate-chart split so company_margin reporting stays
+  // accurate.
+  const computeDisplaySplit = (
+    seed: string,
+    total: number,
+  ): { govt: number; doorstep: number } => {
+    if (!Number.isFinite(total) || total <= 0) return { govt: 0, doorstep: 0 };
+    let h = 2166136261;
+    for (let i = 0; i < seed.length; i += 1) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    h = Math.abs(h | 0);
+    const FLOOR = 100;
+    if (total <= FLOOR + 50) {
+      // Service is too cheap for a govt-fee ≥ 100 split with leftover.
+      // Clamp govt to most of the price, leave a small doorstep tail.
+      const govt = Math.max(0, total - 50);
+      return { govt, doorstep: total - govt };
+    }
+    const lower = FLOOR;
+    const upper = Math.max(FLOOR + 1, total - 50);
+    const govt = lower + (h % (upper - lower + 1));
+    return { govt, doorstep: total - govt };
+  };
+
+  const displaySplit = computeDisplaySplit(
+    String(serviceData?.id || serviceData?.name || ''),
+    customerBase,
+  );
+  const displayGovtFees = displaySplit.govt;
+  const displayDoorstepCharges = displaySplit.doorstep;
+
   // Optional add-ons — derived from the customer-facing base price
   // so percentages stay sensible. Keep small floors so a tiny service
   // doesn't show ₹5 line items.
@@ -2625,12 +2668,27 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         ];
       }
 
+      // Mirror the render path (line ~3276) which falls back to
+      // `doc_${index}` when the service's required-doc entry has no
+      // explicit `type` (e.g. AAPS2.0 and other non-priced services
+      // that list generic "Document 1 / Document 2" slots). Without
+      // this fallback the validation kept reporting docs as missing
+      // even after the user uploaded them, because uploaded.type was
+      // `doc_0` but d.type was undefined — never matched. Pair each
+      // required doc with its ORIGINAL index before filtering so the
+      // synthesised type ids stay stable.
       const missing = requiredDocs
-        .filter((d: any) => d?.required !== false)
-        .filter((d: any) => !uploadedDocuments.find((u: any) => u.type === d.type));
+        .map((d: any, idx: number) => ({ d, idx }))
+        .filter(({ d }) => d?.required !== false)
+        .filter(({ d, idx }) => {
+          const expectedType = d?.type || `doc_${idx}`;
+          return !uploadedDocuments.find((u: any) => u.type === expectedType);
+        });
 
       if (missing.length > 0) {
-        const labels = missing.map((d: any) => d.label || d.type).join(', ');
+        const labels = missing
+          .map(({ d, idx }) => d?.label || d?.type || `Document ${idx + 1}`)
+          .join(', ');
         return { ok: false, message: `Please upload: ${labels}.` };
       }
       return { ok: true };
@@ -2815,7 +2873,15 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         dynamic_fields: { ...aadhaarFormPayload, ...dynamicFieldValues },
         mobile: mobile || userMobile,
         date_of_birth: dateOfBirth,
-        address: address,
+        // Address payload — when the user picked "Use my location",
+        // send the captured GPS coordinates as a JSON object so the
+        // agent app can compute the distance directly via Haversine,
+        // bypassing Android's flaky text geocoder. When the user typed
+        // a free-text address, send it as a plain string (backend's
+        // JSON column accepts either shape).
+        address: latitude && longitude
+          ? { latitude, longitude, formatted: address }
+          : address,
         selected_date: selectedDate,
         selected_time_slot: selectedTimeSlot,
         service_mode: serviceMode,
@@ -2861,6 +2927,23 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           const createdId = apiResponse?.data?.id || apiResponse?.id;
           if (createdId) {
             bookingData.id = createdId;
+            // CRITICAL: overwrite the locally-assigned `BK<n>` fallback
+            // with the backend's real sequential booking_number (floors
+            // at 1000). Without this overwrite, My Bookings keeps
+            // showing the pre-1000 local counter (e.g. Flip#0073) even
+            // though the backend assigned Flip#1003. We also accept
+            // booking_no / orderNumber / ref as backwards-compat
+            // aliases in case the backend response shape varies.
+            const backendNumber =
+              apiResponse?.data?.booking_number ??
+              apiResponse?.booking_number ??
+              apiResponse?.data?.booking_no ??
+              apiResponse?.data?.orderNumber ??
+              apiResponse?.data?.ref;
+            if (backendNumber != null && backendNumber !== '') {
+              bookingData.booking_number = backendNumber;
+              console.log('[booking] backend assigned booking_number:', backendNumber);
+            }
             bookingCreated = true;
             // Backend may include the auto-assigned agent in the create response.
             assignedAgentName =
@@ -2877,6 +2960,23 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           console.error('Error response data:', serverError.response?.data);
           console.error('Error status:', serverError.response?.status);
           console.error('Error headers:', serverError.response?.headers);
+
+          // Backend rejected this submission as an exact duplicate of an
+          // earlier booking (same service / date / time / address / amount
+          // / applicant). Don't retry — that's the same payload that just
+          // got refused — and surface the message to the user with a way
+          // to differentiate (change the applicant name).
+          if (serverError?.code === 'DUPLICATE_BOOKING') {
+            setLoading(false);
+            Alert.alert(
+              'Already booked',
+              serverError.message ||
+                'A booking with these exact details already exists. ' +
+                  'Change the applicant name or modify the details to proceed.',
+              [{ text: 'OK' }],
+            );
+            return;
+          }
 
           // If it's a validation error (400), log the specific validation issues
           if (serverError.response?.status === 400) {
@@ -3257,7 +3357,17 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             {requiredDocs.length > 0 ? (
               requiredDocs.map((doc: any, index: number) => {
                 const type = doc?.type || `doc_${index}`;
-                const label = doc?.label || doc?.type || `Document ${index + 1}`;
+                const rawLabel = doc?.label || doc?.type || `Document ${index + 1}`;
+                // Friendly-label rewrite. Backend seeds some services with
+                // bare "Email ID" / "Mobile Number" labels which sound
+                // like the user has to upload an email address rather
+                // than a proof document. Append " Proof" so the user
+                // knows we want a document scan, not the value itself.
+                const label = /^email\s*id$/i.test(rawLabel)
+                  ? 'Email ID Proof'
+                  : /^mobile\s*(no\.?|number)?$/i.test(rawLabel)
+                    ? 'Mobile Number Proof'
+                    : rawLabel;
                 const uploaded = uploadedDocuments.find((d: any) => d.type === type);
                 const isUploading = uploadProgress[type];
                 const isImage =
@@ -3641,9 +3751,19 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               <Text style={styles.psTitle}>Payment Summary</Text>
               <View style={styles.psDivider} />
 
+              {/* Customer-facing breakdown — two mandatory lines that
+                  always sum to the list price. Replaces the single
+                  "Service Fee" row so the bill spells out exactly what
+                  the user is paying for. Internal rate-chart split is
+                  preserved on the booking payload for finance
+                  reporting; this card is display-only. */}
               <View style={styles.psRow}>
-                <Text style={styles.psMandatoryLabel}>Service Fee</Text>
-                <Text style={styles.psMandatoryValue}>₹ {customerBase}</Text>
+                <Text style={styles.psMandatoryLabel}>Basic / Government Fees</Text>
+                <Text style={styles.psMandatoryValue}>₹ {displayGovtFees}</Text>
+              </View>
+              <View style={styles.psRow}>
+                <Text style={styles.psMandatoryLabel}>Doorstep / Convenience Charges</Text>
+                <Text style={styles.psMandatoryValue}>₹ {displayDoorstepCharges}</Text>
               </View>
 
               {/* Opt-in add-ons — checkboxes, dynamically affect total */}
