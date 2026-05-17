@@ -78,7 +78,7 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
     new Set(),
   );
-  const INITIAL_SERVICES_PER_CAT = 4;
+  const INITIAL_SERVICES_PER_CAT = 6;
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
@@ -434,17 +434,20 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
       }
     }
 
-    // Fallback path — focus input + show the keyboard so the user can
-    // use Gboard's built-in mic. Same end result (text in searchQuery
-    // → debounced search → suggestions), just one extra tap.
+    // Fallback path — runs when @react-native-voice/voice native code
+    // isn't compiled into the APK. Focus the input + show the keyboard
+    // so the user can fall back to Gboard's mic key. Once the package
+    // has been npm-installed AND prebuild + assembleRelease have run,
+    // this branch stops firing and real in-app STT takes over.
     searchInputRef.current?.focus?.();
     setTimeout(() => {
       const y = Math.max(0, (searchYRef.current || 0) - 12);
       scrollRef.current?.scrollTo({ y, animated: true });
     }, 60);
     Alert.alert(
-      'Voice Search',
-      "Tap the 🎤 mic on your keyboard and say the service name (e.g. \"Aadhaar update\", \"PAN card\", \"Voter ID\"). Suggestions will appear as you speak.",
+      'Voice not enabled yet',
+      "In-app voice search needs the @react-native-voice/voice native module — your current APK was built before it was installed.\n\n" +
+        "For now, tap the 🎤 mic on your keyboard and say the service name. Your build needs to be re-prebuilt + reinstalled before the in-app mic starts capturing speech.",
       [{ text: 'Got it' }],
       { cancelable: true },
     );
@@ -1110,30 +1113,9 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
               <Text style={styles.inlineSearchClear}>✕</Text>
             </TouchableOpacity>
           )}
-          {/* Voice search trigger — taps in to @react-native-voice
-              when available; whatever the user speaks lands in the
-              search input via the existing onResults handler. Pulses
-              red while listening so it reads as "I'm hearing you".
-              Falls back silently when the native module isn't
-              compiled in (older dev-client APKs). */}
-          <TouchableOpacity
-            onPress={handleVoiceSearch}
-            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-            style={[
-              styles.inlineSearchMicBtn,
-              voiceListening && styles.inlineSearchMicBtnActive,
-            ]}
-            accessibilityLabel={voiceListening ? 'Stop listening' : 'Voice search'}
-          >
-            <Text
-              style={[
-                styles.inlineSearchMicIcon,
-                voiceListening && styles.inlineSearchMicIconActive,
-              ]}
-            >
-              🎤
-            </Text>
-          </TouchableOpacity>
+          {/* In-app mic button removed per request. If users need voice
+              entry, the device keyboard's own mic key still works since
+              the TextInput honors standard IME voice input. */}
         </View>
 
         {searchQuery.length > 0 && (
@@ -2853,12 +2835,17 @@ const styles = StyleSheet.create({
   inlineSearchMicBtnActive: {
     backgroundColor: '#E63946',
   },
-  inlineSearchMicIcon: {
-    fontSize: 14,
-    color: '#0D3B66',
+  // PNG mic icon (assets/voice.png). The asset is white-on-transparent,
+  // so we tint it with `tintColor` to blend into the gray chip. When
+  // listening the chip flips red and we drop the tint so the icon's
+  // native white shows through, mirroring Google's voice-search UI.
+  inlineSearchMicImg: {
+    width: 18,
+    height: 18,
+    tintColor: '#0D3B66',
   },
-  inlineSearchMicIconActive: {
-    color: '#FFFFFF',
+  inlineSearchMicImgActive: {
+    tintColor: '#FFFFFF',
   },
   // (Voice mic image style removed — the inline button was dropped
   // from the search bar. Use the keyboard's built-in mic key for
