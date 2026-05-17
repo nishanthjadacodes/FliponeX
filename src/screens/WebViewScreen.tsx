@@ -185,6 +185,20 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
           console.log('[webview] HTTP', nativeEvent?.statusCode, nativeEvent?.url);
         }}
         onNavigationStateChange={(s: any) => setCanGoBack(!!s?.canGoBack)}
+        // Channel for the embedded web app (admin dashboard, customer
+        // website) to signal back to native. Used today for: the admin
+        // dashboard's Logout button — it calls
+        //   window.ReactNativeWebView.postMessage('LOGOUT')
+        // which lands here, and we return to the previous screen
+        // (ModeSelectScreen, since that's the only thing that opens
+        // WebViewScreen). Same channel can carry future events without
+        // adding more URL-intercept plumbing.
+        onMessage={(event: any) => {
+          const data = String(event?.nativeEvent?.data || '');
+          if (data === 'LOGOUT' || data === 'BACK_TO_MODE_SELECT') {
+            navigation.goBack();
+          }
+        }}
         javaScriptEnabled
         domStorageEnabled
         sharedCookiesEnabled
