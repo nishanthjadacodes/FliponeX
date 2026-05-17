@@ -16,6 +16,7 @@ import {
   Share,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import MaterialIcon from 'react-native-vector-icons/MaterialIcons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
 import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
@@ -114,9 +115,14 @@ const monthKey = (iso: string): string => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 };
 
+// "yellow" status (action-soon, <=60 days) maps to ACCENT — the same
+// gold-yellow used for the critical "Plan renewal" chip. WARNING is
+// an orange tone reserved for harsher signals; using it here made
+// the action-soon state read as alarming and inconsistent with the
+// rest of the compliance UI.
 const statusColor = (s: ComplianceDoc['status']): string => {
   if (s === 'red') return COLORS.ERROR;
-  if (s === 'yellow') return COLORS.WARNING;
+  if (s === 'yellow') return COLORS.ACCENT;
   return COLORS.SUCCESS;
 };
 
@@ -864,7 +870,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 <Text style={styles.calendarLegendText}>Critical (≤30 days)</Text>
               </View>
               <View style={styles.calendarLegendItem}>
-                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.WARNING }]} />
+                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.ACCENT }]} />
                 <Text style={styles.calendarLegendText}>Action soon (≤60 days)</Text>
               </View>
               <View style={styles.calendarLegendItem}>
@@ -882,7 +888,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                   m.status === 'red'
                     ? COLORS.ERROR
                     : m.status === 'yellow'
-                      ? COLORS.WARNING
+                      ? COLORS.ACCENT
                       : m.status === 'green'
                         ? COLORS.SUCCESS
                         : null;
@@ -941,8 +947,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 setUploadOpen(true);
               }}
             >
-              <Text style={styles.rowAddBtnText}>Row Add Button</Text>
-              <Text style={styles.rowAddPlus}>+</Text>
+              <Text style={styles.rowAddBtnText}>Add  +</Text>
             </TouchableOpacity>
           </>
         ) : (
@@ -975,7 +980,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                     <Text style={[styles.cellDate, styles.regHeaderText]}>Date of Issue</Text>
                     <Text style={[styles.cellDate, styles.regHeaderText]}>Valid Upto</Text>
                     <Text style={[styles.cellStatus, styles.regHeaderText]}>Status</Text>
-                    <Text style={[styles.cellPdf, styles.regHeaderText]}>PDF/JPEG</Text>
+                    <Text style={[styles.cellPdfWrap, styles.regHeaderText]}>PDF/JPEG</Text>
                   </View>
 
                   {/* Data rows — sorted by urgency (most critical first) */}
@@ -1028,26 +1033,53 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                               : ''}
                           </Text>
                         </View>
-                        <TouchableOpacity
-                          style={styles.cellPdf}
-                          onPress={(e) => {
-                            e.stopPropagation();
-                            handlePreview(d);
-                          }}
-                        >
-                          {previewingId === d.id ? (
-                            <ActivityIndicator size="small" color={COLORS.PRIMARY} />
-                          ) : (
-                            <View style={styles.pdfThumb}>
-                              <Text style={styles.pdfThumbIcon}>
-                                {d.mime_type?.includes('pdf') ? '📄' : '🖼️'}
-                              </Text>
-                              <Text style={styles.pdfThumbText} numberOfLines={1}>
-                                View
-                              </Text>
-                            </View>
-                          )}
-                        </TouchableOpacity>
+                        <View style={styles.cellPdfWrap}>
+                          <TouchableOpacity
+                            style={styles.cellPdfPreview}
+                            onPress={(e) => {
+                              e.stopPropagation();
+                              handlePreview(d);
+                            }}
+                          >
+                            {previewingId === d.id ? (
+                              <ActivityIndicator size="small" color={COLORS.PRIMARY} />
+                            ) : (
+                              <View style={styles.pdfThumb}>
+                                <Text style={styles.pdfThumbIcon}>
+                                  {d.mime_type?.includes('pdf') ? '📄' : '🖼️'}
+                                </Text>
+                                <Text style={styles.pdfThumbText} numberOfLines={1}>
+                                  View
+                                </Text>
+                              </View>
+                            )}
+                          </TouchableOpacity>
+                          {/* Quick delete — removes the row from the
+                              register without having to open the edit
+                              sheet first. Same confirmation dialog the
+                              edit-sheet button uses, so the destructive
+                              action still needs explicit confirmation. */}
+                          <TouchableOpacity
+                            style={styles.cellDeleteBtn}
+                            onPress={(e) => {
+                              e.stopPropagation();
+                              confirmDelete(d);
+                            }}
+                            disabled={deletingId === d.id}
+                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          >
+                            {deletingId === d.id ? (
+                              <ActivityIndicator size="small" color="#0F172A" />
+                            ) : (
+                              // Line-drawing trash can (MaterialIcons
+                              // delete-outline) — matches the reference
+                              // icon. Rendered in slate-900 with no
+                              // background fill per the request to drop
+                              // the red chip styling.
+                              <MaterialIcon name="delete-outline" size={22} color="#0F172A" />
+                            )}
+                          </TouchableOpacity>
+                        </View>
                       </TouchableOpacity>
                     );
                   })}
@@ -1062,8 +1094,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                   setUploadOpen(true);
                 }}
               >
-                <Text style={styles.rowAddBtnText}>Row Add Button</Text>
-                <Text style={styles.rowAddPlus}>+</Text>
+                <Text style={styles.rowAddBtnText}>Add  +</Text>
               </TouchableOpacity>
             </View>
 
@@ -1692,6 +1723,25 @@ const styles = StyleSheet.create({
   cellDate: { width: 90, fontSize: 11, color: COLORS.TEXT, paddingHorizontal: 6 },
   cellStatus: { width: 100, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
   cellPdf: { width: 70, alignItems: 'center', justifyContent: 'center' },
+  // Two-up wrapper: preview tile on the left, trash button on the right.
+  // Width matches the column header so the table stays aligned.
+  cellPdfWrap: {
+    width: 100,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  cellPdfPreview: { alignItems: 'center', justifyContent: 'center' },
+  // Transparent delete button — icon-only, no red chip background.
+  // Matches the line-drawing trash reference and keeps the table row
+  // visually quiet so the data (status pill, doc preview) reads first.
+  cellDeleteBtn: {
+    width: 36,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   // Renamed from statusPill / statusPillText to avoid collision with the
   // existing card view's status badges.
   regStatusPill: {
@@ -1743,13 +1793,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: COLORS.ERROR,
     letterSpacing: 0.3,
-    marginBottom: 4,
-  },
-  rowAddPlus: {
-    color: COLORS.ERROR,
-    fontSize: 22,
-    fontWeight: '900',
-    lineHeight: 22,
   },
 
   // Inline-edit modal — Remove-row button
