@@ -167,42 +167,11 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
     // surface (LanguageSelect first time / ModeSelect / Login / Tabs).
     // Stamps the splash-seen flag so the next launch skips the
     // animated entrance.
-    // Check whether any unseen flash notifications are active. If yes,
-    // route via FlashNotifications first (which then hops to the real
-    // target on dismiss). If the backend is down OR everything's
-    // already seen, fall through to the normal route immediately so
-    // launch isn't blocked.
-    const shouldShowFlashNotifications = async (): Promise<boolean> => {
-      try {
-        const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
-        const json = await resp.json();
-        const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
-        if (all.length === 0) return false;
-        const seenRaw = await AsyncStorage.getItem('@flipon_flash_notifications_seen');
-        const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-        const seenSet = new Set(seen);
-        return all.some((n) => !seenSet.has(n.id));
-      } catch (_) {
-        return false;
-      }
-    };
-
-    // Wraps navigation.replace so we transparently insert
-    // FlashNotifications when there's something unseen to show.
-    // For routes that need a multi-step reset (Login lands AFTER
-    // ModeSelect in the stack), we pass nextRoute and let
-    // FlashNotificationsScreen reset to the right destination.
-    const routeWithFlash = async (target: string, params?: any): Promise<void> => {
-      const showFlash = await shouldShowFlashNotifications();
-      if (showFlash) {
-        navigation.replace?.('FlashNotifications', {
-          nextRoute: target,
-          nextParams: params,
-        });
-      } else {
-        navigation.replace?.(target, params);
-      }
-    };
+    // Flash notifications used to be inserted here, but per spec they
+    // should appear AFTER the user picks "Customer App" on
+    // ModeSelectScreen — not before the splash animation. The
+    // splash-side hop was removed; ModeSelectScreen.pickMobile()
+    // handles the carousel detour for the customer tile only.
 
     const runRouting = async (): Promise<void> => {
       AsyncStorage.setItem(SPLASH_SEEN_KEY, 'true').catch(() => {});
@@ -253,7 +222,7 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
             goToLogin('AgentLogin');
             return;
           }
-          await routeWithFlash('AgentTabs');
+          navigation.replace?.('AgentTabs');
           return;
         }
 
@@ -266,11 +235,11 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
             goToLogin('Login');
             return;
           }
-          await routeWithFlash('HomeTabs');
+          navigation.replace?.('HomeTabs');
           return;
         }
 
-        await routeWithFlash('ModeSelect');
+        navigation.replace?.('ModeSelect');
       } catch (e: any) {
         console.log('[splash] routing error:', e?.message);
         navigation.replace?.('ModeSelect');

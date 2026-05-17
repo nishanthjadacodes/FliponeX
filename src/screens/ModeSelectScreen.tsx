@@ -9,10 +9,11 @@ import {
   StatusBar,
   ScrollView,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   setUserMode,
 } from '../utils/storage';
-import { ADMIN_DASHBOARD_URL, CUSTOMER_WEBSITE_URL } from '../config';
+import { ADMIN_DASHBOARD_URL, CUSTOMER_WEBSITE_URL, API_BASE_URL } from '../config';
 
 interface ModeSelectScreenProps {
   navigation: {
@@ -56,13 +57,41 @@ const ModeSelectScreen: React.FC<ModeSelectScreenProps> = ({ navigation }) => {
   // ping-ponged. Routing on warm launch now happens once in Splash; this
   // screen always shows the picker so the user can switch modes.
 
+  // Probe the public flash-notifications endpoint. Returns true only
+  // when at least one ACTIVE notification hasn't been dismissed on
+  // this device. Backend down / empty list → returns false so the
+  // user goes straight to the login screen (never blocks launch).
+  const hasUnseenFlashNotifications = async (): Promise<boolean> => {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
+      const json = await resp.json();
+      const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
+      if (all.length === 0) return false;
+      const seenRaw = await AsyncStorage.getItem('@flipon_flash_notifications_seen');
+      const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
+      const seenSet = new Set(seen);
+      return all.some((n) => !seenSet.has(n.id));
+    } catch (_) {
+      return false;
+    }
+  };
+
   // Picking a mode pushes (not replaces) the corresponding LOGIN screen
   // so the back button lands the user back on this toggle page.
+  // For the CUSTOMER tile only, we first hop through the
+  // FlashNotifications carousel when there are unseen splash banners
+  // (festive offers, important announcements) — the carousel forwards
+  // to Login on dismiss. Agent path skips the splash banner step
+  // because flash notifications target the consumer audience.
   const pickMobile = async (mode: MobileMode): Promise<void> => {
     if (busy) return;
     setBusy(true);
     await setUserMode(mode);
-    navigation.navigate(mode === 'agent' ? 'AgentLogin' : 'Login');
+    if (mode === 'customer' && (await hasUnseenFlashNotifications())) {
+      navigation.navigate('FlashNotifications', { nextRoute: 'Login' });
+    } else {
+      navigation.navigate(mode === 'agent' ? 'AgentLogin' : 'Login');
+    }
     setBusy(false);
   };
 
