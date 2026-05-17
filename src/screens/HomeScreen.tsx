@@ -32,7 +32,8 @@ import {
   markNotificationRead,
 } from '../services/api';
 import type { Service, OfferItem, InboxItem } from '../services/api';
-import { getUser, clearAuthSession } from '../utils/storage';
+import { getUser, storeUser, clearAuthSession } from '../utils/storage';
+import { getProfile } from '../services/api';
 import B2BToggle from '../components/B2BToggle';
 import ServiceCard, { iconForCategory } from '../components/ServiceCard';
 import * as haptics from '../utils/haptics';
@@ -67,6 +68,17 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const [error, setError] = useState<any>(null);
   const [user, setUser] = useState<any>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  // Per-category expansion state for the home services grid. By default
+  // each category shows only the first INITIAL_SERVICES_PER_CAT items
+  // so the home screen fits more sections on one screen; tapping
+  // "View All" expands that category in-place to reveal the rest.
+  // Stored as a Set so toggling is O(1) and adding new categories is
+  // free. Resets on B2B toggle / category-chip filter via the user's
+  // navigation away + back.
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
+    new Set(),
+  );
+  const INITIAL_SERVICES_PER_CAT = 4;
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [showSearchModal, setShowSearchModal] = useState<boolean>(false);
@@ -445,12 +457,38 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     handleServicePress(service);
   }, []);
 
+  // Two-pass user load:
+  //   1. Read the AsyncStorage cache and render immediately (fast,
+  //      offline-safe).
+  //   2. In the background, hit GET /profile and merge the freshest
+  //      profile_pic / name back into the cache. This stops the header
+  //      avatar from "going missing" after an app restart — the cache
+  //      can get overwritten by guest-login fallback or older payloads
+  //      that don't include profile_pic, while the backend always has
+  //      the truth. Re-syncing here keeps AsyncStorage authoritative.
   const loadUserData = async (): Promise<void> => {
     try {
-      const userData = await getUser();
-      setUser(userData);
+      const cached = await getUser();
+      if (cached) setUser(cached);
     } catch (error) {
-      console.error('Error loading user data:', error);
+      console.error('Error loading cached user data:', error);
+    }
+
+    try {
+      const resp: any = await getProfile();
+      const fresh: any = resp?.user || resp?.data || resp || null;
+      if (fresh && typeof fresh === 'object') {
+        const cached: any = (await getUser()) || {};
+        // Merge so any local-only fields stay; backend wins for any
+        // canonical fields (profile_pic, name, mobile, email, etc.).
+        const merged = { ...cached, ...fresh };
+        await storeUser(merged);
+        setUser(merged);
+      }
+    } catch (error) {
+      // Backend unreachable — keep the cached value we already set above.
+      // Don't surface this to the user; the home screen still renders.
+      console.log('[home] background profile refresh failed:', (error as any)?.message);
     }
   };
 
@@ -762,10 +800,33 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             Flipone<Text style={styles.brandNameAccent}>X</Text> Digital
           </Text>
           <View style={styles.brandTagline}>
-            <Text style={styles.brandTaglineText}>Doorstep Digital Service</Text>
+            <Text style={styles.brandTaglineText}>Doorstep Digital Services</Text>
           </View>
         </View>
         <View style={styles.headerActions}>
+          {/* Alerts bell — left of the profile icon. Replaces the
+              in-body "Alerts" chip that used to sit between the quad
+              cards and the Common/Industrial toggle. Badge appears
+              when there are unread inbox items. Wrapped in a separate
+              container so the unread-count badge can poke outside the
+              circle without disabling the profile-pic clip. */}
+          <View style={styles.bellWrap}>
+            <TouchableOpacity
+              style={styles.bellInner}
+              onPress={openAlerts}
+              accessibilityLabel="Open alerts"
+            >
+              <Text style={styles.iconButtonText}>🔔</Text>
+            </TouchableOpacity>
+            {inboxUnread > 0 && (
+              <View style={styles.headerBellBadge} pointerEvents="none">
+                <Text style={styles.headerBellBadgeText}>
+                  {inboxUnread > 99 ? '99+' : inboxUnread}
+                </Text>
+              </View>
+            )}
+          </View>
+
           {/* Single avatar button — opens Profile. Surfaces, in order:
                 1. profile_pic if uploaded (real photo)
                 2. first letter of user.name if set
@@ -995,144 +1056,27 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
         </TouchableOpacity>
       </View>
 
-      {/* Quick actions — Rewards + Alerts as a 2-up row that spans the
-          full home screen width. Was previously a horizontal ScrollView
-          with auto-width chips, which left a big empty strip on the
-          right side of the screen on most phones. */}
-      <View style={styles.quickStrip}>
-        <TouchableOpacity
-          style={styles.quickChip}
-          onPress={() => handleQuickAction('rewards')}
-        >
-          <Text style={styles.quickChipIcon}>🏆</Text>
-          <Text style={styles.quickChipText}>Rewards</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.quickChip} onPress={openAlerts}>
-          <Text style={styles.quickChipIcon}>🔔</Text>
-          <Text style={styles.quickChipText}>Alerts</Text>
-          {inboxUnread > 0 && (
-            <View style={styles.alertsBadge}>
-              <Text style={styles.alertsBadgeText}>
-                {inboxUnread > 99 ? '99+' : inboxUnread}
-              </Text>
-            </View>
-          )}
-        </TouchableOpacity>
-      </View>
-
-      <B2BToggle onToggle={handleB2BToggle} currentMode={serviceType} />
-
-      {/* 30-day Critical Compliance Alert — only renders when the user has
-          at least one document expiring in <30 days. Spec wording exactly:
-          "Action Required Immediately to avoid penalties!" */}
+      {/* 30-day Critical Compliance Alert — only renders when the user
+          has at least one document expiring in <30 days. Sits directly
+          below the quad cards (Book New / My Bookings / KYC Documents /
+          Refer & Earn) so the "Action Required Immediately" prompt is
+          the first thing the user sees after the primary actions. Spec
+          wording exactly: "Action Required Immediately to avoid
+          penalties!". The previous Rewards + Alerts chip strip that
+          used to live between the cards and the toggle was removed —
+          Alerts moved to the header bell (top-right, left of avatar)
+          and Rewards became a Profile-screen entry. */}
       <ComplianceRedAlertBanner
         onPress={() => navigation.navigate('Compliance')}
       />
 
-      {/* ─── Trending Services — auto-rotates every 3s, same native-
-          thread AutoCarousel pattern used by the trust strip above.
-          Diversified across categories (Aadhaar / PAN / GST / Ayushman /
-          Voter ID / PF / Driving Licence / Passport) by the
-          `displayedTrending` memo so the strip never collapses to a
-          single category. */}
-      {displayedTrending.length > 0 && (
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>📈 Trending Services</Text>
-          <AutoCarousel
-            items={displayedTrending}
-            cardWidth={150}
-            intervalMs={3000}
-            slideDurationMs={650}
-            renderItem={(item: any) => (
-              <TouchableOpacity
-                key={item.id}
-                style={styles.trendingCard}
-                activeOpacity={0.85}
-                onPress={() => navigation.navigate('ServiceDetails', { serviceId: item.id })}
-              >
-                <Text style={styles.trendingName} numberOfLines={2}>{item.name}</Text>
-                <Text style={styles.trendingPrice}>
-                  ₹{item.user_cost ?? item.total_expense ?? 0}
-                </Text>
-                <View style={styles.trendingCta}>
-                  <Text style={styles.trendingCtaText}>Book Now</Text>
-                </View>
-              </TouchableOpacity>
-            )}
-            style={{ paddingHorizontal: 6 }}
-          />
-        </View>
-      )}
+      <B2BToggle onToggle={handleB2BToggle} currentMode={serviceType} />
 
-      {/* ─── Promo strip — single horizontal auto-rotating row of all
-          4 hero banners (Consumer / Industrial / Fast Track / Referral).
-          Replaces the old standalone Fast Track full-width banner so the
-          home screen surfaces every value prop in one compact strip.
-          Each card is tinted to match its bannerType and routes the user
-          to the most relevant flow on tap. */}
-      <View style={{ marginTop: 6, marginBottom: 6 }}>
-        <Text style={styles.bannerSectionTitle}>✨ Why FliponeX</Text>
-        <AutoCarousel
-          items={HERO_BANNERS}
-          cardWidth={240}
-          intervalMs={3200}
-          slideDurationMs={650}
-          renderItem={(banner: any) => (
-            <TouchableOpacity
-              activeOpacity={0.9}
-              onPress={() => {
-                haptics.tap();
-                // Route per bannerType — Fast Track + Consumer → scroll
-                // to services in consumer mode; Industrial → switch to
-                // B2B mode + scroll; Referral → Refer & Earn screen.
-                const t = String(banner?.bannerType || '').toLowerCase();
-                if (t.includes('industrial')) {
-                  handleB2BToggle('industrial');
-                  scrollToServices();
-                } else if (t.includes('referral')) {
-                  handleShareApp();
-                } else {
-                  handleB2BToggle('consumer');
-                  scrollToServices();
-                }
-              }}
-              style={[
-                styles.heroBannerCard,
-                { backgroundColor: banner.tint, marginHorizontal: 5 },
-              ]}
-            >
-              <View style={styles.heroBannerLeft}>
-                <View style={[styles.heroBannerBadge, { backgroundColor: banner.badgeBg }]}>
-                  <Text style={[styles.heroBannerBadgeText, { color: banner.badgeFg }]}>
-                    {String(banner.bannerType || '').toUpperCase()}
-                  </Text>
-                </View>
-                <Text
-                  style={[styles.heroBannerTitle, { color: banner.fg }]}
-                  numberOfLines={3}
-                >
-                  {banner.mainText}
-                </Text>
-              </View>
-              <Text style={styles.heroBannerEmoji}>{banner.emoji}</Text>
-            </TouchableOpacity>
-          )}
-          style={{ paddingHorizontal: 6 }}
-        />
-      </View>
-
-      <View style={styles.categoriesContainer}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          <View style={styles.categoriesRow}>
-            {categories.map(renderCategoryChip)}
-          </View>
-        </ScrollView>
-      </View>
-
-      {/* Single search bar — lives right above the services grid so the user
-          can filter without scrolling back to the top. Dropdown of matches
-          renders directly under the input. The wrapping View captures its
-          own Y offset so we can scroll it into view when the keyboard opens. */}
+      {/* Search bar — moved up so it sits directly under the Common /
+          Industrial toggle. Lets the user filter the services grid
+          without scrolling past promo strips and other secondary
+          content. Dropdown of matches renders directly under the
+          input. */}
       <View
         style={styles.inlineSearchWrap}
         onLayout={(e: any) => {
@@ -1150,9 +1094,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             onChangeText={handleSearchInputChange}
             onFocus={() => {
               handleSearchInputFocus();
-              // Scroll the search bar to the top of the visible area so the
-              // keyboard never covers it (safety net in case adjustResize
-              // hasn't kicked in fast enough).
               setTimeout(() => {
                 const y = Math.max(0, (searchYRef.current || 0) - 12);
                 scrollRef.current?.scrollTo({ y, animated: true });
@@ -1169,10 +1110,30 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
               <Text style={styles.inlineSearchClear}>✕</Text>
             </TouchableOpacity>
           )}
-          {/* Voice icon removed — the keyboard's built-in mic key is
-              the canonical voice-search path on Android. We keep
-              handleVoiceSearch around in case we re-add a custom voice
-              UI later, but no inline button on the search bar now. */}
+          {/* Voice search trigger — taps in to @react-native-voice
+              when available; whatever the user speaks lands in the
+              search input via the existing onResults handler. Pulses
+              red while listening so it reads as "I'm hearing you".
+              Falls back silently when the native module isn't
+              compiled in (older dev-client APKs). */}
+          <TouchableOpacity
+            onPress={handleVoiceSearch}
+            hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+            style={[
+              styles.inlineSearchMicBtn,
+              voiceListening && styles.inlineSearchMicBtnActive,
+            ]}
+            accessibilityLabel={voiceListening ? 'Stop listening' : 'Voice search'}
+          >
+            <Text
+              style={[
+                styles.inlineSearchMicIcon,
+                voiceListening && styles.inlineSearchMicIconActive,
+              ]}
+            >
+              🎤
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {searchQuery.length > 0 && (
@@ -1217,8 +1178,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                       </Text>
                     </View>
                     <Text style={styles.searchResultPrice}>
-                      {/* user_cost is the customer-facing price; fall
-                          back to total_expense / 0 only when missing. */}
                       ₹{item.user_cost || item.total_expense || '0'}
                     </Text>
                   </Pressable>
@@ -1233,6 +1192,52 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           </View>
         )}
       </View>
+
+      {/* ─── Trending Services section REMOVED — was here, taking too
+          much vertical real estate. Customers now search via the bar
+          above or browse the categories strip + popular grid below. */}
+      {false && displayedTrending.length > 0 && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>📈 Trending Services</Text>
+          <AutoCarousel
+            items={displayedTrending}
+            cardWidth={150}
+            intervalMs={3000}
+            slideDurationMs={650}
+            renderItem={(item: any) => (
+              <TouchableOpacity
+                key={item.id}
+                style={styles.trendingCard}
+                activeOpacity={0.85}
+                onPress={() => navigation.navigate('ServiceDetails', { serviceId: item.id })}
+              >
+                <Text style={styles.trendingName} numberOfLines={2}>{item.name}</Text>
+                <Text style={styles.trendingPrice}>
+                  ₹{item.user_cost ?? item.total_expense ?? 0}
+                </Text>
+                <View style={styles.trendingCta}>
+                  <Text style={styles.trendingCtaText}>Book Now</Text>
+                </View>
+              </TouchableOpacity>
+            )}
+            style={{ paddingHorizontal: 6 }}
+          />
+        </View>
+      )}
+
+      {/* Why-FliponeX promo strip was here — now lives at the very
+          bottom of the home screen (right above the WhatsApp button)
+          so it appears AFTER the user has scrolled past the services
+          listing, matching the requested layout. */}
+
+      <View style={styles.categoriesContainer}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <View style={styles.categoriesRow}>
+            {categories.map(renderCategoryChip)}
+          </View>
+        </ScrollView>
+      </View>
+
     </View>
   );
 
@@ -1332,43 +1337,120 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           // grouped section emoji matches the cards inside it.
           const catIcon = iconForCategory;
 
-          return Object.entries(groups).map(([category, items]: [string, any]) => (
-            <View key={category} style={styles.catSection}>
-              {/* Section header — icon + name + count + "View All →"
-                  link that opens the Services tab pre-filtered. */}
-              <View style={styles.catHeader}>
-                <Text style={styles.catIcon}>{catIcon(category)}</Text>
-                <Text style={styles.catTitle}>{category}</Text>
-                <Text style={styles.catCount}>{items.length}</Text>
-                <View style={{ flex: 1 }} />
-                <TouchableOpacity
-                  onPress={() =>
-                    navigation.navigate('HomeTabs', {
-                      screen: 'Services',
-                      params: { category },
-                    })
-                  }
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <Text style={styles.catViewAll}>View All →</Text>
-                </TouchableOpacity>
-              </View>
+          return Object.entries(groups).map(([category, items]: [string, any]) => {
+            const isExpanded = expandedCategories.has(category);
+            const visibleItems = isExpanded
+              ? items
+              : items.slice(0, INITIAL_SERVICES_PER_CAT);
+            const hasMore = items.length > INITIAL_SERVICES_PER_CAT;
+            const toggleExpand = () => {
+              haptics.tap();
+              setExpandedCategories((prev) => {
+                const next = new Set(prev);
+                if (next.has(category)) next.delete(category);
+                else next.add(category);
+                return next;
+              });
+            };
+            return (
+              <View key={category} style={styles.catSection}>
+                {/* Section header — icon + name + count + "View All →"
+                    toggle that expands this category IN PLACE (no nav
+                    away). Each section starts with just the first few
+                    services; tapping View All reveals the rest in the
+                    same scroll position so the user stays on home. */}
+                <View style={styles.catHeader}>
+                  <Text style={styles.catIcon}>{catIcon(category)}</Text>
+                  <Text style={styles.catTitle}>{category}</Text>
+                  <Text style={styles.catCount}>{items.length}</Text>
+                  <View style={{ flex: 1 }} />
+                  {hasMore && (
+                    <TouchableOpacity
+                      onPress={toggleExpand}
+                      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    >
+                      <Text style={styles.catViewAll}>
+                        {isExpanded ? 'Show Less ↑' : 'View All →'}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
 
-              {/* Vertical 2-column grid. ServiceCard already renders the
-                  Prussian-blue Book Now pill internally, so we use the
-                  default renderer with no extra wrapper here. */}
-              <FlatList
-                data={items}
-                renderItem={renderServiceCard}
-                keyExtractor={(item: any) => item.id?.toString?.() ?? Math.random().toString()}
-                numColumns={2}
-                contentContainerStyle={styles.servicesGrid}
-                columnWrapperStyle={styles.servicesRow}
-                scrollEnabled={false}
-              />
-            </View>
-          ));
+                {/* Vertical 2-column grid. ServiceCard already renders the
+                    Prussian-blue Book Now pill internally. visibleItems
+                    is sliced to INITIAL_SERVICES_PER_CAT unless the user
+                    expanded this category. */}
+                <FlatList
+                  data={visibleItems}
+                  renderItem={renderServiceCard}
+                  keyExtractor={(item: any) => item.id?.toString?.() ?? Math.random().toString()}
+                  numColumns={2}
+                  contentContainerStyle={styles.servicesGrid}
+                  columnWrapperStyle={styles.servicesRow}
+                  scrollEnabled={false}
+                />
+              </View>
+            );
+          });
         })()}
+        </View>
+
+        {/* Why FliponeX — moved to the very bottom of the home scroll,
+            right above the WhatsApp button, so it surfaces AFTER the
+            user has seen the services listing rather than competing
+            for vertical real estate above it. Same 4 hero banners
+            (Consumer / Industrial / Fast Track / Referral), same
+            auto-rotating carousel — only the position changed. */}
+        <View style={{ marginTop: 14, marginBottom: 6 }}>
+          <Text style={styles.bannerSectionTitle}>✨ Why FliponeX</Text>
+          <AutoCarousel
+            items={HERO_BANNERS}
+            cardWidth={240}
+            intervalMs={3200}
+            slideDurationMs={650}
+            renderItem={(banner: any) => (
+              <TouchableOpacity
+                activeOpacity={0.9}
+                onPress={() => {
+                  haptics.tap();
+                  const t = String(banner?.bannerType || '').toLowerCase();
+                  if (t.includes('industrial')) {
+                    handleB2BToggle('industrial');
+                    scrollToServices();
+                  } else if (t.includes('referral')) {
+                    handleShareApp();
+                  } else {
+                    handleB2BToggle('consumer');
+                    scrollToServices();
+                  }
+                }}
+                style={[
+                  styles.heroBannerCard,
+                  { backgroundColor: banner.tint, marginHorizontal: 5 },
+                ]}
+              >
+                <View style={styles.heroBannerLeft}>
+                  <View
+                    style={[styles.heroBannerBadge, { backgroundColor: banner.badgeBg }]}
+                  >
+                    <Text
+                      style={[styles.heroBannerBadgeText, { color: banner.badgeFg }]}
+                    >
+                      {String(banner.bannerType || '').toUpperCase()}
+                    </Text>
+                  </View>
+                  <Text
+                    style={[styles.heroBannerTitle, { color: banner.fg }]}
+                    numberOfLines={3}
+                  >
+                    {banner.mainText}
+                  </Text>
+                </View>
+                <Text style={styles.heroBannerEmoji}>{banner.emoji}</Text>
+              </TouchableOpacity>
+            )}
+            style={{ paddingHorizontal: 6 }}
+          />
         </View>
 
         {/* Enhanced WhatsApp Button */}
@@ -1522,6 +1604,38 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   iconButtonText: { fontSize: 18, color: '#fff' },
+  // Wrapper that lets the bell badge poke OUTSIDE the round button
+  // without disabling overflow:hidden on the button itself (which is
+  // needed to clip the profile-pic image into the circle).
+  bellWrap: {
+    position: 'relative',
+    marginLeft: 8,
+  },
+  bellInner: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    justifyContent: 'center', alignItems: 'center',
+  },
+  headerBellBadge: {
+    position: 'absolute',
+    top: -2,
+    right: -2,
+    backgroundColor: '#E63946',
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    paddingHorizontal: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#FFFFFF',
+  },
+  headerBellBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+  },
   iconAvatarImg: {
     width: '100%',
     height: '100%',
@@ -2722,6 +2836,29 @@ const styles = StyleSheet.create({
     color: '#5C6A7A',
     fontWeight: '700',
     paddingHorizontal: 6,
+  },
+  // Voice mic chip on the right edge of the search bar. Inactive
+  // state = subtle gray pill matching the search bar tone; active
+  // state = red pulse so the user has clear feedback that the
+  // mic is listening.
+  inlineSearchMicBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#F1F5F9',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 4,
+  },
+  inlineSearchMicBtnActive: {
+    backgroundColor: '#E63946',
+  },
+  inlineSearchMicIcon: {
+    fontSize: 14,
+    color: '#0D3B66',
+  },
+  inlineSearchMicIconActive: {
+    color: '#FFFFFF',
   },
   // (Voice mic image style removed — the inline button was dropped
   // from the search bar. Use the keyboard's built-in mic key for
