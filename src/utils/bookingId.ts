@@ -19,6 +19,15 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
  *   formatBookingId('a1b2c3d4-e5f6-...') → 'Flip#A1B2'    (UUID fallback)
  *   formatBookingId(null)                → ''
  */
+// Display floor — every Flip# ID shown to the customer is at least 4
+// digits starting at 1000. Old bookings whose backend booking_number
+// was assigned before the 1000-floor shipped (e.g. 73, 82, 124) get
+// rendered with +1000 offset so they read consistently as Flip#1073,
+// Flip#1082, Flip#1124 instead of cramped Flip#0073. Newer bookings
+// already at 1000+ render unchanged. Display-only — DB values aren't
+// rewritten.
+const DISPLAY_FLOOR = 1000;
+
 export const formatBookingId = (input: string | number | null | undefined): string => {
   if (input == null) return '';
   const raw = String(input).trim();
@@ -29,7 +38,11 @@ export const formatBookingId = (input: string | number | null | undefined): stri
   if (digitMatch) {
     const n = parseInt(digitMatch[1], 10);
     if (!Number.isNaN(n)) {
-      return `Flip#${String(n).padStart(4, '0')}`;
+      // Anything < 1000 → bump by 1000 so a 2-digit booking_number
+      // like 73 renders as Flip#1073 instead of the legacy Flip#0073.
+      // Anything ≥ 1000 stays as-is.
+      const displayN = n < DISPLAY_FLOOR ? n + DISPLAY_FLOOR : n;
+      return `Flip#${String(displayN).padStart(4, '0')}`;
     }
   }
 
