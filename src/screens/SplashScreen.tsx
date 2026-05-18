@@ -380,33 +380,49 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
     (async () => {
       const audio = tryLoadGlassSound();
       if (!audio) return;
+      // Tag each mount's audio attempt so the [splash-audio] logs
+      // are traceable across consecutive launches. Renders/launches
+      // count up so we can see in adb logcat whether the audio is
+      // actually being re-initialised each time the user reopens.
+      const launchTag = Date.now().toString().slice(-6);
       try {
+        console.log(`[splash-audio ${launchTag}] setAudioMode start`);
+        // Always re-set audio mode on every mount. Some Android OEMs
+        // reset the global audio-focus state between app sessions;
+        // without re-calling setAudioModeAsync, playsInSilentModeIOS
+        // and shouldDuckAndroid revert to defaults and the sound is
+        // dropped on warm launches. setAudioModeAsync is idempotent
+        // so calling it every time is safe.
         await audio.Audio.setAudioModeAsync({
           playsInSilentModeIOS: true,
           staysActiveInBackground: false,
           shouldDuckAndroid: true,
-        }).catch(() => {});
-        // isLooping=true so the glass-break ambient sound carries
-        // through the ENTIRE splash (was felt to be too short and
-        // ending mid-animation). The cleanup function below fades
-        // it out over ~400ms before the unload so the audio doesn't
-        // hard-cut into silence — a smooth fade avoids the
-        // "buffered tail leaks into next screen" problem the previous
-        // one-shot setup had, while still satisfying the user's
-        // request for the sound to play through the whole splash.
+          allowsRecordingIOS: false,
+        });
+        console.log(`[splash-audio ${launchTag}] setAudioMode ok`);
+
+        // Create the Sound with shouldPlay=true. We previously
+        // separated create + playAsync so we could check `cancelled`
+        // between them, but on warm launches the OS sometimes
+        // de-prioritised the deferred play() and dropped the audio
+        // request entirely. shouldPlay=true binds creation and
+        // playback into one atomic native call that always honours.
+        // isLooping=true so the glass-break carries through the
+        // full splash window. The cleanup function fades it out.
         const { sound } = await audio.Audio.Sound.createAsync(audio.asset, {
-          shouldPlay: false,
+          shouldPlay: true,
           isLooping: true,
           volume: 1.0,
         });
         if (cancelled) {
+          console.log(`[splash-audio ${launchTag}] cancelled after createAsync — unloading`);
           await sound.unloadAsync().catch(() => {});
           return;
         }
         activeSound = sound;
-        sound.playAsync().catch(() => {});
+        console.log(`[splash-audio ${launchTag}] playing`);
       } catch (e: any) {
-        console.log('[splash] glass-break audio failed:', e?.message);
+        console.warn(`[splash-audio ${launchTag}] FAILED:`, e?.message, e?.code);
       }
     })();
 
