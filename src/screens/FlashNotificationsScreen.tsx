@@ -127,6 +127,11 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
   // queue two navigation.reset calls. Tracked in a ref (not state)
   // so we don't force an extra render after the button press.
   const navigatingRef = useRef<boolean>(false);
+  // Track which notification image_urls have failed to load on this
+  // device so we can swap them out for the emoji fallback without
+  // leaving a blank navy box. Stored as a Set of failed IDs so a
+  // single failure doesn't poison other cards in the carousel.
+  const [imgFailed, setImgFailed] = useState<Set<string>>(new Set());
 
   const markAllSeenAndContinue = (): void => {
     if (navigatingRef.current) return;
@@ -191,18 +196,31 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
       >
         {items.map((item) => (
           <View key={item.id} style={[styles.card, { width: SCREEN_WIDTH }]}>
-            {item.image_url ? (
+            {item.image_url && !imgFailed.has(item.id) ? (
               <Image
                 source={{ uri: item.image_url }}
                 style={styles.image}
                 resizeMode="cover"
+                // If the URL fails to load (Google-search redirect,
+                // hotlink-protected CDN, http-only host blocked by
+                // Android's cleartext policy, expired link, etc.),
+                // swap to the emoji fallback instead of leaving a
+                // blank navy box. Logged so devs can see in adb
+                // logcat which URL broke.
+                onError={(e) => {
+                  console.log(
+                    '[flash] image failed to load:',
+                    item.image_url,
+                    e?.nativeEvent?.error,
+                  );
+                  setImgFailed((prev) => {
+                    const next = new Set(prev);
+                    next.add(item.id);
+                    return next;
+                  });
+                }}
               />
             ) : (
-              // Bare-bones fallback for when admin didn't upload an
-              // image_url. In practice admin always provides a proper
-              // illustration (the green megaphone with hand, the red
-              // bullhorn etc.) so this branch rarely renders — the
-              // 📣 emoji just keeps the layout from collapsing.
               <View style={[styles.image, styles.imageFallback]}>
                 <Text style={styles.imageFallbackEmoji}>📣</Text>
               </View>
