@@ -57,20 +57,17 @@ const ModeSelectScreen: React.FC<ModeSelectScreenProps> = ({ navigation }) => {
   // ping-ponged. Routing on warm launch now happens once in Splash; this
   // screen always shows the picker so the user can switch modes.
 
-  // Probe the public flash-notifications endpoint. Returns true only
-  // when at least one ACTIVE notification hasn't been dismissed on
-  // this device. Backend down / empty list → returns false so the
-  // user goes straight to the login screen (never blocks launch).
+  // Probe the public flash-notifications endpoint. Returns true if at
+  // least one is active — dismissal tracking is intentionally OFF so
+  // the carousel appears on every app open until admin deactivates
+  // the notification server-side. Backend down / empty → false so
+  // the user goes straight to login (never blocks launch).
   const hasUnseenFlashNotifications = async (): Promise<boolean> => {
     try {
       const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
       const json = await resp.json();
       const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
-      if (all.length === 0) return false;
-      const seenRaw = await AsyncStorage.getItem('@flipon_flash_notifications_seen');
-      const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-      const seenSet = new Set(seen);
-      return all.some((n) => !seenSet.has(n.id));
+      return all.length > 0;
     } catch (_) {
       return false;
     }

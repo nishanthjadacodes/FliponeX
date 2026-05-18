@@ -198,20 +198,17 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           }
         };
 
-        // Probe /flash-notifications/active. Returns true only when at
-        // least one ACTIVE notification hasn't been dismissed on this
-        // device. Backend down / empty / all-seen → returns false so
-        // launch isn't blocked.
+        // Probe /flash-notifications/active. Returns true when there's
+        // at least one active notification — we no longer track
+        // dismissals so the carousel pops on EVERY app open until
+        // admin deactivates it server-side (per spec). Backend down /
+        // empty → returns false so launch isn't blocked.
         const hasUnseenFlashNotifications = async (): Promise<boolean> => {
           try {
             const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
             const json = await resp.json();
             const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
-            if (all.length === 0) return false;
-            const seenRaw = await AsyncStorage.getItem('@flipon_flash_notifications_seen');
-            const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-            const seenSet = new Set(seen);
-            return all.some((n) => !seenSet.has(n.id));
+            return all.length > 0;
           } catch (_) {
             return false;
           }

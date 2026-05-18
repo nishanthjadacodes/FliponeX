@@ -491,19 +491,27 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
               +91 {profile?.mobile || 'N/A'}
             </Text>
           </View>
-          <TouchableOpacity
-            style={styles.stickyBarLang}
-            onPress={() => { haptics.tap(); setShowLanguage(true); }}
-            accessibilityLabel="Change language"
-          >
-            <Text style={styles.stickyBarLangText}>🌐</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.stickyBarEdit}
-            onPress={() => { haptics.tap(); setEditing(true); }}
-          >
-            <Text style={styles.stickyBarEditText}>Edit</Text>
-          </TouchableOpacity>
+          {/* Right-side action cluster — keeps the 🌐 lang chip and
+              the Edit button glued together on the same horizontal
+              line at any screen width, with the row never wrapping
+              even when the user's name is long. flexShrink: 0 on
+              the wrapper guarantees the parent flex layout doesn't
+              squeeze these buttons into a stacked column. */}
+          <View style={styles.stickyBarActions}>
+            <TouchableOpacity
+              style={styles.stickyBarLang}
+              onPress={() => { haptics.tap(); setShowLanguage(true); }}
+              accessibilityLabel="Change language"
+            >
+              <Text style={styles.stickyBarLangText}>🌐</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.stickyBarEdit}
+              onPress={() => { haptics.tap(); setEditing(true); }}
+            >
+              <Text style={styles.stickyBarEditText}>Edit</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* Branded hero header with big avatar (scrolls under the sticky bar).
@@ -811,11 +819,34 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
               {STRINGS.CORPORATE_OFFICE}
             </Text>
 
+            {/* Self-contained close button — the shared modalBtn style
+                has flex:1 which is designed for ROW layouts. Using it
+                here inside a column layout stretched the button to
+                full vertical space and hid the text inside an
+                oversized solid-blue slab. Inline geometry below makes
+                the button render at a normal CTA height with the
+                "Back to Profile" label clearly visible. */}
             <TouchableOpacity
               onPress={() => setShowContact(false)}
-              style={[styles.modalBtn, { backgroundColor: '#0D3B66', marginTop: 14 }]}
+              style={{
+                backgroundColor: '#0D3B66',
+                marginTop: 14,
+                paddingVertical: 14,
+                borderRadius: 12,
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
             >
-              <Text style={{ color: '#fff', fontWeight: '700', textAlign: 'center' }}>Back to Profile</Text>
+              <Text
+                style={{
+                  color: '#FFFFFF',
+                  fontWeight: '800',
+                  fontSize: 15,
+                  letterSpacing: 0.3,
+                }}
+              >
+                Back to Profile
+              </Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -1163,11 +1194,16 @@ const styles = StyleSheet.create({
   stickyBarMobile: {
     color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: '600', marginTop: 1,
   },
+  stickyBarActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 0,
+    gap: 8,
+  },
   stickyBarLang: {
     backgroundColor: 'rgba(255,255,255,0.18)',
     width: 34, height: 34, borderRadius: 17,
     alignItems: 'center', justifyContent: 'center',
-    marginRight: 8,
   },
   stickyBarLangText: { fontSize: 16 },
   stickyBarEdit: {

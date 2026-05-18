@@ -5149,7 +5149,12 @@ const styles: any = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderTopLeftRadius: 18,
     borderTopRightRadius: 18,
-    paddingBottom: 16,
+    // Bumped from 16 → 40 so the Upload / Retake row never overlaps
+    // the phone's bottom gesture bar or 3-button nav. On Pixel-class
+    // phones the original 16px put Upload directly in the swipe-back
+    // zone, so taps registered as "back" and silently navigated
+    // away from the doc upload flow.
+    paddingBottom: 40,
   },
   // Image preview is wrapped so we can position the floating Crop
   // overlay absolutely inside it.
@@ -5254,7 +5259,12 @@ const styles: any = StyleSheet.create({
     borderTopRightRadius: 20,
     paddingHorizontal: 18,
     paddingTop: 10,
-    paddingBottom: 24,
+    // Lift the bottom edge well above any phone's gesture bar /
+    // 3-button nav so the Cancel + upload options never overlap with
+    // the system back swipe. Previously 24px which on Pixel-class
+    // phones put Cancel directly inside the bottom gesture strip
+    // and taps registered as a system back instead.
+    paddingBottom: 48,
   },
   docPickerHandle: {
     width: 44,

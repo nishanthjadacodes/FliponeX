@@ -27,11 +27,9 @@ import {
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const SEEN_KEY = '@flipon_flash_notifications_seen';
 
 interface FlashNotification {
   id: string;
@@ -85,24 +83,23 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
   const nextRoute = route?.params?.nextRoute || 'ModeSelect';
   const nextParams = route?.params?.nextParams;
 
-  // Loader — fetches active notifications, filters out already-seen
-  // ones via AsyncStorage. If nothing's left to show, navigate
-  // straight through.
+  // Loader — fetches active notifications on EVERY app open. We
+  // intentionally do NOT filter by AsyncStorage-tracked "seen" IDs
+  // anymore so festive offers / important announcements pop up
+  // every time the user closes and reopens the app, per spec. If
+  // nothing's active, navigate straight through so the splash flow
+  // isn't blocked.
   useEffect(() => {
     (async () => {
       try {
         const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
         const json = await resp.json();
         const all: FlashNotification[] = Array.isArray(json?.data) ? json.data : [];
-        const seenRaw = await AsyncStorage.getItem(SEEN_KEY);
-        const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-        const seenSet = new Set(seen);
-        const unseen = all.filter((n) => !seenSet.has(n.id));
-        if (unseen.length === 0) {
+        if (all.length === 0) {
           continueNext();
           return;
         }
-        setItems(unseen);
+        setItems(all);
       } catch (e: any) {
         // Backend unreachable on launch — don't block the user; skip
         // straight to the next route as if there were no notifications.
@@ -126,13 +123,10 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   };
 
-  const markAllSeenAndContinue = async (): Promise<void> => {
-    try {
-      const seenRaw = await AsyncStorage.getItem(SEEN_KEY);
-      const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-      const merged = Array.from(new Set([...seen, ...items.map((i) => i.id)]));
-      await AsyncStorage.setItem(SEEN_KEY, JSON.stringify(merged));
-    } catch (_) { /* non-fatal */ }
+  const markAllSeenAndContinue = (): void => {
+    // Seen-tracking removed: notifications now appear on every app
+    // open until admin deactivates them. Skip / Continue simply
+    // forwards to the next route without persisting any state.
     continueNext();
   };
 
@@ -144,16 +138,6 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
         await Linking.openURL(item.cta_url);
       }
     } catch (_) { /* ignore — don't block */ }
-    // Mark the tapped notification seen but stay on this screen so
-    // the user can still browse the other banners or skip.
-    try {
-      const seenRaw = await AsyncStorage.getItem(SEEN_KEY);
-      const seen: string[] = seenRaw ? JSON.parse(seenRaw) : [];
-      await AsyncStorage.setItem(
-        SEEN_KEY,
-        JSON.stringify(Array.from(new Set([...seen, item.id]))),
-      );
-    } catch (_) { /* non-fatal */ }
   };
 
   if (loading) {

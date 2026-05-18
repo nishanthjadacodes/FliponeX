@@ -27,6 +27,7 @@ import {
 import { readCache, writeCache } from '../../utils/agent/cache';
 import ProfileModal, { type AgentProfile } from '../../components/agent/ProfileModal';
 import { LinearGradient } from 'expo-linear-gradient';
+import { repCode } from '../../utils/agent/repCode';
 
 interface DashboardScreenProps {
   navigation: {
@@ -283,19 +284,33 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
     loadDashboardData();
   };
 
+  // Re-entrancy guard — without it, tapping the Switch faster than
+  // a render cycle queued two parallel updateOnlineStatus calls in
+  // opposite directions, plus the location-ping useEffect tore down
+  // and rebuilt its interval mid-cycle. That triggered the
+  // "Warning: Cannot update a component while rendering a different
+  // component" render error users were seeing. The ref pattern
+  // (not state) avoids forcing an extra render to release the lock.
+  const toggleInFlightRef = useRef<boolean>(false);
+
   const handleToggleOnlineStatus = async (): Promise<void> => {
-    const newStatus = !isOnline;
-    // 1. Update local state immediately — UI flips right away.
-    setIsOnline(newStatus);
-    // 2. Persist locally so a restart / poll cycle can't revert it.
-    //    AsyncStorage write is fire-and-forget; even if it fails the
-    //    React state still wins for this session.
-    AsyncStorage.setItem(ONLINE_STATUS_KEY, String(newStatus)).catch(() => {});
-    // 3. Notify backend so admin / dispatch see the change. Failure
-    //    here is non-fatal — the rep's local toggle is the source of
-    //    truth and survives any backend flake.
-    updateOnlineStatus(newStatus).catch((e: any) => {
-      console.log('[online-status] backend update failed (non-fatal):', e?.message);
+    if (toggleInFlightRef.current) return;
+    toggleInFlightRef.current = true;
+    // Functional setState so we never read a stale `isOnline` if the
+    // user tapped twice in quick succession.
+    setIsOnline((prev) => {
+      const next = !prev;
+      // Persist + notify backend INSIDE the updater so they're always
+      // keyed off the value we're actually committing.
+      AsyncStorage.setItem(ONLINE_STATUS_KEY, String(next)).catch(() => {});
+      updateOnlineStatus(next)
+        .catch((e: any) => {
+          console.log('[online-status] backend update failed (non-fatal):', e?.message);
+        })
+        .finally(() => {
+          toggleInFlightRef.current = false;
+        });
+      return next;
     });
   };
 
@@ -437,8 +452,17 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                         },
                       ]}
                     >
+                      {/* Rep's profile picture if they uploaded one in
+                          the Profile screen — surfaces immediately in
+                          the home hero so they can confirm at a glance
+                          which account is signed in. Falls back to the
+                          FliponeX partner logo when no upload exists. */}
                       <Image
-                        source={require('../../assets/logo1.jpeg')}
+                        source={
+                          (agent as any)?.profile_pic
+                            ? { uri: (agent as any).profile_pic }
+                            : require('../../assets/logo1.jpeg')
+                        }
                         style={styles.logoImg}
                         resizeMode="cover"
                       />
@@ -450,6 +474,13 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                     <Text style={styles.welcomeText}>Welcome back,</Text>
                     <Text style={styles.agentName} numberOfLines={1}>
                       {agent?.name || 'Representative'}
+                    </Text>
+                    {/* Short rep code — shown so the rep can quickly cite
+                        their ID over the phone with admin / customer.
+                        Derived from user.id; falls back to "REP-—" if
+                        the agent payload hasn't loaded yet. */}
+                    <Text style={styles.agentRepCode}>
+                      {repCode(agent as any)}
                     </Text>
                   </View>
 
@@ -833,6 +864,13 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.75)',
     fontWeight: '600',
     marginTop: 2,
+  },
+  agentRepCode: {
+    marginTop: 4,
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#FCD34D',
+    letterSpacing: 1.2,
   },
   agentName: {
     fontSize: 18,
