@@ -45,6 +45,7 @@ try {
   documentPickerAvailable = false;
 }
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { API_BASE_URL } from '../config';
 import { getUser } from '../utils/storage';
 import RazorpayCheckout from 'react-native-razorpay';
 import { createBooking, getLocationFromAddress, uploadDocument, getProfile, processPayment, createPaymentOrder, verifyPayment, applyReferralCode, updateMyLocation } from '../services/api';
@@ -1645,6 +1646,19 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   const [availableSlots, setAvailableSlots] = useState<any[]>([]);
   const [priorityFee] = useState<number>(50); // Priority fee for fast-track service
 
+  // Matching flash-notification discount for THIS service. Fetched
+  // once on screen mount. If admin published an active notification
+  // with discount_percent + target_service_pattern, AND the pattern
+  // matches this service's name/category (case-insensitive), the
+  // Payment Summary shows a "Flash Offer (X% off)" line and the
+  // discount is subtracted from the customer-facing total. Multiple
+  // matching notifications → the highest discount wins.
+  const [flashOffer, setFlashOffer] = useState<{
+    id: string;
+    title: string;
+    percent: number;
+  } | null>(null);
+
   // Step 5: Payment
   // Payment is always online and is collected AFTER the representative
   // completes the work (deferred). Customer is shown a "Pay Now" button on
@@ -1687,6 +1701,46 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   useEffect(() => {
     setOptFastTrack(serviceMode === 'fast_track');
   }, [serviceMode]);
+
+  // Fetch active flash-notification discounts and pick the highest one
+  // that matches THIS service. Matched by case-insensitive substring
+  // of target_service_pattern against service.name + service.category.
+  // Backend down / empty / no match → flashOffer stays null and
+  // Payment Summary renders normally.
+  useEffect(() => {
+    const svcName = String(serviceData?.name || '').toLowerCase();
+    const svcCat = String(serviceData?.category || '').toLowerCase();
+    if (!svcName && !svcCat) return;
+    const haystack = `${svcName} ${svcCat}`;
+    (async () => {
+      try {
+        const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
+        const json = await resp.json();
+        const all: any[] = Array.isArray(json?.data) ? json.data : [];
+        let best: { id: string; title: string; percent: number } | null = null;
+        for (const n of all) {
+          const pct = Number(n?.discount_percent);
+          const pattern = String(n?.target_service_pattern || '').trim().toLowerCase();
+          if (!Number.isFinite(pct) || pct <= 0 || !pattern) continue;
+          if (!haystack.includes(pattern)) continue;
+          if (!best || pct > best.percent) {
+            best = { id: n.id, title: n.title, percent: pct };
+          }
+        }
+        if (best) {
+          console.log(
+            '[flash] applying discount to service',
+            svcName,
+            `${best.percent}% via "${best.title}"`,
+          );
+        }
+        setFlashOffer(best);
+      } catch (e: any) {
+        console.log('[flash] discount lookup failed:', e?.message);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceData?.id]);
 
   // Fetch the customer's wallet + refund balance once so the Payment
   // Summary can show real "Use Reward Points" / "Use Refund Wallet" caps.
@@ -1877,9 +1931,18 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   // bill matches the price shown on the service detail page.
   const subtotalBeforeCredits = customerBase + optionalTotal;
 
+  // Flash-notification discount — admin-managed splash offer. Applied
+  // BEFORE wallet credits + referral so the user clearly sees the
+  // flash-offer line as a savings before any other adjustments.
+  // Rounded to the nearest rupee so the bill total stays clean.
+  const flashDiscountAmount = flashOffer
+    ? Math.round(subtotalBeforeCredits * (flashOffer.percent / 100))
+    : 0;
+  const subtotalAfterFlash = Math.max(0, subtotalBeforeCredits - flashDiscountAmount);
+
   // Wallet credits can pay at most 50% of the booking value (per the
   // Refer & Earn policy 3.2). Apply each credit pool only when checked.
-  const fiftyPercentCap = Math.floor(subtotalBeforeCredits * 0.5);
+  const fiftyPercentCap = Math.floor(subtotalAfterFlash * 0.5);
   const rewardApplied = useRewardPoints ? Math.min(walletBalance, fiftyPercentCap) : 0;
   const refundApplied = useRefundWallet
     ? Math.min(refundBalance, fiftyPercentCap - rewardApplied)
@@ -1887,7 +1950,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
 
   const totalAmount = Math.max(
     0,
-    subtotalBeforeCredits - rewardApplied - refundApplied - referralDiscount,
+    subtotalAfterFlash - rewardApplied - refundApplied - referralDiscount,
   );
 
   // Legacy compatibility — older code paths read `additionalFee`.
@@ -3804,6 +3867,21 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                 <Text style={styles.psSmallLabel}>Subtotal</Text>
                 <Text style={styles.psSmallValue}>₹ {subtotalBeforeCredits}</Text>
               </View>
+
+              {/* Flash offer — admin-managed splash discount. Only
+                  rendered when an active notification matched this
+                  service's name/category. Green minus line so the
+                  savings are unmissable. */}
+              {flashOffer && flashDiscountAmount > 0 && (
+                <View style={styles.psRow}>
+                  <Text style={[styles.psSmallLabel, { color: '#10B981', fontWeight: '700' }]}>
+                    🎉 Flash Offer ({flashOffer.percent}% off)
+                  </Text>
+                  <Text style={[styles.psSmallValue, { color: '#10B981', fontWeight: '900' }]}>
+                    − ₹ {flashDiscountAmount}
+                  </Text>
+                </View>
+              )}
 
               {/* Adjustments — wallet + refund. Show each as a minus
                   line item the moment it's toggled on so the user can

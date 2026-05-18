@@ -40,7 +40,29 @@ interface FlashNotification {
   image_url?: string | null;
   cta_label?: string | null;
   cta_url?: string | null;
+  active_from?: string | null;
+  active_until?: string | null;
+  discount_percent?: number | null;
+  target_service_pattern?: string | null;
 }
+
+// "Valid: 01 Nov – 05 Nov 2026" / "Valid until 05 Nov 2026" /
+// "Available now" — depending on which dates are present.
+const formatValidity = (from?: string | null, until?: string | null): string => {
+  const fmt = (iso: string): string => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+    });
+  };
+  if (from && until) return `Valid ${fmt(from)} – ${fmt(until)}`;
+  if (from) return `From ${fmt(from)}`;
+  if (until) return `Valid until ${fmt(until)}`;
+  return 'Available now';
+};
 
 interface Props {
   navigation: {
@@ -185,7 +207,26 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
             )}
             <View style={styles.body}>
               <Text style={styles.title}>{item.title}</Text>
+              {/* Discount pill — only when admin attached a discount.
+                  Spells out the savings AND the service match so the
+                  user knows where it'll apply (e.g. "50% off · all
+                  Aadhaar services"). */}
+              {item.discount_percent != null && item.discount_percent > 0 ? (
+                <View style={styles.discountPill}>
+                  <Text style={styles.discountPillText}>
+                    {item.discount_percent}% OFF
+                    {item.target_service_pattern
+                      ? `  ·  all ${item.target_service_pattern} services`
+                      : ''}
+                  </Text>
+                </View>
+              ) : null}
               {item.body ? <Text style={styles.bodyText}>{item.body}</Text> : null}
+              {/* Validity window from admin's active_from / active_until.
+                  Always rendered so users know how long they have. */}
+              <Text style={styles.validityText}>
+                ⏳ {formatValidity(item.active_from, item.active_until)}
+              </Text>
               {item.cta_url && item.cta_label ? (
                 <TouchableOpacity style={styles.ctaBtn} onPress={() => handleCta(item)}>
                   <Text style={styles.ctaBtnText}>{item.cta_label} →</Text>
@@ -272,12 +313,32 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 28,
   },
+  discountPill: {
+    marginTop: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+    backgroundColor: '#10B981',
+  },
+  discountPillText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 0.4,
+  },
   bodyText: {
     marginTop: 10,
     color: 'rgba(255,255,255,0.85)',
     fontSize: 14,
     textAlign: 'center',
     lineHeight: 20,
+  },
+  validityText: {
+    marginTop: 14,
+    color: '#FCD34D',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.3,
   },
   ctaBtn: {
     marginTop: 22,
