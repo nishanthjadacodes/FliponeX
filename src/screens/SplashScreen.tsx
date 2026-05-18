@@ -156,15 +156,26 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       if (!activeSound) return;
       const s = activeSound;
       activeSound = null;
-      // Order matters — pauseAsync flushes the native buffer
-      // immediately on Android (stopAsync alone lets the last
-      // ~50-200ms of buffered audio leak into the next screen).
-      // Then we zero volume, stop, and unload to free the asset.
+      // Stop the loop immediately so no new iteration starts after
+      // the fade begins, then ramp volume down over ~400ms before
+      // the hard stop. This gives a smooth fade-out into silence
+      // instead of an abrupt cut, without leaking buffered audio
+      // into the next screen (we still call stopAsync + unloadAsync
+      // after the fade window closes).
       try { s.setIsLoopingAsync(false); } catch {}
-      try { s.pauseAsync(); } catch {}
-      try { s.setVolumeAsync(0); } catch {}
-      try { s.stopAsync(); } catch {}
-      try { s.unloadAsync(); } catch {}
+      const FADE_MS = 400;
+      const STEPS = 8;
+      for (let i = 1; i <= STEPS; i += 1) {
+        const stepVol = Math.max(0, 1 - i / STEPS);
+        setTimeout(() => {
+          try { s.setVolumeAsync(stepVol); } catch {}
+        }, (FADE_MS / STEPS) * i);
+      }
+      setTimeout(() => {
+        try { s.pauseAsync(); } catch {}
+        try { s.stopAsync(); } catch {}
+        try { s.unloadAsync(); } catch {}
+      }, FADE_MS + 50);
     };
 
     // Routing logic — runs after the animation completes (or
@@ -203,51 +214,30 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           }
         };
 
-        // Probe /flash-notifications/active. Returns true when there's
-        // at least one active notification — we no longer track
-        // dismissals so the carousel pops on EVERY app open until
-        // admin deactivates it server-side (per spec). Backend down /
-        // empty → returns false so launch isn't blocked.
-        const hasUnseenFlashNotifications = async (): Promise<boolean> => {
-          try {
-            const resp = await fetch(`${API_BASE_URL}/flash-notifications/active`);
-            const json = await resp.json();
-            const all: { id: string }[] = Array.isArray(json?.data) ? json.data : [];
-            return all.length > 0;
-          } catch (_) {
-            return false;
-          }
-        };
-
-        const goToLogin = async (loginRoute: 'Login' | 'AgentLogin'): Promise<void> => {
-          // Customer login path → hop through FlashNotifications first
-          // when there's a pre-login splash banner to show. Mirrors the
-          // ModeSelect → customer tile flow so the banner always
-          // appears between any path → customer Login (warm-launch
-          // logged-out users would otherwise skip ModeSelect entirely
-          // and bypass the carousel). Agent login skips the hop.
-          if (loginRoute === 'Login' && (await hasUnseenFlashNotifications())) {
+        // Splash → ModeSelect on every launch. The flash-notifications
+        // carousel hop now lives ONLY on ModeSelectScreen.pickMobile
+        // ('customer') so the user always sees the toggle page (the
+        // "2 apps + 2 websites" tiles) right after the splash. If a
+        // user previously had customer mode set and was logged out,
+        // we still drop them on ModeSelect — not straight to Login —
+        // so they can choose to switch modes before the flash banner.
+        const goToLogin = (loginRoute: 'Login' | 'AgentLogin'): void => {
+          if (loginRoute === 'AgentLogin') {
+            // Agents always go straight to their login (no flash hop).
             if (navigation.reset) {
               navigation.reset({
                 index: 1,
-                routes: [
-                  { name: 'ModeSelect' },
-                  { name: 'FlashNotifications', params: { nextRoute: 'Login' } },
-                ],
+                routes: [{ name: 'ModeSelect' }, { name: 'AgentLogin' }],
               });
             } else {
-              navigation.replace?.('FlashNotifications', { nextRoute: 'Login' });
+              navigation.replace?.('AgentLogin');
             }
             return;
           }
-          if (navigation.reset) {
-            navigation.reset({
-              index: 1,
-              routes: [{ name: 'ModeSelect' }, { name: loginRoute }],
-            });
-          } else {
-            navigation.replace?.(loginRoute);
-          }
+          // Customer path → land on ModeSelect; user taps the
+          // Customer tile and ModeSelectScreen handles the flash hop
+          // before navigating to Login.
+          navigation.replace?.('ModeSelect');
         };
 
         if (mode === 'agent') {
@@ -260,7 +250,7 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           const guest = isGuestUser(userRaw, '1111111111');
           if (!existing || demoOrOffline || guest) {
             await AsyncStorage.multiRemove(['agent_token', 'agent_data']);
-            await goToLogin('AgentLogin');
+            goToLogin('AgentLogin');
             return;
           }
           navigation.replace?.('AgentTabs');
@@ -273,7 +263,7 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           const guest = isGuestUser(userRaw, '0000000000');
           if (!existing || guest) {
             await AsyncStorage.multiRemove(['token', 'user', 'auth_token']);
-            await goToLogin('Login');
+            goToLogin('Login');
             return;
           }
           navigation.replace?.('HomeTabs');
@@ -396,14 +386,17 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           staysActiveInBackground: false,
           shouldDuckAndroid: true,
         }).catch(() => {});
-        // isLooping=false because glass-break is a one-shot sound
-        // effect — letting it loop kept replaying the snap-and-tinkle
-        // through the entire splash, and on slow navigation transitions
-        // the buffered tail leaked into the next screen. One play,
-        // tracks the visual completion, stops naturally.
+        // isLooping=true so the glass-break ambient sound carries
+        // through the ENTIRE splash (was felt to be too short and
+        // ending mid-animation). The cleanup function below fades
+        // it out over ~400ms before the unload so the audio doesn't
+        // hard-cut into silence — a smooth fade avoids the
+        // "buffered tail leaks into next screen" problem the previous
+        // one-shot setup had, while still satisfying the user's
+        // request for the sound to play through the whole splash.
         const { sound } = await audio.Audio.Sound.createAsync(audio.asset, {
           shouldPlay: false,
-          isLooping: false,
+          isLooping: true,
           volume: 1.0,
         });
         if (cancelled) {

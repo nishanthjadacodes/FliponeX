@@ -27,6 +27,7 @@ import {
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
+import FontAwesome from 'react-native-vector-icons/FontAwesome';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -198,13 +199,16 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
                 resizeMode="cover"
               />
             ) : (
-              // Fallback when admin didn't upload an image — colourful
-              // megaphone-with-sound-waves emoji (📣). On modern phones
-              // this renders as the red bullhorn + yellow sound arcs
-              // that matches the announcement style the user expects
-              // for festive-offer notifications.
+              // Fallback when admin didn't upload an image —
+              // FontAwesome "bullhorn" renders the megaphone WITH the
+              // three curved sound-wave arcs on the right (the 📣
+              // emoji's appearance varies by device emoji font; on
+              // some Android skins it dropped the waves and just
+              // showed a plain horn, which is why the user couldn't
+              // see them). FontAwesome glyphs render identically on
+              // every device. Gold colour matches the brand accent.
               <View style={[styles.image, styles.imageFallback]}>
-                <Text style={styles.imageFallbackEmoji}>📣</Text>
+                <FontAwesome name="bullhorn" size={130} color="#FCD34D" />
               </View>
             )}
             <View style={styles.body}>
