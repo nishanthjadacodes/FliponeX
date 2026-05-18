@@ -236,7 +236,7 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
                   <Text style={styles.discountPillText}>
                     {item.discount_percent}% OFF
                     {item.target_service_pattern
-                      ? `  ·  all ${item.target_service_pattern} services`
+                      ? `  ·  All ${item.target_service_pattern} services`
                       : ''}
                   </Text>
                 </View>
