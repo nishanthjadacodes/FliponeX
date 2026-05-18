@@ -282,47 +282,14 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       }
     };
 
-    // ── Warm launch (splashSeen=true) ──────────────────────────────
-    // User has seen the full animation before, so we don't replay
-    // the 7-second sequence — but we DO still show the splash screen
-    // for ~1.6 seconds so the brand moment lands on every launch
-    // (was: zero delay, which made the splash invisibly flash past
-    // and made users think it never rendered). Snap the entrance
-    // animations to their final state instantly so the user sees a
-    // fully-composed splash instead of a half-rendered frame.
-    if (splashSeen === true) {
-      bgOpacity.setValue(1);
-      logoScale.setValue(1);
-      sparkProgress.forEach((v) => v.setValue(1));
-      titleOpacity.setValue(1);
-      titleTranslateY.setValue(0);
-      pillOpacity.setValue(1);
-      featureOpacity.setValue(1);
-      subtitleOpacity.setValue(1);
-      // Short progress bar sweep so the user still gets a tactile
-      // "almost ready" beat — sweeps in 1.4s, then runRouting fires.
-      Animated.timing(progressX, {
-        toValue: 1,
-        duration: 1400,
-        easing: Easing.bezier(0.4, 0, 0.2, 1),
-        useNativeDriver: false,
-      }).start();
-      // Keep the arrow halo + audio spinning so the screen doesn't
-      // look frozen during the wait.
-      Animated.loop(
-        Animated.timing(arrowSpin, {
-          toValue: 1,
-          duration: 6000,
-          easing: Easing.linear,
-          useNativeDriver: true,
-        }),
-      ).start();
-      const warmTimeout = setTimeout(runRouting, 1600);
-      return () => {
-        cancelled = true;
-        clearTimeout(warmTimeout);
-      };
-    }
+    // Warm-launch shortcut removed — user reported the warm splash
+    // felt rushed (no glass-break sound, no progressive reveal of
+    // sparks / title / features). Now BOTH cold and warm launches
+    // run the full entrance sequence below: brand moment lands the
+    // same way every time, audio plays, services pop up, progress
+    // bar sweeps in sync. The splashSeen flag is still stamped at
+    // the start of runRouting so we keep the "first launch" semantic
+    // available for any future use.
 
     // ── First launch (splashSeen=false) — full animated splash ──────
     //

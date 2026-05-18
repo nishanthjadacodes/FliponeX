@@ -27,6 +27,7 @@ import {
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
+import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -123,11 +124,24 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   };
 
+  // Re-entrancy guard so rapid double-taps on Continue / Skip don't
+  // queue two navigation.reset calls. Tracked in a ref (not state)
+  // so we don't force an extra render after the button press.
+  const navigatingRef = useRef<boolean>(false);
+
   const markAllSeenAndContinue = (): void => {
-    // Seen-tracking removed: notifications now appear on every app
-    // open until admin deactivates them. Skip / Continue simply
-    // forwards to the next route without persisting any state.
-    continueNext();
+    if (navigatingRef.current) return;
+    navigatingRef.current = true;
+    // requestAnimationFrame defers the navigation by ONE frame so the
+    // button's press-state visual lands first — without this, the
+    // heavy mount of the next screen (Login / HomeTabs) ran on the
+    // same JS tick as the tap and the button looked frozen for ~200ms
+    // before anything happened.
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(continueNext);
+    } else {
+      continueNext();
+    }
   };
 
   const handleCta = async (item: FlashNotification): Promise<void> => {
@@ -185,8 +199,17 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
                 resizeMode="cover"
               />
             ) : (
+              // Fallback when admin didn't upload an image — use the
+              // bullhorn / megaphone icon from MaterialCommunityIcons.
+              // Reads as "announcement" with visible sound-wave arcs,
+              // matching the style customers expect for festive-offer
+              // notifications.
               <View style={[styles.image, styles.imageFallback]}>
-                <Text style={styles.imageFallbackEmoji}>📣</Text>
+                <MaterialCommunityIcons
+                  name="bullhorn"
+                  size={140}
+                  color="#FCD34D"
+                />
               </View>
             )}
             <View style={styles.body}>
@@ -284,7 +307,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  imageFallbackEmoji: { fontSize: 80 },
   body: {
     marginTop: 22,
     alignItems: 'center',
