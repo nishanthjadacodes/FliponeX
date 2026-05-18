@@ -27,7 +27,6 @@ import {
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
-import FontAwesome from 'react-native-vector-icons/FontAwesome';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -199,16 +198,13 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
                 resizeMode="cover"
               />
             ) : (
-              // Fallback when admin didn't upload an image —
-              // FontAwesome "bullhorn" renders the megaphone WITH the
-              // three curved sound-wave arcs on the right (the 📣
-              // emoji's appearance varies by device emoji font; on
-              // some Android skins it dropped the waves and just
-              // showed a plain horn, which is why the user couldn't
-              // see them). FontAwesome glyphs render identically on
-              // every device. Gold colour matches the brand accent.
+              // Bare-bones fallback for when admin didn't upload an
+              // image_url. In practice admin always provides a proper
+              // illustration (the green megaphone with hand, the red
+              // bullhorn etc.) so this branch rarely renders — the
+              // 📣 emoji just keeps the layout from collapsing.
               <View style={[styles.image, styles.imageFallback]}>
-                <FontAwesome name="bullhorn" size={130} color="#FCD34D" />
+                <Text style={styles.imageFallbackEmoji}>📣</Text>
               </View>
             )}
             <View style={styles.body}>
