@@ -381,49 +381,61 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       const audio = tryLoadGlassSound();
       if (!audio) return;
       // Tag each mount's audio attempt so the [splash-audio] logs
-      // are traceable across consecutive launches. Renders/launches
-      // count up so we can see in adb logcat whether the audio is
-      // actually being re-initialised each time the user reopens.
+      // are traceable across consecutive launches.
       const launchTag = Date.now().toString().slice(-6);
-      try {
-        console.log(`[splash-audio ${launchTag}] setAudioMode start`);
-        // Always re-set audio mode on every mount. Some Android OEMs
-        // reset the global audio-focus state between app sessions;
-        // without re-calling setAudioModeAsync, playsInSilentModeIOS
-        // and shouldDuckAndroid revert to defaults and the sound is
-        // dropped on warm launches. setAudioModeAsync is idempotent
-        // so calling it every time is safe.
-        await audio.Audio.setAudioModeAsync({
-          playsInSilentModeIOS: true,
-          staysActiveInBackground: false,
-          shouldDuckAndroid: true,
-          allowsRecordingIOS: false,
-        });
-        console.log(`[splash-audio ${launchTag}] setAudioMode ok`);
 
-        // Create the Sound with shouldPlay=true. We previously
-        // separated create + playAsync so we could check `cancelled`
-        // between them, but on warm launches the OS sometimes
-        // de-prioritised the deferred play() and dropped the audio
-        // request entirely. shouldPlay=true binds creation and
-        // playback into one atomic native call that always honours.
-        // isLooping=true so the glass-break carries through the
-        // full splash window. The cleanup function fades it out.
-        const { sound } = await audio.Audio.Sound.createAsync(audio.asset, {
-          shouldPlay: true,
-          isLooping: true,
-          volume: 1.0,
-        });
-        if (cancelled) {
-          console.log(`[splash-audio ${launchTag}] cancelled after createAsync — unloading`);
-          await sound.unloadAsync().catch(() => {});
-          return;
+      // Tries to create and play the audio. Returns true on success,
+      // false on failure so the caller can retry. Splitting this out
+      // lets us run TWO attempts: the first one immediately and a
+      // second one ~600ms later if the first failed. Why retry: when
+      // the user closes the app via back-button-from-Login and
+      // reopens it, the previous process's native audio resources
+      // can still be in the middle of release on Android. The new
+      // process's first createAsync hits a transient "audio focus
+      // unavailable" state and silently drops. A short delay lets
+      // the OS finish cleaning up, and the second attempt succeeds.
+      const tryPlay = async (attempt: number): Promise<boolean> => {
+        try {
+          console.log(`[splash-audio ${launchTag}] attempt ${attempt}: setAudioMode`);
+          await audio.Audio.setAudioModeAsync({
+            playsInSilentModeIOS: true,
+            staysActiveInBackground: false,
+            shouldDuckAndroid: true,
+            allowsRecordingIOS: false,
+          });
+          const { sound } = await audio.Audio.Sound.createAsync(audio.asset, {
+            shouldPlay: true,
+            isLooping: true,
+            volume: 1.0,
+          });
+          if (cancelled) {
+            console.log(`[splash-audio ${launchTag}] cancelled — unloading`);
+            await sound.unloadAsync().catch(() => {});
+            return true;
+          }
+          activeSound = sound;
+          console.log(`[splash-audio ${launchTag}] attempt ${attempt}: playing`);
+          return true;
+        } catch (e: any) {
+          console.warn(
+            `[splash-audio ${launchTag}] attempt ${attempt} FAILED:`,
+            e?.message,
+            e?.code,
+          );
+          return false;
         }
-        activeSound = sound;
-        console.log(`[splash-audio ${launchTag}] playing`);
-      } catch (e: any) {
-        console.warn(`[splash-audio ${launchTag}] FAILED:`, e?.message, e?.code);
-      }
+      };
+
+      // First attempt — usually succeeds on cold launches.
+      const ok = await tryPlay(1);
+      if (ok || cancelled) return;
+
+      // Retry after 600ms — covers the back-button-from-Login →
+      // reopen race where the previous process's native audio
+      // resources hadn't fully released yet.
+      await new Promise((r) => setTimeout(r, 600));
+      if (cancelled) return;
+      await tryPlay(2);
     })();
 
     // Tactile crack right at the end — fires when the progress bar
