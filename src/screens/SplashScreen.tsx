@@ -156,7 +156,12 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       if (!activeSound) return;
       const s = activeSound;
       activeSound = null;
+      // Order matters — pauseAsync flushes the native buffer
+      // immediately on Android (stopAsync alone lets the last
+      // ~50-200ms of buffered audio leak into the next screen).
+      // Then we zero volume, stop, and unload to free the asset.
       try { s.setIsLoopingAsync(false); } catch {}
+      try { s.pauseAsync(); } catch {}
       try { s.setVolumeAsync(0); } catch {}
       try { s.stopAsync(); } catch {}
       try { s.unloadAsync(); } catch {}
@@ -329,6 +334,23 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       Animated.timing(subtitleOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
     ]).start();
 
+    // Per-spark "tan tan tan tan" tactile feedback — fires a light
+    // haptic impact at the moment each service icon (Apply, Pay, KYC,
+    // Doorstep) pops out from the centre. Timings tuned to land just
+    // as each spark's spring settles (logoScale spring lands ~1050ms
+    // in, then sparks stagger 160ms apart). Stored in sparkHaptics
+    // so the cleanup function can clear pending ones if the user
+    // navigates away mid-sequence.
+    const SPARK_HAPTIC_OFFSETS = [1050, 1210, 1370, 1530];
+    const sparkHaptics: ReturnType<typeof setTimeout>[] = [];
+    SPARK_HAPTIC_OFFSETS.forEach((ms) => {
+      sparkHaptics.push(
+        setTimeout(() => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+        }, ms),
+      );
+    });
+
     // Continuous arrow halo spin — native thread, stays smooth even
     // while routing-decision JS work runs below.
     Animated.loop(
@@ -374,9 +396,14 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           staysActiveInBackground: false,
           shouldDuckAndroid: true,
         }).catch(() => {});
+        // isLooping=false because glass-break is a one-shot sound
+        // effect — letting it loop kept replaying the snap-and-tinkle
+        // through the entire splash, and on slow navigation transitions
+        // the buffered tail leaked into the next screen. One play,
+        // tracks the visual completion, stops naturally.
         const { sound } = await audio.Audio.Sound.createAsync(audio.asset, {
           shouldPlay: false,
-          isLooping: true,
+          isLooping: false,
           volume: 1.0,
         });
         if (cancelled) {
@@ -407,6 +434,10 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
       cancelled = true;
       clearTimeout(timeout);
       if (breakTimer) clearTimeout(breakTimer);
+      // Cancel any pending per-spark haptic taps so they don't fire
+      // after the splash has unmounted (would buzz the user randomly
+      // on the next screen).
+      sparkHaptics.forEach((t) => clearTimeout(t));
       // Backup cleanup — runRouting already called stopAudio, but if
       // the screen unmounts for some other reason (parent navigation
       // re-mount) we still want the audio gone.

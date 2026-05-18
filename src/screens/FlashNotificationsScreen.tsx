@@ -27,7 +27,6 @@ import {
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
-import MaterialCommunityIcons from 'react-native-vector-icons/MaterialCommunityIcons';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -199,17 +198,13 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
                 resizeMode="cover"
               />
             ) : (
-              // Fallback when admin didn't upload an image — use the
-              // bullhorn / megaphone icon from MaterialCommunityIcons.
-              // Reads as "announcement" with visible sound-wave arcs,
-              // matching the style customers expect for festive-offer
-              // notifications.
+              // Fallback when admin didn't upload an image — colourful
+              // megaphone-with-sound-waves emoji (📣). On modern phones
+              // this renders as the red bullhorn + yellow sound arcs
+              // that matches the announcement style the user expects
+              // for festive-offer notifications.
               <View style={[styles.image, styles.imageFallback]}>
-                <MaterialCommunityIcons
-                  name="bullhorn"
-                  size={140}
-                  color="#FCD34D"
-                />
+                <Text style={styles.imageFallbackEmoji}>📣</Text>
               </View>
             )}
             <View style={styles.body}>
@@ -307,6 +302,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  imageFallbackEmoji: { fontSize: 140 },
   body: {
     marginTop: 22,
     alignItems: 'center',
