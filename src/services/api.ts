@@ -376,8 +376,30 @@ export const updateProfile = async (
     const response = await api.put<ApiResponse<User>>('/profile', profileData);
     return response.data;
   } catch (error: any) {
-    console.error('Update profile error:', error);
-    throw error.response?.data || { message: 'Failed to update profile' };
+    // Preserve as much diagnostic info as possible so the caller can show
+    // a useful message. The old `throw error.response?.data || {…}`
+    // collapsed every network/timeout/cold-start failure into a single
+    // generic "Failed to update profile" string with no status code.
+    const status = error?.response?.status;
+    const serverMsg = error?.response?.data?.message;
+    let message: string;
+    if (serverMsg) {
+      message = serverMsg;
+    } else if (error?.code === 'ECONNABORTED') {
+      message = 'Request timed out. The server may be waking up — please try again in a moment.';
+    } else if (error?.code === 'ERR_NETWORK' || error?.message === 'Network Error') {
+      message = 'Cannot reach server. Check your internet connection.';
+    } else if (error?.message) {
+      message = error.message;
+    } else {
+      message = 'Failed to update profile';
+    }
+    console.log('[updateProfile] failed:', { status, code: error?.code, message });
+    const wrapped: any = new Error(message);
+    wrapped.status = status;
+    wrapped.code = error?.code;
+    wrapped.serverData = error?.response?.data;
+    throw wrapped;
   }
 };
 

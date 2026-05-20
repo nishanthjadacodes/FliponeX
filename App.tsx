@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { NavigationContainer, NavigationContainerRef } from '@react-navigation/native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { QueryClientProvider } from '@tanstack/react-query';
+import { queryClient } from './src/lib/queryClient';
+import { useAppStore } from './src/store/useAppStore';
 import AppNavigator from './AppNavigator';
 import {
   registerForPushNotifications,
@@ -10,6 +13,7 @@ import {
 import type { RootStackParamList } from './src/types';
 import { loadAppLanguage } from './src/i18n';
 import NotificationBanner from './src/components/NotificationBanner';
+import ErrorBoundary from './src/components/ErrorBoundary';
 import { API_BASE_URL } from './src/config';
 
 // Navigation lifecycle in this app:
@@ -32,6 +36,14 @@ export default function App() {
 
   useEffect(() => {
     loadAppLanguage().finally(() => setI18nReady(true));
+  }, []);
+
+  // Seed the Zustand app store from AsyncStorage once on launch so
+  // every screen reads user / mode from a single reactive source.
+  // The store wraps the existing storage utils, so screens not yet
+  // migrated keep working unchanged.
+  useEffect(() => {
+    useAppStore.getState().hydrate();
   }, []);
 
   useEffect(() => {
@@ -61,15 +73,19 @@ export default function App() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <NavigationContainer ref={navRef}>
-        <AppNavigator />
-        {/* Top-down banner for in-app notifications. Renders ABOVE the
-            stack screens (zIndex 9999) so it's visible on every screen.
-            Polls the backend's /notifications/inbox on app focus and
-            shows the topmost unseen notification with a tap-to-deep-link
-            CTA. Handles both customer and agent surfaces. */}
-        <NotificationBanner navigationRef={navRef} apiBase={API_BASE_URL} />
-      </NavigationContainer>
+      <QueryClientProvider client={queryClient}>
+        <ErrorBoundary>
+          <NavigationContainer ref={navRef}>
+            <AppNavigator />
+            {/* Top-down banner for in-app notifications. Renders ABOVE the
+                stack screens (zIndex 9999) so it's visible on every screen.
+                Polls the backend's /notifications/inbox on app focus and
+                shows the topmost unseen notification with a tap-to-deep-link
+                CTA. Handles both customer and agent surfaces. */}
+            <NotificationBanner navigationRef={navRef} apiBase={API_BASE_URL} />
+          </NavigationContainer>
+        </ErrorBoundary>
+      </QueryClientProvider>
     </GestureHandlerRootView>
   );
 }

@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsFocused } from '@react-navigation/native';
 import {
   View,
   Text,
@@ -17,6 +19,7 @@ import { readCache, writeCache } from '../../utils/agent/cache';
 import { COLORS } from '../../constants/agent/colors';
 import { LinearGradient } from 'expo-linear-gradient';
 import { computeDistanceToAddress, formatDistance } from '../../utils/agent/distance';
+import { formatBookingAddress } from '../../utils/addressFormat';
 
 // ─── Status helpers (module-scope, no hooks) ────────────────────────────────
 // Explicit emerald green for completed/work_completed — COLORS.success
@@ -113,7 +116,7 @@ const TaskCard: React.FC<TaskCardProps> = ({ item, index, distance, onOpen, onAc
 
         <View style={styles.taskDetails}>
           <Text style={styles.address} numberOfLines={2}>
-            {item.address}
+            {formatBookingAddress(item.address)}
           </Text>
           <View style={styles.taskMeta}>
             <Text style={styles.amount}>
@@ -191,10 +194,35 @@ interface TaskListScreenProps {
 }
 
 const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) => {
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
+  const queryClient = useQueryClient();
+  const isFocused = useIsFocused();
   const [filter, setFilter] = useState<FilterId>(route?.params?.initialFilter || 'all');
+
+  // Task list via TanStack Query, keyed on the active filter so each
+  // filter caches independently. refetchInterval (gated on focus)
+  // surfaces new customer bookings automatically every 15s.
+  const {
+    data: tasks = [],
+    isLoading: loading,
+    refetch: refetchTasks,
+  } = useQuery({
+    queryKey: ['agentTasks', filter],
+    queryFn: async () => {
+      const response = await getTasks(filter as string);
+      const list = response?.tasks || [];
+      writeCache<TasksCacheValue>(`tasks:${filter}`, { tasks: list });
+      return list;
+    },
+    refetchInterval: isFocused ? 15_000 : false,
+  });
+  // Pull-to-refresh spinner — kept as local state so the background
+  // 15s poll doesn't flash the RefreshControl.
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+  // Thin wrapper so the existing loadTasks({ silent }) call sites
+  // (after accept / reject) keep working — the arg is now ignored.
+  const loadTasks = (_opts?: { silent?: boolean }): void => {
+    refetchTasks();
+  };
   const [selectedTask, setSelectedTask] = useState<AgentTask | null>(null);
   const [detailModalVisible, setDetailModalVisible] = useState<boolean>(false);
   const [distances, setDistances] = useState<Record<string, string>>({});
@@ -205,13 +233,18 @@ const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) =>
     if (incoming && incoming !== filter) setFilter(incoming);
   }, [route?.params?.initialFilter]);
 
+  // Seed the query cache from the persisted per-filter snapshot so a
+  // cold start shows last-known tasks instantly while the live fetch
+  // runs.
   useEffect(() => {
     (async () => {
+      if (queryClient.getQueryData(['agentTasks', filter])) return;
       const cached = await readCache<TasksCacheValue>(`tasks:${filter}`);
-      if (cached?.value?.tasks) setTasks(cached.value.tasks);
-      loadTasks({ silent: true });
+      if (cached?.value?.tasks) {
+        queryClient.setQueryData(['agentTasks', filter], cached.value.tasks);
+      }
     })();
-  }, [filter]);
+  }, [filter, queryClient]);
 
   // Compute real agent→service distance for every task that appears in the list.
   useEffect(() => {
@@ -234,49 +267,12 @@ const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) =>
     };
   }, [tasks]);
 
-  // Poll every 15s while focused so new customer bookings surface automatically
-  useEffect(() => {
-    let id: ReturnType<typeof setInterval> | null = null;
-    const tick = (): void => {
-      loadTasks({ silent: true });
-    };
-    const start = (): void => {
-      tick();
-      id = setInterval(tick, 15000);
-    };
-    const stop = (): void => {
-      if (id) {
-        clearInterval(id);
-        id = null;
-      }
-    };
-    const fu = navigation.addListener('focus', start);
-    const bu = navigation.addListener('blur', stop);
-    return () => {
-      stop();
-      fu();
-      bu();
-    };
-  }, [navigation, filter]);
-
-  const loadTasks = async ({ silent = false }: { silent?: boolean } = {}): Promise<void> => {
-    if (!silent && tasks.length === 0) setLoading(true);
-    try {
-      const response = await getTasks(filter as string);
-      const list = response?.tasks || [];
-      setTasks(list);
-      writeCache<TasksCacheValue>(`tasks:${filter}`, { tasks: list });
-    } catch (error) {
-      console.error('Error loading tasks:', error);
-      if (tasks.length === 0) setTasks([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // The 15s poll is now the query's refetchInterval — no manual
+  // interval / focus-blur wiring needed.
 
   const onRefresh = async (): Promise<void> => {
     setRefreshing(true);
-    await loadTasks({ silent: true });
+    await refetchTasks();
     setRefreshing(false);
   };
 
@@ -421,7 +417,7 @@ const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) =>
                     label="Service"
                     value={selectedTask.serviceName || selectedTask.serviceType}
                   />
-                  <DetailRow label="Address" value={selectedTask.address} />
+                  <DetailRow label="Address" value={formatBookingAddress(selectedTask.address)} />
                   <DetailRow label="Amount" value={`₹${selectedTask.amount}`} />
                   <DetailRow
                     label="Distance"

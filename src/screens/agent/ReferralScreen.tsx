@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -81,13 +82,39 @@ type ShareType = 'whatsapp' | 'general' | string;
 const ReferralScreen: React.FC = () => {
   const navigation = useNavigation<any>();
   const insets = useSafeAreaInsets();
-  const [referralData, setReferralData] = useState<ReferralData | null>(null);
-  const [referralStats, setReferralStats] = useState<ReferralStats | null>(null);
-  const [, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<string>('overview');
-  const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
   const [syncingRewards, setSyncingRewards] = useState<boolean>(false);
+
+  // Referral data + stats via TanStack Query. While the user sits on
+  // the Royalty tab the query polls every 30s (refetchInterval) so the
+  // headline counter reflects new completed bookings as they land.
+  const {
+    data: referral,
+    dataUpdatedAt,
+    refetch: refetchReferral,
+  } = useQuery({
+    queryKey: ['agentReferral'],
+    queryFn: async () => {
+      const [referralResponse, statsResponse] = await Promise.all([
+        getReferrals(),
+        getReferralStats(),
+      ]);
+      return {
+        referralData: referralResponse as ReferralData,
+        referralStats: statsResponse as ReferralStats,
+      };
+    },
+    refetchInterval: activeTab === 'royalty' ? 30_000 : false,
+  });
+  const referralData: ReferralData | null = referral?.referralData ?? null;
+  const referralStats: ReferralStats | null = referral?.referralStats ?? null;
+  const lastRefreshAt: Date | null = dataUpdatedAt ? new Date(dataUpdatedAt) : null;
+
+  // Thin wrapper so existing loadReferralData() call sites keep working.
+  const loadReferralData = (): void => {
+    refetchReferral();
+  };
 
   // Animated counter for the "Current Month Royalty (Est.)" headline. We
   // tween from 0 → server-provided value whenever the data refreshes so
@@ -102,63 +129,30 @@ const ReferralScreen: React.FC = () => {
     return () => royaltyAnim.removeListener(id);
   }, [royaltyAnim]);
 
+  // React to fresh referral data: tween the royalty headline counter
+  // and, on first load, jump to the network tab if the rep already
+  // has referrals. Runs whenever the query data changes (initial
+  // fetch + 30s polls) — same trigger points as the old in-load
+  // side effects.
   useEffect(() => {
-    loadReferralData();
-  }, []);
-
-  // Live refresh — while the user is sitting on the Royalty tab we re-fetch
-  // every 30s so the headline counter reflects new completed bookings as
-  // they land. Cleanup on tab switch / unmount.
-  useEffect(() => {
-    if (activeTab !== 'royalty') return;
-    const interval = setInterval(() => {
-      loadReferralData();
-    }, 30 * 1000);
-    return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab]);
-
-  const loadReferralData = async (): Promise<void> => {
-    setLoading(true);
-    try {
-      const [referralResponse, statsResponse] = await Promise.all([
-        getReferrals(),
-        getReferralStats(),
-      ]);
-
-      const next = referralResponse as ReferralData;
-      setReferralData(next);
-      setReferralStats(statsResponse);
-      setLastRefreshAt(new Date());
-
-      // Tween the headline counter from its previous value to the new one.
-      // 800ms is short enough to feel responsive; longer feels laggy on
-      // back-to-back polls (every 30s while the tab is open).
-      const target = Number(next?.royalty?.currentMonthRoyalty || 0);
-      Animated.timing(royaltyAnim, {
-        toValue: target,
-        duration: 800,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: false, // we read the animated value via listener
-      }).start();
-
-      // If the user already has referrals, jump straight to the network/list
-      // tab the first time the screen loads. Otherwise stay on Overview so
-      // they see the share-code CTA. Don't override an explicit tab choice.
-      const list = next?.referrals;
-      if (Array.isArray(list) && list.length > 0 && activeTab === 'overview') {
-        setActiveTab('referrals');
-      }
-    } catch (error) {
-      console.error('Error loading referral data:', error);
-    } finally {
-      setLoading(false);
+    if (!referralData) return;
+    const target = Number(referralData?.royalty?.currentMonthRoyalty || 0);
+    Animated.timing(royaltyAnim, {
+      toValue: target,
+      duration: 800,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+    const list = referralData?.referrals;
+    if (Array.isArray(list) && list.length > 0 && activeTab === 'overview') {
+      setActiveTab('referrals');
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [referralData]);
 
   const onRefresh = async (): Promise<void> => {
     setRefreshing(true);
-    await loadReferralData();
+    await refetchReferral();
     setRefreshing(false);
   };
 

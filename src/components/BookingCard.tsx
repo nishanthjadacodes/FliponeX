@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, Pressable, Animated } from 'react-native';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import * as haptics from '../utils/haptics';
 import { formatBookingId } from '../utils/bookingId';
+import { formatBookingAddress } from '../utils/addressFormat';
 
 // Loose booking shape — accepts both snake_case (backend) and camelCase
 // variants the older screens use, so callers don't have to normalize first.
@@ -166,24 +167,21 @@ const BookingCard: React.FC<BookingCardProps> = ({ booking, onPress }) => {
               )}
             </View>
           </View>
-          {(booking.address || booking.service_address) && (
-            <View style={styles.detailRow}>
-              <Text style={styles.detailLabel}>Address:</Text>
-              <Text style={styles.detailValue} numberOfLines={2}>
-                {(() => {
-                  // If the stored "address" is actually just lat,lng
-                  // (reverse-geocoding failed at booking time), show a
-                  // friendlier "📍 Map pin" label instead of raw coords.
-                  const raw = booking.address || booking.service_address || '';
-                  const m = String(raw).match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
-                  if (m) {
-                    return `📍 Map pin: ${Number(m[1]).toFixed(4)}, ${Number(m[2]).toFixed(4)}`;
-                  }
-                  return raw;
-                })()}
-              </Text>
-            </View>
-          )}
+          {(() => {
+            // formatBookingAddress handles every shape we've seen on
+            // this field (string, GPS object, null, mixed) so the card
+            // never tries to render a raw object inside <Text>.
+            const label = formatBookingAddress(booking.address || booking.service_address);
+            if (!label) return null;
+            return (
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Address:</Text>
+                <Text style={styles.detailValue} numberOfLines={2}>
+                  {label}
+                </Text>
+              </View>
+            );
+          })()}
         </View>
       </Pressable>
     </Animated.View>

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Alert, ScrollView,
   TextInput, ActivityIndicator, Share, Linking, Modal, RefreshControl,
@@ -8,9 +8,12 @@ import Icon from 'react-native-vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import * as ImagePicker from 'expo-image-picker';
-import { clearAuthSession, storeUser, getUser } from '../utils/storage';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { clearAuthSession } from '../utils/storage';
 import { getProfile, updateProfile, getMyBookings, getMyDocuments, uploadAvatar, deleteAvatar } from '../services/api';
 import * as api from '../services/api';
+import { useAppStore } from '../store/useAppStore';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 import {
   STRINGS,
   PRIVACY_POLICY,
@@ -63,17 +66,85 @@ interface MenuRowProps {
   onPress?: () => void;
 }
 
+// KYC progress — driven by the actual uploaded-doc list from
+// /documents/kyc/my. Same required-doc set as DocumentsScreen so the
+// numbers stay in sync between the two screens.
+const KYC_REQUIRED = ['aadhaar_front', 'aadhaar_back', 'pan_card', 'profile_photo'];
+
+// ─── Query functions ────────────────────────────────────────────────
+// Profile — GET /profile returns { success, user } on current paths,
+// { success, data } on legacy ones; fall back to the bare object.
+const fetchProfile = async (): Promise<Record<string, any>> => {
+  const p: any = await getProfile();
+  return p?.user || p?.data || p || {};
+};
+
+interface ProfileStats {
+  bookingsCount: number;
+  kycUploaded: number;
+  kycVerified: number;
+}
+// Stats — bookings count + KYC progress, from two list endpoints.
+// Resilient: a failed endpoint just contributes 0, never throws.
+const fetchProfileStats = async (): Promise<ProfileStats> => {
+  const [b, d] = await Promise.all([
+    getMyBookings().catch(() => [] as any),
+    getMyDocuments().catch(() => [] as any),
+  ]);
+  const bookingsCount = Array.isArray(b) ? b.length : ((b as any)?.data?.length || 0);
+  const docList: any[] = Array.isArray(d) ? d : ((d as any)?.data || []);
+  const uploadedTypes = new Set(
+    docList.map((doc: any) => (doc.document_type || doc.docType || '').toLowerCase()),
+  );
+  const verifiedTypes = new Set(
+    docList
+      .filter((doc: any) => doc.is_verified === true || doc.status === 'verified')
+      .map((doc: any) => (doc.document_type || doc.docType || '').toLowerCase()),
+  );
+  return {
+    bookingsCount,
+    kycUploaded: KYC_REQUIRED.filter((t) => uploadedTypes.has(t)).length,
+    kycVerified: KYC_REQUIRED.filter((t) => verifiedTypes.has(t)).length,
+  };
+};
+
 const ProfileScreen: React.FC<Props> = ({ navigation }) => {
-  const [profile, setProfile] = useState<any>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
-  const [bookingsCount, setBookingsCount] = useState<number>(0);
-  // KYC progress — driven by the actual uploaded-doc list from
-  // /documents/kyc/my. Same required-doc set as DocumentsScreen so the
-  // numbers stay in sync between the two screens.
-  const KYC_REQUIRED = ['aadhaar_front', 'aadhaar_back', 'pan_card', 'profile_photo'];
-  const [kycUploaded, setKycUploaded] = useState<number>(0);
-  const [kycVerified, setKycVerified] = useState<number>(0);
+  const queryClient = useQueryClient();
+
+  // ─── Server state via TanStack Query ──────────────────────────────
+  // `profile` is the API user object; `stats` is the booking/KYC
+  // counts. Replaces the old loadProfile() + 6 useState fields +
+  // focus-listener plumbing.
+  const {
+    data: profile = null,
+    isLoading: profileLoading,
+    isFetching: profileFetching,
+    refetch: refetchProfile,
+  } = useQuery({ queryKey: ['profile'], queryFn: fetchProfile });
+
+  const { data: stats, refetch: refetchStats } = useQuery({
+    queryKey: ['profileStats'],
+    queryFn: fetchProfileStats,
+  });
+  const bookingsCount = stats?.bookingsCount ?? 0;
+  const kycUploaded = stats?.kycUploaded ?? 0;
+  const kycVerified = stats?.kycVerified ?? 0;
+
+  // Patches the profile cache + the shared Zustand user in one call.
+  // This is what replaced the old setProfile + getUser/storeUser
+  // "cache-mirror dance" — the store's patchUser writes through to
+  // AsyncStorage, so HomeScreen's header avatar etc. stay in sync.
+  const applyProfilePatch = useCallback(
+    (patch: Record<string, unknown>): void => {
+      queryClient.setQueryData(['profile'], (old: any) => ({
+        ...(old || {}),
+        ...patch,
+      }));
+      useAppStore.getState().patchUser(patch);
+    },
+    [queryClient],
+  );
+
   const [editing, setEditing] = useState<boolean>(false);
   const [formData, setFormData] = useState<{ name: string; email: string; mobile: string; address: string }>({ name: '', email: '', mobile: '', address: '' });
   // Avatar upload state — flips while the camera/gallery picker is open
@@ -111,7 +182,6 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     (profile?.mobile ? `FL${String(profile.mobile).slice(-6)}` : 'FLIPON');
 
   useEffect(() => {
-    loadProfile();
     loadSavedSettings();
     (async () => {
       try {
@@ -123,10 +193,36 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     })();
   }, []);
 
+  // Refetch profile + stats when the screen regains focus (replaces
+  // the old navigation.addListener('focus', loadProfile)).
+  const onRefresh = useCallback((): void => {
+    refetchProfile();
+    refetchStats();
+  }, [refetchProfile, refetchStats]);
+  useRefetchOnFocus(onRefresh);
+
+  // Seed the edit form from the latest profile — but NOT while the
+  // user is mid-edit, so a background refetch can't wipe their typing.
   useEffect(() => {
-    const unsubscribe = navigation.addListener?.('focus', loadProfile);
-    return unsubscribe;
-  }, [navigation]);
+    if (profile && !editing) {
+      setFormData({
+        name: profile.name || '',
+        email: profile.email || '',
+        mobile: profile.mobile || '',
+        address: profile.address || '',
+      });
+    }
+  }, [profile, editing]);
+
+  // Mirror the freshly-fetched profile into the shared Zustand user so
+  // screens not yet migrated (HomeScreen header avatar / greeting)
+  // pick up the canonical server data. setUser writes through to
+  // AsyncStorage, so the next focus of those screens is in sync.
+  useEffect(() => {
+    if (profile && (profile.id || profile.mobile)) {
+      useAppStore.getState().setUser(profile);
+    }
+  }, [profile]);
 
   // Load persisted preferences (notifications / language / saved addresses)
   const loadSavedSettings = async (): Promise<void> => {
@@ -189,52 +285,8 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     });
   };
 
-  const loadProfile = async (): Promise<void> => {
-    try {
-      const [p, b, d] = await Promise.all([
-        getProfile().catch(() => ({} as any)),
-        getMyBookings().catch(() => [] as any),
-        getMyDocuments().catch(() => [] as any),
-      ]);
-      // Backend's GET /profile returns { success, user } — older paths
-      // returned { success, data }. Pull whichever is present, fall back
-      // to the bare object. Without this, `data.name` was always
-      // undefined, so the avatar's first-letter reverted to "U" and the
-      // edit modal opened with empty name/email even after saves.
-      const data: any =
-        (p as any)?.user || (p as any)?.data || p || {};
-      setProfile(data);
-      setBookingsCount(Array.isArray(b) ? b.length : ((b as any)?.data?.length || 0));
-
-      // KYC progress: count REQUIRED doc types that have a server-side row.
-      // Same logic as DocumentsScreen, so stat card stays in sync.
-      const docList: any[] = Array.isArray(d) ? d : ((d as any)?.data || []);
-      const uploadedTypes = new Set(
-        docList.map((doc: any) => (doc.document_type || doc.docType || '').toLowerCase())
-      );
-      const verifiedTypes = new Set(
-        docList
-          .filter((doc: any) => doc.is_verified === true || doc.status === 'verified')
-          .map((doc: any) => (doc.document_type || doc.docType || '').toLowerCase())
-      );
-      setKycUploaded(KYC_REQUIRED.filter(t => uploadedTypes.has(t)).length);
-      setKycVerified(KYC_REQUIRED.filter(t => verifiedTypes.has(t)).length);
-
-      setFormData({
-        name: data.name || '',
-        email: data.email || '',
-        mobile: data.mobile || '',
-        address: data.address || '',
-      });
-    } catch (error) {
-      console.error('Profile load error:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  const onRefresh = (): void => { setRefreshing(true); loadProfile(); };
+  // loadProfile / onRefresh are now handled by TanStack Query — see
+  // the useQuery calls + useRefetchOnFocus at the top of the component.
 
   // Avatar picker — bottom-sheet style choice between Camera and Gallery,
   // then resizes / crops to a 1:1 square via the picker's allowsEditing
@@ -287,11 +339,9 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
             try {
               setAvatarUploading(true);
               await deleteAvatar();
-              setProfile((prev: any) => ({ ...(prev || {}), profile_pic: null }));
-              try {
-                const cached = (await getUser()) || {};
-                await storeUser({ ...cached, profile_pic: null });
-              } catch (_) { /* non-fatal */ }
+              // Updates the profile query cache + the shared Zustand
+              // user (which writes through to AsyncStorage) in one call.
+              applyProfilePatch({ profile_pic: null });
               haptics.success();
             } catch (e: any) {
               console.log('avatar delete error:', e?.message || e);
@@ -346,15 +396,10 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
       setAvatarUploading(true);
       const { profile_pic } = await uploadAvatar({ uri, name, type });
-      // Optimistic update so the camera overlay flips back to the new pic
-      // immediately — the next loadProfile refresh would set the same value.
-      setProfile((prev: any) => ({ ...(prev || {}), profile_pic }));
-      // Mirror to AsyncStorage so HomeScreen's header avatar picks it up
-      // on the next focus, without waiting for a full /profile re-fetch.
-      try {
-        const cached = (await getUser()) || {};
-        await storeUser({ ...cached, profile_pic });
-      } catch (_) { /* non-fatal */ }
+      // One call updates the profile query cache + the shared Zustand
+      // user (→ AsyncStorage), so HomeScreen's header avatar refreshes
+      // without waiting for a full /profile re-fetch.
+      applyProfilePatch({ profile_pic });
       haptics.success();
     } catch (e: any) {
       console.log('avatar pick error:', e?.message || e);
@@ -367,26 +412,77 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
   const handleSave = async (): Promise<void> => {
     try {
-      // Persist via the API.
-      await updateProfile(formData);
-      const merged = { ...(profile || {}), ...formData };
-      setProfile(merged);
-      // Mirror the change into the AsyncStorage `user` cache so other
-      // screens (HomeScreen header avatar / first-letter fallback) pick
-      // up the new name + email on their next focus-driven reload.
-      try {
-        const cached = (await getUser()) || {};
-        await storeUser({ ...cached, ...formData });
-      } catch (_) { /* cache miss is non-fatal */ }
+      // Build a clean payload — the backend only accepts `name` and
+      // `email` on this endpoint. Mobile is the auth identity (not
+      // editable). Address has no column on the shared User model,
+      // so we keep it in the local cache only.
+      //
+      // We also:
+      //   • trim whitespace (autocorrect on some keyboards inserts
+      //     leading/trailing spaces that fail email uniqueness checks)
+      //   • drop empty email so the backend doesn't try to set "" and
+      //     trip the unique constraint on the email column
+      //   • drop fields that haven't changed so we don't accidentally
+      //     re-submit a stale email that now conflicts with another
+      //     account
+      const trimmedName = (formData.name || '').trim();
+      const trimmedEmail = (formData.email || '').trim();
+      const payload: { name?: string; email?: string } = {};
+      if (trimmedName && trimmedName !== (profile?.name || '')) {
+        payload.name = trimmedName;
+      }
+      if (trimmedEmail !== (profile?.email || '')) {
+        // Empty string means "user cleared the field" — send null so
+        // the backend stores NULL instead of "" (which would collide
+        // with every other user who left their email blank).
+        if (trimmedEmail) {
+          payload.email = trimmedEmail;
+        }
+      }
+
+      if (Object.keys(payload).length > 0) {
+        await updateProfile(payload as any);
+      }
+
+      // One call patches the profile query cache + the shared Zustand
+      // user (→ AsyncStorage). This replaced the old setProfile +
+      // getUser/storeUser "cache-mirror dance" — HomeScreen's header
+      // avatar and name now update instantly, everywhere.
+      applyProfilePatch({
+        name: trimmedName,
+        email: trimmedEmail,
+        address: formData.address,
+      });
       setEditing(false);
       haptics.success();
       Alert.alert('Success', 'Profile updated');
-      // Re-fetch in the background so local state matches the server's
-      // canonical view (and the avatar initial sticks across navigations).
-      loadProfile();
-    } catch (error) {
+      // Re-fetch in the background so the cache matches the server's
+      // canonical view.
+      refetchProfile();
+    } catch (error: any) {
       haptics.error();
-      Alert.alert('Error', 'Failed to update profile');
+      // Surface the real reason so the user (and we) know what went
+      // wrong on devices where this used to fail silently. Common cases:
+      //   • email already in use by another account
+      //   • token expired (Session expired — please sign in again)
+      //   • network timeout on Render cold-start
+      const raw =
+        error?.message ||
+        error?.response?.data?.message ||
+        error?.data?.message ||
+        '';
+      const status = error?.response?.status || error?.status;
+      let friendly = 'Could not update profile. Please try again.';
+      if (status === 401 || /unauthor/i.test(raw)) {
+        friendly = 'Your session has expired. Please log in again.';
+      } else if (/duplicate|unique|already.*(exist|use)/i.test(raw)) {
+        friendly = 'That email is already linked to another account.';
+      } else if (/network|timeout|aborted/i.test(raw)) {
+        friendly = 'Network is slow. Check your connection and try again.';
+      } else if (raw) {
+        friendly = raw;
+      }
+      Alert.alert('Could not save', friendly);
     }
   };
 
@@ -455,7 +551,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     );
   };
 
-  if (loading) {
+  if (profileLoading) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#0D3B66" />
@@ -472,7 +568,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     >
     <View style={styles.container}>
       <ScrollView
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#0D3B66']} />}
+        refreshControl={<RefreshControl refreshing={profileFetching} onRefresh={onRefresh} colors={['#0D3B66']} />}
         stickyHeaderIndices={[0]}
         keyboardShouldPersistTaps="handled"
       >

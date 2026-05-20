@@ -8,10 +8,12 @@ import {
   RefreshControl,
   Animated,
 } from 'react-native';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { getEarnings, type EarningRecord } from '../../services/agent/api';
 import { readCache, writeCache } from '../../utils/agent/cache';
 import { COLORS } from '../../constants/agent/colors';
 import { LinearGradient } from 'expo-linear-gradient';
+import { useRefetchOnFocus } from '../../lib/useRefetchOnFocus';
 
 type PeriodId = 'all' | 'today' | 'week' | 'month';
 
@@ -36,12 +38,36 @@ interface EarningsScreenProps {
 }
 
 const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
-  const [earnings, setEarnings] = useState<EarningRecord[]>([]);
-  const [totalEarnings, setTotalEarnings] = useState<number>(0);
-  const [todayEarnings, setTodayEarnings] = useState<number>(0);
-  const [weekEarnings, setWeekEarnings] = useState<number>(0);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
+  const queryClient = useQueryClient();
+
+  // Earnings via TanStack Query. getEarnings() returns the record
+  // list + total/today/week aggregates; the queryFn also writes a
+  // cache snapshot for instant cold-start render.
+  const {
+    data: earningsData,
+    isLoading: loading,
+    isFetching: refreshing,
+    refetch: refetchEarnings,
+  } = useQuery({
+    queryKey: ['agentEarnings'],
+    queryFn: async () => {
+      const response = await getEarnings();
+      const earningsList = response.earnings || [];
+      const packed = {
+        earnings: earningsList,
+        total: response.total || 0,
+        today: response.today || 0,
+        week: response.week || 0,
+      };
+      writeCache<EarningsCacheValue>('earnings', packed);
+      return packed;
+    },
+  });
+  const earnings: EarningRecord[] = earningsData?.earnings || [];
+  const totalEarnings: number = earningsData?.total || 0;
+  const todayEarnings: number = earningsData?.today || 0;
+  const weekEarnings: number = earningsData?.week || 0;
+
   const [selectedPeriod, setSelectedPeriod] = useState<PeriodId>('all');
 
   // Animation values
@@ -52,27 +78,20 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
   const todayEarningsAnim = useRef(new Animated.Value(0)).current;
   const weekEarningsAnim = useRef(new Animated.Value(0)).current;
 
+  // Seed the query cache from the persisted snapshot so a cold start
+  // shows last-known earnings instantly while the live fetch runs.
   useEffect(() => {
     (async () => {
+      if (queryClient.getQueryData(['agentEarnings'])) return;
       const cached = await readCache<EarningsCacheValue>('earnings');
       if (cached?.value) {
-        const e = cached.value;
-        setEarnings(e.earnings || []);
-        setTotalEarnings(e.total || 0);
-        setTodayEarnings(e.today || 0);
-        setWeekEarnings(e.week || 0);
+        queryClient.setQueryData(['agentEarnings'], cached.value);
       }
-      loadEarningsData();
     })();
-  }, []);
+  }, [queryClient]);
 
-  // Refresh on focus
-  useEffect(() => {
-    const unsubscribe = navigation.addListener('focus', () => {
-      loadEarningsData();
-    });
-    return unsubscribe;
-  }, [navigation]);
+  // Refresh on focus.
+  useRefetchOnFocus(refetchEarnings);
 
   // Start animations when data loads
   useEffect(() => {
@@ -107,31 +126,8 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
     ]).start();
   };
 
-  const loadEarningsData = async (): Promise<void> => {
-    try {
-      const response = await getEarnings();
-      const earningsList = response.earnings || [];
-      setEarnings(earningsList);
-      setTotalEarnings(response.total || 0);
-      setTodayEarnings(response.today || 0);
-      setWeekEarnings(response.week || 0);
-      writeCache<EarningsCacheValue>('earnings', {
-        earnings: earningsList,
-        total: response.total || 0,
-        today: response.today || 0,
-        week: response.week || 0,
-      });
-    } catch (error) {
-      console.error('Error loading earnings:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
   const onRefresh = (): void => {
-    setRefreshing(true);
-    loadEarningsData();
+    refetchEarnings();
   };
 
   const formatDate = (dateString?: string): string => {

@@ -12,7 +12,8 @@
 //
 // Per-row math: TDS = Rs.10 flat per booking. Net = Gross − TDS.
 // Aggregates: Total / Income = sum of all rows.net for that downline.
-import { useEffect, useState, useMemo } from 'react';
+import { useState, useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -62,10 +63,22 @@ const formatDate = (iso: string): string => {
 
 const TeamTreeIncomeScreen: React.FC<Props> = ({ navigation }) => {
   const insets = useSafeAreaInsets();
-  const [data, setData] = useState<TeamIncomeSummary | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+
+  // Team income summary via TanStack Query.
+  const {
+    data = null,
+    isLoading: loading,
+    isFetching: refreshing,
+    error: queryError,
+    refetch,
+  } = useQuery<TeamIncomeSummary>({
+    queryKey: ['agentTeamIncome'],
+    queryFn: getTeamIncomeSummary,
+  });
+  const error = queryError
+    ? ((queryError as any)?.message || 'Failed to load team income.')
+    : null;
+
   const [search, setSearch] = useState<string>('');
   const [appliedSearch, setAppliedSearch] = useState<string>('');
   // Per-downline table-visibility map. Tapping the "Details" button on
@@ -74,25 +87,8 @@ const TeamTreeIncomeScreen: React.FC<Props> = ({ navigation }) => {
   // its full transaction list.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
-  const load = async (): Promise<void> => {
-    setError(null);
-    try {
-      const res = await getTeamIncomeSummary();
-      setData(res);
-    } catch (e: any) {
-      setError(e?.message || 'Failed to load team income.');
-    }
-  };
-
-  useEffect(() => {
-    setLoading(true);
-    load().finally(() => setLoading(false));
-  }, []);
-
-  const onRefresh = async (): Promise<void> => {
-    setRefreshing(true);
-    await load();
-    setRefreshing(false);
+  const onRefresh = (): void => {
+    refetch();
   };
 
   const visibleDownlines = useMemo<DownlineSummary[]>(() => {
@@ -196,7 +192,7 @@ const TeamTreeIncomeScreen: React.FC<Props> = ({ navigation }) => {
           <View style={styles.errorCard}>
             <Text style={styles.errorTitle}>Couldn't load team income</Text>
             <Text style={styles.errorBody}>{error}</Text>
-            <TouchableOpacity style={styles.retryBtn} onPress={load}>
+            <TouchableOpacity style={styles.retryBtn} onPress={() => refetch()}>
               <Text style={styles.retryBtnText}>Retry</Text>
             </TouchableOpacity>
           </View>

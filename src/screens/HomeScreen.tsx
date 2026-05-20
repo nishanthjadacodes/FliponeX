@@ -32,8 +32,10 @@ import {
   markNotificationRead,
 } from '../services/api';
 import type { Service, OfferItem, InboxItem } from '../services/api';
-import { getUser, storeUser, clearAuthSession } from '../utils/storage';
-import { getProfile } from '../services/api';
+import { clearAuthSession } from '../utils/storage';
+import { useQuery } from '@tanstack/react-query';
+import { useAppStore } from '../store/useAppStore';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 import B2BToggle from '../components/B2BToggle';
 import ServiceCard, { iconForCategory } from '../components/ServiceCard';
 import * as haptics from '../utils/haptics';
@@ -59,14 +61,60 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   // indicator). Used to pad the scroll content so the last visible
   // section / CTA isn't covered by the device's navigation chrome.
   const insets = useSafeAreaInsets();
-  const [services, setServices] = useState<any[]>([]);
-  const [categories, setCategories] = useState<any[]>([]);
   const [selectedCategory, setSelectedCategory] = useState<string>(STRINGS.ALL_CATEGORIES);
   const [serviceType, setServiceType] = useState<'consumer' | 'industrial'>('consumer');
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
-  const [error, setError] = useState<any>(null);
-  const [user, setUser] = useState<any>(null);
+
+  // ─── Server state via TanStack Query ──────────────────────────────
+  // Service catalogue — re-fetches automatically when serviceType (in
+  // the queryKey) flips between consumer / industrial.
+  const {
+    data: services = [],
+    isLoading: loading,
+    isFetching: refreshing,
+    error: servicesError,
+    refetch: refetchServices,
+  } = useQuery({
+    queryKey: ['homeServices', serviceType],
+    queryFn: async () => {
+      const response: any = await getServices(serviceType);
+      return Array.isArray(response?.data) ? response.data : [];
+    },
+  });
+  const error = servicesError
+    ? 'Failed to load services. Please check your connection.'
+    : null;
+
+  // Trending services + promotional offers — optional home sections.
+  const { data: trendingOffers } = useQuery({
+    queryKey: ['homeTrendingOffers'],
+    queryFn: async () => {
+      const [trendingRes, offersRes] = await Promise.all([
+        getTrendingServices().catch(() => null),
+        getOffers().catch(() => null),
+      ]);
+      return {
+        trending: ((trendingRes as any)?.data as Service[]) || [],
+        offers: ((offersRes as any)?.data as OfferItem[]) || [],
+      };
+    },
+  });
+  const trendingServices: Service[] = trendingOffers?.trending || [];
+  const offers: OfferItem[] = trendingOffers?.offers || [];
+
+  // Logged-in user comes straight from the shared Zustand store —
+  // ProfileScreen keeps it current, so the header avatar / greeting
+  // update the instant the user edits their profile (no focus-reload).
+  const user = useAppStore((s) => s.user);
+
+  // Category chip list — derived from whatever services came back.
+  const categories = useMemo<any[]>(
+    () => [
+      STRINGS.ALL_CATEGORIES,
+      ...new Set(services.map((s: any) => s.category).filter(Boolean)),
+    ],
+    [services],
+  );
+
   const [searchQuery, setSearchQuery] = useState<string>('');
   // Global home-page services-grid expansion. By default we show only
   // TOTAL_INITIAL_SERVICES (across ALL categories combined, in the
@@ -83,8 +131,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const [searchInputFocused, setSearchInputFocused] = useState<boolean>(false);
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState<string>('');
   const [searchTimeoutId, setSearchTimeoutId] = useState<ReturnType<typeof setTimeout> | null>(null);
-  const [trendingServices, setTrendingServices] = useState<Service[]>([]);
-  const [offers, setOffers] = useState<OfferItem[]>([]);
   // ─── Notifications inbox (drives the Alerts chip + modal) ────────────
   // The badge on the chip shows `inboxUnread`. Opening the chip lists
   // ALL recent notifications in `inboxItems` and clears the badge.
@@ -190,25 +236,11 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   // Pulled from the marketing brief so the app echoes the same promise as the website.
   const engagingContent = VALUE_PROPS;
 
-  useEffect(() => {
-    loadServices();
-    loadUserData();
-    loadTrendingAndOffers();
-  }, [serviceType]);
-
-  // Re-pull cached user on focus so the header avatar / first-letter
-  // picks up name / profile_pic changes the user just saved on the
-  // Profile screen. Without this, the avatar stays as 👤 until the
-  // app is fully restarted.
-  useEffect(() => {
-    const unsub = navigation.addListener?.('focus', () => {
-      loadUserData();
-    });
-    return () => {
-      if (typeof unsub === 'function') unsub();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [navigation]);
+  // Services / trending / offers / user are all served by TanStack
+  // Query + the Zustand store now (see the hooks at the top of the
+  // component). useRefetchOnFocus keeps the service grid fresh when
+  // the user returns to the Home tab.
+  useRefetchOnFocus(refetchServices);
 
   // Cleanup timeout on component unmount
   useEffect(() => {
@@ -458,141 +490,13 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     handleServicePress(service);
   }, []);
 
-  // Two-pass user load:
-  //   1. Read the AsyncStorage cache and render immediately (fast,
-  //      offline-safe).
-  //   2. In the background, hit GET /profile and merge the freshest
-  //      profile_pic / name back into the cache. This stops the header
-  //      avatar from "going missing" after an app restart — the cache
-  //      can get overwritten by guest-login fallback or older payloads
-  //      that don't include profile_pic, while the backend always has
-  //      the truth. Re-syncing here keeps AsyncStorage authoritative.
-  const loadUserData = async (): Promise<void> => {
-    try {
-      const cached = await getUser();
-      if (cached) setUser(cached);
-    } catch (error) {
-      console.error('Error loading cached user data:', error);
-    }
-
-    try {
-      const resp: any = await getProfile();
-      const fresh: any = resp?.user || resp?.data || resp || null;
-      if (fresh && typeof fresh === 'object') {
-        const cached: any = (await getUser()) || {};
-        // Merge so any local-only fields stay; backend wins for any
-        // canonical fields (profile_pic, name, mobile, email, etc.).
-        const merged = { ...cached, ...fresh };
-        await storeUser(merged);
-        setUser(merged);
-      }
-    } catch (error) {
-      // Backend unreachable — keep the cached value we already set above.
-      // Don't surface this to the user; the home screen still renders.
-      console.log('[home] background profile refresh failed:', (error as any)?.message);
-    }
-  };
-
-  // Fetch trending services + active offers in parallel.
-  // Failure here is non-fatal — the home screen still works without these
-  // optional sections, so we just swallow + log the error.
-  const loadTrendingAndOffers = async (): Promise<void> => {
-    try {
-      const [trendingRes, offersRes] = await Promise.all([
-        getTrendingServices(),
-        getOffers(),
-      ]);
-      setTrendingServices((trendingRes?.data as Service[]) || []);
-      setOffers((offersRes?.data as OfferItem[]) || []);
-    } catch (err) {
-      console.warn('loadTrendingAndOffers failed (non-fatal):', err);
-    }
-  };
-
-  const loadServices = async (): Promise<void> => {
-    try {
-      setLoading(true);
-      setError(null);
-      console.log('=== LOADING SERVICES ===');
-
-      // Add retry mechanism for service loading
-      let response: any;
-      let retryCount = 0;
-      const maxRetries = 3;
-
-      while (retryCount < maxRetries) {
-        try {
-          response = await getServices(serviceType);
-          console.log('Services received:', response);
-          break; // Success, exit retry loop
-        } catch (error: any) {
-          retryCount++;
-          console.log(`Service load attempt ${retryCount} failed:`, error.message);
-
-          if (retryCount >= maxRetries) {
-            throw error; // Re-throw after max retries
-          }
-        }
-      }
-
-      // Process successful response
-      console.log('=== HOMESCREEN CATEGORY BREAKDOWN ===');
-
-      // Extract categories from services
-      const aadhaarServices = response.data.filter((s: any) =>
-        s.name && s.name.toLowerCase().includes('aadhaar')
-      );
-      const panServices = response.data.filter((s: any) =>
-        s.name && s.name.toLowerCase().includes('pan')
-      );
-      const voterIdServices = response.data.filter((s: any) =>
-        s.name && (s.name.toLowerCase().includes('voter') || s.name.toLowerCase().includes('voter id'))
-      );
-      const rationCardServices = response.data.filter((s: any) =>
-        s.name && (s.name.toLowerCase().includes('ration') || s.name.toLowerCase().includes('ration card'))
-      );
-      const drivingLicenseServices = response.data.filter((s: any) =>
-        s.name && (s.name.toLowerCase().includes('driving') || s.name.toLowerCase().includes('license') || s.name.toLowerCase().includes('driving license'))
-      );
-
-      console.log('Aadhaar services found in raw data:', aadhaarServices.length);
-      console.log('Aadhaar service names:', aadhaarServices.map((s: any) => s.name));
-      console.log('PAN services found in raw data:', panServices.length);
-      console.log('PAN service names:', panServices.map((s: any) => s.name));
-      console.log('Voter ID services found in raw data:', voterIdServices.length);
-      console.log('Voter ID service names:', voterIdServices.map((s: any) => s.name));
-      console.log('Ration Card services found in raw data:', rationCardServices.length);
-      console.log('Ration Card service names:', rationCardServices.map((s: any) => s.name));
-      console.log('Driving License services found in raw data:', drivingLicenseServices.length);
-      console.log('Driving License service names:', drivingLicenseServices.map((s: any) => s.name));
-
-      const totalKnownServices = aadhaarServices.length + panServices.length + voterIdServices.length + rationCardServices.length + drivingLicenseServices.length;
-      console.log('Total known services:', totalKnownServices);
-      console.log('Total services from API:', response.data.length);
-      console.log('===================================');
-
-      // Extract unique categories
-      const uniqueCategories = [
-        STRINGS.ALL_CATEGORIES,
-        ...new Set(response.data.map((service: any) => service.category).filter(Boolean))
-      ];
-
-      setServices(response.data);
-      setCategories(uniqueCategories);
-    } catch (error) {
-      console.error('Error loading services:', error);
-      setError('Failed to load services. Please check your connection.');
-      setServices([]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // loadServices / loadUserData / loadTrendingAndOffers are gone —
+  // services + trending/offers are TanStack Query (see the useQuery
+  // hooks at the top), the user comes from the Zustand store, and the
+  // 3-retry loop is now the QueryClient's built-in retry config.
   const onRefresh = useCallback(async (): Promise<void> => {
-    setRefreshing(true);
-    await loadServices();
-    setRefreshing(false);
-  }, [serviceType]);
+    await refetchServices();
+  }, [refetchServices]);
 
   const handleB2BToggle = (type: 'consumer' | 'industrial') => {
     setServiceType(type);

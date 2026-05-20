@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -12,6 +13,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { getWalletBalance, type WalletTransaction } from '../services/api';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 
 interface WalletScreenProps {
   navigation: { goBack: () => void };
@@ -19,32 +21,23 @@ interface WalletScreenProps {
 
 const WalletScreen: React.FC<WalletScreenProps> = ({ navigation }) => {
   const insets = useSafeAreaInsets();
-  const [balance, setBalance] = useState<number>(0);
-  const [transactions, setTransactions] = useState<WalletTransaction[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
+  // Wallet balance + transactions — fetched & cached by TanStack Query.
+  const {
+    data: wallet,
+    isLoading: loading,
+    isFetching: refreshing,
+    refetch,
+  } = useQuery({
+    queryKey: ['wallet'],
+    queryFn: getWalletBalance,
+  });
+  const balance: number = wallet?.balance || 0;
+  const transactions: WalletTransaction[] = wallet?.transactions || [];
 
-  const load = useCallback(async () => {
-    try {
-      const data = await getWalletBalance();
-      setBalance(data.balance || 0);
-      setTransactions(data.transactions || []);
-    } catch (e) {
-      console.error('Wallet load error:', e);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const onRefresh = (): void => {
-    setRefreshing(true);
-    load();
-  };
+  const onRefresh = useCallback((): void => {
+    refetch();
+  }, [refetch]);
+  useRefetchOnFocus(onRefresh);
 
   const formatDate = (iso: string): string => {
     try {

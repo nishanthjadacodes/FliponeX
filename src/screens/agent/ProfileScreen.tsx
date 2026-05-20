@@ -15,8 +15,13 @@ import {
   Platform,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Image, ActivityIndicator } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
 import { getDashboard, updateOnlineStatus, updateProfile } from '../../services/agent/api';
+import { uploadAvatar, deleteAvatar } from '../../services/api';
+import { storeUser, getUser } from '../../utils/storage';
 import { COLORS } from '../../constants/agent/colors';
+import { repCode } from '../../utils/agent/repCode';
 import ProfileModal, { type AgentProfile } from '../../components/agent/ProfileModal';
 import PaymentMethodsModal from '../../components/agent/PaymentMethodsModal';
 import BankDetailsModal from '../../components/agent/BankDetailsModal';
@@ -61,6 +66,7 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
     confirm: '',
   });
   const [savingPassword, setSavingPassword] = useState<boolean>(false);
+  const [avatarUploading, setAvatarUploading] = useState<boolean>(false);
   const [notifSettings, setNotifSettings] = useState<{ push: boolean; sms: boolean; email: boolean }>({
     push: true,
     sms: true,
@@ -134,11 +140,130 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
   };
 
   const handleProfileSave = async (updatedData: AgentProfile): Promise<void> => {
-    setAgent(updatedData as unknown as AgentRecord);
+    // The parent owns the canonical agent record. Merge edited fields
+    // INTO the live `agent` state — which still carries the rep's UUID,
+    // agent_code, rating, totalJobs, profile_pic, online_status, etc.
+    // even if AsyncStorage's `agent_data` was previously corrupted by
+    // an older build that overwrote the blob with just form fields.
+    //
+    // Writing the merged record back to AsyncStorage here (instead of
+    // in the modal) is what recovers from any prior corruption: the
+    // UUID from the in-memory `agent` makes it back into storage, so
+    // the next app launch reads a clean record and repCode() keeps
+    // returning the same FLIPRT##### value forever.
+    const base = (agent || {}) as Record<string, unknown>;
+    const merged = { ...base, ...updatedData } as AgentRecord;
+    setAgent(merged);
+    try {
+      await AsyncStorage.setItem('agent_data', JSON.stringify(merged));
+    } catch (e) {
+      console.log('agent_data persist failed:', (e as any)?.message);
+    }
     try {
       await updateProfile(updatedData as any);
     } catch (e) {
       console.log('Backend profile sync failed, saved locally');
+    }
+  };
+
+  // Camera / gallery picker for the rep's profile picture. Mirrors
+  // the customer ProfileScreen flow: show a chooser, run the picker,
+  // upload via the shared /profile/avatar endpoint, then mirror the
+  // returned URL into local agent state, AsyncStorage's agent_data
+  // payload, AND the shared user cache so the Dashboard hero picks
+  // up the new pic the moment the user navigates back.
+  const pickAvatar = async (): Promise<void> => {
+    const hasExisting = !!(agent as any)?.profile_pic;
+    const buttons: any[] = [
+      { text: 'Camera', onPress: () => doPickAvatar('camera') },
+      { text: 'Photo Library', onPress: () => doPickAvatar('library') },
+    ];
+    if (hasExisting) {
+      buttons.push({
+        text: 'Remove current photo',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            setAvatarUploading(true);
+            await deleteAvatar();
+            setAgent((prev) => ({ ...(prev || {}), profile_pic: null }) as any);
+            try {
+              const data = await AsyncStorage.getItem('agent_data');
+              const parsed = data ? JSON.parse(data) : {};
+              await AsyncStorage.setItem(
+                'agent_data',
+                JSON.stringify({ ...parsed, profile_pic: null }),
+              );
+              const cached = (await getUser()) || {};
+              await storeUser({ ...cached, profile_pic: null });
+            } catch (_) { /* non-fatal */ }
+          } catch (e: any) {
+            Alert.alert('Could not remove photo', e?.message || 'Try again');
+          } finally {
+            setAvatarUploading(false);
+          }
+        },
+      });
+    }
+    buttons.push({ text: 'Cancel', style: 'cancel' });
+    Alert.alert('Change profile picture', undefined, buttons);
+  };
+
+  const doPickAvatar = async (source: 'camera' | 'library'): Promise<void> => {
+    try {
+      const perm =
+        source === 'camera'
+          ? await ImagePicker.requestCameraPermissionsAsync()
+          : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(
+          'Permission needed',
+          `Grant ${source === 'camera' ? 'camera' : 'photo library'} access in Settings to update your profile picture.`,
+        );
+        return;
+      }
+      const result: any =
+        source === 'camera'
+          ? await ImagePicker.launchCameraAsync({
+              mediaTypes: 'images' as any,
+              allowsEditing: true,
+              aspect: [1, 1],
+              quality: 0.85,
+            })
+          : await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: 'images' as any,
+              allowsEditing: true,
+              aspect: [1, 1],
+              quality: 0.85,
+            });
+      if (result.canceled || !result.assets?.[0]) return;
+      const asset = result.assets[0];
+      const uri = asset.uri;
+      const name = asset.fileName || `agent-avatar-${Date.now()}.jpg`;
+      const type = asset.mimeType || 'image/jpeg';
+
+      setAvatarUploading(true);
+      const { profile_pic } = await uploadAvatar({ uri, name, type });
+      setAgent((prev) => ({ ...(prev || {}), profile_pic }) as any);
+
+      // Mirror to BOTH the agent_data cache (used by this screen + the
+      // dashboard) and the shared user cache so any other surface that
+      // reads from getUser() also sees the new pic.
+      try {
+        const data = await AsyncStorage.getItem('agent_data');
+        const parsed = data ? JSON.parse(data) : {};
+        await AsyncStorage.setItem(
+          'agent_data',
+          JSON.stringify({ ...parsed, profile_pic }),
+        );
+        const cached = (await getUser()) || {};
+        await storeUser({ ...cached, profile_pic });
+      } catch (_) { /* non-fatal */ }
+    } catch (e: any) {
+      console.log('[agent-avatar] upload failed:', e?.message);
+      Alert.alert('Upload failed', e?.message || 'Could not upload your photo. Try again.');
+    } finally {
+      setAvatarUploading(false);
     }
   };
 
@@ -230,12 +355,37 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
         >
           <View style={styles.profileHeader}>
             <Animated.View style={[styles.avatar, { transform: [{ scale: scaleAnim }] }]}>
-              <LinearGradient colors={COLORS.primaryGradient} style={styles.avatarGradient}>
-                <Text style={styles.avatarText}>{agent?.name?.charAt(0)?.toUpperCase() || 'A'}</Text>
-              </LinearGradient>
+              {(agent as any)?.profile_pic ? (
+                <Image
+                  source={{ uri: (agent as any).profile_pic }}
+                  style={styles.avatarGradient}
+                  resizeMode="cover"
+                />
+              ) : (
+                <LinearGradient colors={COLORS.primaryGradient} style={styles.avatarGradient}>
+                  <Text style={styles.avatarText}>
+                    {agent?.name?.charAt(0)?.toUpperCase() || 'A'}
+                  </Text>
+                </LinearGradient>
+              )}
+              {/* Camera overlay button — mirrors the customer profile.
+                  Tap → action sheet (Camera / Gallery / Remove). */}
+              <TouchableOpacity
+                style={styles.avatarCameraBtn}
+                onPress={pickAvatar}
+                disabled={avatarUploading}
+                accessibilityLabel="Change profile picture"
+              >
+                {avatarUploading ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.avatarCameraBtnText}>📷</Text>
+                )}
+              </TouchableOpacity>
             </Animated.View>
             <View style={styles.profileInfo}>
               <Text style={styles.agentName}>{agent?.name || 'Representative'}</Text>
+              <Text style={styles.agentRepCode}>{repCode(agent as any)}</Text>
               <Text style={styles.agentDetail}>{agent?.mobile || 'N/A'}</Text>
               <Text style={styles.agentDetail}>{agent?.email || 'N/A'}</Text>
             </View>
@@ -474,14 +624,33 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   avatar: {
-    width: 60, height: 60, borderRadius: 30, marginRight: 14, overflow: 'hidden',
+    width: 60, height: 60, borderRadius: 30, marginRight: 14,
     shadowColor: '#F4A100', shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3, shadowRadius: 8, elevation: 4,
+    // overflow:visible so the camera badge can sit on the bottom-right
+    // edge. The inner gradient/image is itself round, so the avatar
+    // still appears clipped.
+    overflow: 'visible',
   },
-  avatarGradient: { width: 60, height: 60, borderRadius: 30, justifyContent: 'center', alignItems: 'center' },
+  avatarGradient: { width: 60, height: 60, borderRadius: 30, justifyContent: 'center', alignItems: 'center', overflow: 'hidden' },
   avatarText: { fontSize: 24, fontWeight: '900', color: '#0F172A' },
+  avatarCameraBtn: {
+    position: 'absolute',
+    right: -2,
+    bottom: -2,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#0D3B66',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  avatarCameraBtnText: { fontSize: 11, color: '#FFFFFF' },
   profileInfo: { flex: 1 },
   agentName: { fontSize: 18, fontWeight: '900', color: '#0F172A', marginBottom: 2, letterSpacing: 0.2 },
+  agentRepCode: { fontSize: 11, fontWeight: '800', color: '#F4A100', letterSpacing: 1.2, marginBottom: 4 },
   agentDetail: { fontSize: 12, color: '#64748B', marginBottom: 1 },
   editHeaderBtn: {
     borderRadius: 12, overflow: 'hidden',

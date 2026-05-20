@@ -1,5 +1,6 @@
 import React, { useRef, useEffect } from 'react';
-import { Pressable, Text, StyleSheet, Linking, Alert, Animated } from 'react-native';
+import { Pressable, StyleSheet, Linking, Alert, Animated } from 'react-native';
+import FontAwesome from 'react-native-vector-icons/FontAwesome';
 import { STRINGS } from '../constants/strings';
 import * as haptics from '../utils/haptics';
 
@@ -52,7 +53,10 @@ const WhatsAppButton: React.FC = () => {
         android_ripple={{ color: 'rgba(255,255,255,0.3)', borderless: true }}
         style={styles.fabInner}
       >
-        <Text style={styles.icon}>💬</Text>
+        {/* Real WhatsApp logo via FontAwesome (white on the green
+            FAB so it matches WhatsApp's brand glyph instead of the
+            generic 💬 chat bubble that was there before). */}
+        <FontAwesome name="whatsapp" size={32} color="#FFFFFF" />
       </Pressable>
     </Animated.View>
   );
@@ -61,6 +65,9 @@ const WhatsAppButton: React.FC = () => {
 const styles = StyleSheet.create({
   fab: {
     position: 'absolute',
+    // Sits ~80px above the bottom edge of the parent screen so it
+    // floats clear of the bottom-tab nav (~56–72px high) on every
+    // device. zIndex so it always paints over scrollable content.
     bottom: 80,
     right: 16,
     width: 60,
@@ -72,6 +79,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.4,
     shadowRadius: 12,
     elevation: 10,
+    zIndex: 999,
   },
   fabInner: {
     width: '100%',
@@ -80,7 +88,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  icon: { fontSize: 28 },
 });
 
 export default WhatsAppButton;

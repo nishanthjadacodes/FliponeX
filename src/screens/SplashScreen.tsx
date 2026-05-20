@@ -263,10 +263,12 @@ const SplashScreen: React.FC<Props> = ({ navigation }) => {
           const guest = isGuestUser(userRaw, '0000000000');
           if (!existing || guest) {
             await AsyncStorage.multiRemove(['token', 'user', 'auth_token']);
-            goToLogin('Login');
-            return;
           }
-          navigation.replace?.('HomeTabs');
+          // Always route through ModeSelect (toggle page) on launch, even
+          // when the user is already logged in. The customer tile on
+          // ModeSelect detects the existing token and forwards through
+          // FlashNotifications → HomeTabs (skipping Login).
+          navigation.replace?.('ModeSelect');
           return;
         }
 

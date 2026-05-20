@@ -16,6 +16,7 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { captureWithCrop, pickWithCrop } from '../../utils/cropPicker';
+import { formatBookingAddress } from '../../utils/addressFormat';
 import * as Location from 'expo-location';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import {
@@ -471,14 +472,35 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
   };
 
   const openMaps = (): void => {
-    const address = encodeURIComponent(task?.address || '');
+    // `task.address` may be a free-text string OR a JSON object of
+    // shape { latitude, longitude, formatted } when the customer
+    // booked with GPS on. We prefer the raw "lat,lng" pair when
+    // available because Google Maps routes most accurately to a
+    // precise pin; otherwise fall back to the formatted/free-text
+    // string.
+    const raw: any = task?.address;
+    let dest = '';
+    if (raw && typeof raw === 'object') {
+      if (raw.latitude != null && raw.longitude != null) {
+        dest = `${raw.latitude},${raw.longitude}`;
+      } else if (typeof raw.formatted === 'string') {
+        dest = raw.formatted;
+      }
+    } else if (typeof raw === 'string') {
+      dest = raw;
+    }
+    if (!dest) {
+      Alert.alert('No address', 'This booking has no service address yet.');
+      return;
+    }
+    const destEnc = encodeURIComponent(dest);
     const url = Platform.select({
-      android: `google.navigation:q=${address}`,
-      ios: `maps://app?daddr=${address}`,
-      default: `https://www.google.com/maps/dir/?api=1&destination=${address}`,
+      android: `google.navigation:q=${destEnc}`,
+      ios: `maps://app?daddr=${destEnc}`,
+      default: `https://www.google.com/maps/dir/?api=1&destination=${destEnc}`,
     });
     Linking.openURL(url as string).catch(() =>
-      Linking.openURL(`https://www.google.com/maps/dir/?api=1&destination=${address}`),
+      Linking.openURL(`https://www.google.com/maps/dir/?api=1&destination=${destEnc}`),
     );
   };
 
@@ -802,7 +824,7 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
           </View>
           <View style={styles.detailItem}>
             <Text style={styles.detailLabel}>Address</Text>
-            <Text style={styles.detailValue}>{task?.address}</Text>
+            <Text style={styles.detailValue}>{formatBookingAddress(task?.address) || 'N/A'}</Text>
           </View>
           <View style={styles.detailItem}>
             <Text style={styles.detailLabel}>Phone</Text>

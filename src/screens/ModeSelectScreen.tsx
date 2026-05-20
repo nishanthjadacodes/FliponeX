@@ -12,6 +12,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   setUserMode,
+  getToken,
 } from '../utils/storage';
 import { ADMIN_DASHBOARD_URL, CUSTOMER_WEBSITE_URL, API_BASE_URL } from '../config';
 
@@ -84,10 +85,35 @@ const ModeSelectScreen: React.FC<ModeSelectScreenProps> = ({ navigation }) => {
     if (busy) return;
     setBusy(true);
     await setUserMode(mode);
-    if (mode === 'customer' && (await hasUnseenFlashNotifications())) {
-      navigation.navigate('FlashNotifications', { nextRoute: 'Login' });
+
+    // If the user is already logged in as a customer, skip the OTP
+    // screen and forward to HomeTabs. The flash notification carousel
+    // (when present) still appears in between — admin offers should
+    // reach returning customers too, not just first-time logins.
+    let customerLoggedIn = false;
+    if (mode === 'customer') {
+      try {
+        const existing = await getToken();
+        const userRaw = await AsyncStorage.getItem('user');
+        const isGuest = (() => {
+          if (!userRaw) return false;
+          try { return JSON.parse(userRaw)?.mobile === '0000000000'; } catch { return false; }
+        })();
+        customerLoggedIn = Boolean(existing) && !isGuest;
+      } catch {
+        customerLoggedIn = false;
+      }
+    }
+
+    if (mode === 'customer') {
+      const customerNext = customerLoggedIn ? 'HomeTabs' : 'Login';
+      if (await hasUnseenFlashNotifications()) {
+        navigation.navigate('FlashNotifications', { nextRoute: customerNext });
+      } else {
+        navigation.navigate(customerNext);
+      }
     } else {
-      navigation.navigate(mode === 'agent' ? 'AgentLogin' : 'Login');
+      navigation.navigate('AgentLogin');
     }
     setBusy(false);
   };

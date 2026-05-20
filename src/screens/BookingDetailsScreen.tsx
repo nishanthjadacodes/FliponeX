@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -30,6 +31,7 @@ import DateTimePicker from '@react-native-community/datetimepicker';
 import RazorpayCheckout from 'react-native-razorpay';
 import * as haptics from '../utils/haptics';
 import { formatBookingId } from '../utils/bookingId';
+import { normalizeAddress, formatBookingAddress } from '../utils/addressFormat';
 import DocPreviewModal, { fixDocUrl } from '../components/DocPreviewModal';
 
 // Defensive load — expo-print and expo-sharing are native modules that
@@ -89,10 +91,28 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
   // status bar / notch on phones that have one. Without this the back
   // arrow appears clipped on Android 12+ and iPhone X+.
   const insets = useSafeAreaInsets();
-  const [booking, setBooking] = useState<any>(null);
+
+  // Booking detail — fetched + cached by TanStack Query, keyed on
+  // bookingId. The booking response shape varies ({ data: { data } }
+  // / { data } / bare), so the queryFn unwraps it to the flat object.
+  const {
+    data: booking = null,
+    isLoading: loading,
+    error: bookingError,
+    refetch: refetchBooking,
+  } = useQuery({
+    queryKey: ['booking', bookingId],
+    queryFn: async () => {
+      const response: any = await getBookingDetails(bookingId);
+      let bookingData: any = response?.data || response;
+      if (bookingData && bookingData.data) bookingData = bookingData.data;
+      return bookingData;
+    },
+    enabled: bookingId != null,
+  });
+
   // Currently-previewed doc (set when user taps a doc row) — null = closed.
   const [previewDoc, setPreviewDoc] = useState<any>(null);
-  const [loading, setLoading] = useState<boolean>(false);
   const [otp, setOtp] = useState<string>('');
   const [verificationLoading, setVerificationLoading] = useState<boolean>(false);
   const [showRating, setShowRating] = useState<boolean>(false);
@@ -114,9 +134,26 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
   const [showRescheduleDatePicker, setShowRescheduleDatePicker] = useState<boolean>(false);
   const [showRescheduleTimePicker, setShowRescheduleTimePicker] = useState<boolean>(false);
 
+  // 404 on the booking → the server has no record of it. Drop it from
+  // the local cache so it stops haunting MyBookings, then bounce back.
   useEffect(() => {
-    loadBookingDetails();
-  }, [bookingId]);
+    if (!bookingError) return;
+    const err: any = bookingError;
+    const status = err?.response?.status || err?.status;
+    const notFound =
+      status === 404 ||
+      /not found/i.test(err?.message || '') ||
+      /not found/i.test(err?.response?.data?.message || '');
+    if (notFound) {
+      purgeLocalBooking(bookingId);
+      Alert.alert('Booking unavailable', 'This booking is no longer available.', [
+        { text: 'OK', onPress: () => navigation.goBack() },
+      ]);
+    } else {
+      Alert.alert('Error', 'Failed to load booking details');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookingError]);
 
   // Pay Now handler — creates a Razorpay order, opens the native checkout,
   // verifies the signature server-side, then refreshes the booking so the
@@ -166,7 +203,7 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
         razorpay_signature: result.razorpay_signature,
       });
       Alert.alert('Payment successful', 'Thank you! Your booking is now paid.');
-      await loadBookingDetails();
+      await refetchBooking();
     } catch (e: any) {
       const msg = e?.description || e?.message || 'Payment was not completed.';
       // User-cancelled is fine; only alert on real errors.
@@ -178,72 +215,9 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   };
 
-  const loadBookingDetails = async (): Promise<void> => {
-    try {
-      setLoading(true);
-      const response: any = await getBookingDetails(bookingId);
-      console.log('=== BOOKING DETAILS RESPONSE ===');
-      console.log('Full response:', JSON.stringify(response, null, 2));
-
-      // Handle different response structures
-      let bookingData: any = response.data || response;
-      if (bookingData && bookingData.data) {
-        bookingData = bookingData.data;
-      }
-
-      console.log('Final booking data:', JSON.stringify(bookingData, null, 2));
-      console.log('Booking fields:', Object.keys(bookingData || {}));
-
-      // Log specific fields we're looking for
-      console.log('Amount fields:', {
-        total_amount: bookingData?.total_amount,
-        amount: bookingData?.amount,
-        totalExpense: bookingData?.totalExpense,
-        total_expense: bookingData?.total_expense,
-        user_cost: bookingData?.user_cost,
-        cost: bookingData?.cost,
-        price: bookingData?.price
-      });
-
-      console.log('Address fields:', {
-        address: bookingData?.address,
-        user_address: bookingData?.user_address,
-        customer_address: bookingData?.customer_address,
-        full_address: bookingData?.full_address,
-        location: bookingData?.location
-      });
-
-      console.log('Document fields:', {
-        documents: bookingData?.documents,
-        uploaded_documents: bookingData?.uploaded_documents,
-        files: bookingData?.files,
-        attachments: bookingData?.attachments
-      });
-
-      console.log('===============================');
-
-      setBooking(bookingData);
-    } catch (error: any) {
-      console.error('Error loading booking details:', error);
-      // Server has no record of this booking — drop it from local cache so
-      // it stops appearing in MyBookings, then bounce back.
-      const status = error?.response?.status || error?.status;
-      const notFound =
-        status === 404 ||
-        /not found/i.test(error?.message || '') ||
-        /not found/i.test(error?.response?.data?.message || '');
-      if (notFound) {
-        await purgeLocalBooking(bookingId);
-        Alert.alert('Booking unavailable', 'This booking is no longer available.', [
-          { text: 'OK', onPress: () => navigation.goBack() },
-        ]);
-      } else {
-        Alert.alert('Error', 'Failed to load booking details');
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
+  // loadBookingDetails() is now the query's refetchBooking() — see the
+  // useQuery above. The 404 / purge handling moved to the bookingError
+  // effect.
 
   const handleVerifyCompletion = async (): Promise<void> => {
     if (!otp.trim()) {
@@ -257,7 +231,7 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
 
       if (response.success) {
         Alert.alert('Success', 'Booking verified successfully');
-        loadBookingDetails(); // Refresh booking details
+        refetchBooking(); // Refresh booking details
       } else {
         Alert.alert('Error', response.message || 'Verification failed');
       }
@@ -297,7 +271,7 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
       setRescheduleTime(null);
       setRescheduleReason('');
       Alert.alert('Rescheduled', 'Your booking has been rescheduled successfully.');
-      await loadBookingDetails();
+      await refetchBooking();
     } catch (e: any) {
       haptics.error();
       const msg = e?.message || 'Could not reschedule. Please try again or contact support.';
@@ -343,7 +317,7 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
       setRating(0);
       setReviewText('');
       Alert.alert('Thank You!', 'Your review has been submitted');
-      loadBookingDetails();
+      refetchBooking();
     } catch (error) {
       haptics.error();
       Alert.alert('Error', 'Failed to submit review');
@@ -613,11 +587,10 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
                 // coords are normally a sign that reverse-geocoding
                 // failed on the booking flow — this gives them a way
                 // to actually see what the address resolves to.
-                const raw =
-                  booking?.service_address || booking?.address || booking?.customer_address || '';
-                const m = String(raw).match(
-                  /^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/,
+                const raw = normalizeAddress(
+                  booking?.service_address || booking?.address || booking?.customer_address,
                 );
+                const m = raw.match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
                 if (m) {
                   const url = `https://www.google.com/maps/search/?api=1&query=${m[1]},${m[2]}`;
                   try {
@@ -626,20 +599,10 @@ const BookingDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
                 }
               }}
             >
-              {(() => {
-                // Display logic — pure lat/lng strings get a clearer
-                // "Location pin (lat, lng)" prefix + tap-to-map hint.
-                // Customers used to see naked "12.345678, 77.123456"
-                // and wonder if the address even got saved.
-                const raw =
-                  booking?.service_address || booking?.address || booking?.customer_address;
-                if (!raw) return 'N/A';
-                const m = String(raw).match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
-                if (m) {
-                  return `📍 Map pin: ${Number(m[1]).toFixed(5)}, ${Number(m[2]).toFixed(5)} (tap to open)`;
-                }
-                return String(raw);
-              })()}
+              {formatBookingAddress(
+                booking?.service_address || booking?.address || booking?.customer_address,
+                { withTapHint: true, precision: 5 },
+              ) || 'N/A'}
             </Text>
           </View>
         </View>

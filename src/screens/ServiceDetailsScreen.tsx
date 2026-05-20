@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -34,15 +35,26 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
   // Quote) doesn't get clipped by the gesture bar, home indicator, or
   // rounded screen edges on modern phones.
   const insets = useSafeAreaInsets();
-  const [service, setService] = useState<any>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-
   const { serviceId } = route.params as { serviceId: any };
 
-  useEffect(() => {
-    loadServiceDetails();
-  }, [serviceId]);
+  // Service detail fetched + cached by TanStack Query, keyed on the
+  // serviceId so each service has its own cache entry.
+  const {
+    data: rawService,
+    isLoading: loading,
+    error: queryError,
+    refetch,
+  } = useQuery({
+    queryKey: ['service', serviceId],
+    queryFn: async () => {
+      const response: any = await getServiceById(serviceId);
+      return response.data;
+    },
+    enabled: serviceId != null,
+  });
+  const error = queryError
+    ? ((queryError as any)?.message || STRINGS.ERROR_LOADING_SERVICE_DETAILS)
+    : null;
 
   // Rate-chart safety override — same idea as in BookingScreen. If the
   // backend service row is missing partner_earning / company_margin /
@@ -122,23 +134,17 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
     };
   };
 
-  const loadServiceDetails = async (): Promise<void> => {
-    try {
-      setLoading(true);
-      setError(null);
-      const response: any = await getServiceById(serviceId);
-      setService(applyRateChartOverride(response.data));
-    } catch (error: any) {
-      console.error('Error loading service details:', error);
-      setError(error.message || STRINGS.ERROR_LOADING_SERVICE_DETAILS);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // The query returns the raw service row; the rate-chart override is
+  // applied here so the breakdown card always has correct numbers.
+  const service = useMemo(
+    () => (rawService ? applyRateChartOverride(rawService) : null),
+    // applyRateChartOverride is pure (no external deps) — safe to omit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rawService],
+  );
 
   const handleRetry = (): void => {
-    console.log('Retrying service details fetch...');
-    loadServiceDetails();
+    refetch();
   };
 
   // Two distinct paths:
@@ -314,19 +320,32 @@ const ServiceDetailsScreen: React.FC<Props> = ({ navigation, route }) => {
                 );
               })()}
 
-              {/* Timeline — single line. The previous version showed
-                  three rows each prefixed with a stray "?" character
-                  (Unicode-icon font wasn't loading). Processing Time
-                  and Expected Delivery were always 'N/A' anyway since
-                  the backend doesn't carry those fields. Collapsed to
-                  the one row that actually has data. */}
+              {/* Timeline section — three rows. The backend only
+                  carries `expected_timeline` today; processing fees and
+                  expected delivery aren't tracked per-service yet, so
+                  they render as "N/A" placeholders. The earlier "?"
+                  prefix was a missing Unicode icon — now plain labels
+                  so nothing ever shows a stray glyph. */}
               <View style={styles.timelineContainer}>
                 <Text style={styles.sectionTitle}>Expected Timeline</Text>
                 <View style={styles.timelineRow}>
                   <View style={styles.timelineContent}>
+                    <Text style={styles.timelineLabel}>Expected timeline</Text>
                     <Text style={styles.timelineValue}>
                       {service.expected_timeline || 'Varies by service — confirmed on booking.'}
                     </Text>
+                  </View>
+                </View>
+                <View style={styles.timelineRow}>
+                  <View style={styles.timelineContent}>
+                    <Text style={styles.timelineLabel}>Processing fees</Text>
+                    <Text style={styles.timelineValue}>N/A</Text>
+                  </View>
+                </View>
+                <View style={styles.timelineRow}>
+                  <View style={styles.timelineContent}>
+                    <Text style={styles.timelineLabel}>Expected delivery</Text>
+                    <Text style={styles.timelineValue}>N/A</Text>
                   </View>
                 </View>
               </View>

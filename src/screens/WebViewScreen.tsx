@@ -7,6 +7,7 @@ import {
   TouchableOpacity,
   BackHandler,
   Platform,
+  Alert,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 
@@ -21,6 +22,27 @@ try {
   webViewReady = typeof WebView === 'function' || typeof WebView === 'object';
 } catch (_) {
   webViewReady = false;
+}
+
+// Defensive load for expo-file-system + expo-sharing — used to save
+// CSV exports the embedded admin dashboard sends over the bridge.
+// Expo SDK 54 moved `writeAsStringAsync` / `cacheDirectory` to the
+// `/legacy` sub-path; try that first, fall back to the main entry.
+let FileSystem: any = null;
+let Sharing: any = null;
+try {
+  try {
+    // eslint-disable-next-line global-require
+    FileSystem = require('expo-file-system/legacy');
+  } catch (_) {
+    // eslint-disable-next-line global-require
+    FileSystem = require('expo-file-system');
+  }
+  // eslint-disable-next-line global-require
+  Sharing = require('expo-sharing');
+} catch (_) {
+  FileSystem = null;
+  Sharing = null;
 }
 
 interface WebViewScreenProps {
@@ -57,6 +79,13 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   const [loading, setLoading] = useState<boolean>(true);
   const [errored, setErrored] = useState<boolean>(false);
   const [canGoBack, setCanGoBack] = useState<boolean>(false);
+  // Set true the moment a LOGOUT message arrives. The `beforeRemove`
+  // listener below normally swallows navigation-away events to step
+  // back through WebView history instead — but a logout must ALWAYS
+  // exit the WebView (back to ModeSelect), no matter how deep the
+  // embedded page history is. This flag tells beforeRemove to stand
+  // down for that one navigation.
+  const loggingOutRef = useRef<boolean>(false);
   // Bumping this key remounts the <WebView>, forcing it to reload the
   // original `url` from scratch. Used by the in-header Home button to
   // jump back to the embedded site's root (admin dashboard's super
@@ -118,12 +147,52 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   // has history, consume the event and go back within the page instead.
   useEffect(() => {
     const unsub = navigation.addListener('beforeRemove', (e: any) => {
+      // Logout must exit the WebView entirely — never intercept it,
+      // even when the embedded site still has back-history.
+      if (loggingOutRef.current) return;
       if (!canGoBack || !webViewRef.current) return; // allow normal nav exit
       e.preventDefault();
       webViewRef.current.goBack();
     });
     return unsub;
   }, [navigation, canGoBack]);
+
+  // Saves a text payload (CSV export from the embedded admin
+  // dashboard) to a temp file and opens the OS share sheet so the
+  // user can store it in Downloads / send it via WhatsApp, email,
+  // Drive, etc. Android WebView can't do `blob:` downloads itself —
+  // the dashboard postMessages the content here instead.
+  const handleFileDownload = async (
+    filename: string,
+    content: string,
+  ): Promise<void> => {
+    if (!FileSystem || !Sharing) {
+      Alert.alert(
+        'Export unavailable',
+        'Saving files needs a fresh app build (expo-file-system native module).',
+      );
+      return;
+    }
+    try {
+      const safeName = String(filename || 'export.csv').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const dir = FileSystem.cacheDirectory || '';
+      const path = `${dir}${safeName}`;
+      await FileSystem.writeAsStringAsync(path, content, {
+        encoding: FileSystem.EncodingType?.UTF8 || 'utf8',
+      });
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(path, {
+          mimeType: 'text/csv',
+          dialogTitle: safeName,
+          UTI: 'public.comma-separated-values-text',
+        });
+      } else {
+        Alert.alert('Saved', `File saved to:\n${path}`);
+      }
+    } catch (e: any) {
+      Alert.alert('Export failed', e?.message || 'Could not save the file.');
+    }
+  };
 
   // Native-module missing guard
   if (!webViewReady) {
@@ -196,7 +265,26 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
         onMessage={(event: any) => {
           const data = String(event?.nativeEvent?.data || '');
           if (data === 'LOGOUT' || data === 'BACK_TO_MODE_SELECT') {
+            // Raise the flag FIRST so the beforeRemove listener lets
+            // this navigation through instead of stepping back inside
+            // the embedded site's history. Without this, logging out
+            // from a deep nested admin page just went back one web
+            // page and stayed inside the WebView.
+            loggingOutRef.current = true;
             navigation.goBack();
+            return;
+          }
+          // JSON-shaped messages — currently the CSV-export bridge.
+          // The admin dashboard postMessages
+          //   { type: 'DOWNLOAD_FILE', filename, content, mime }
+          // because Android WebView can't do blob: downloads itself.
+          try {
+            const msg = JSON.parse(data);
+            if (msg && msg.type === 'DOWNLOAD_FILE' && typeof msg.content === 'string') {
+              handleFileDownload(msg.filename || 'export.csv', msg.content);
+            }
+          } catch (_) {
+            /* not JSON — ignore (plain-string messages handled above) */
           }
         }}
         javaScriptEnabled

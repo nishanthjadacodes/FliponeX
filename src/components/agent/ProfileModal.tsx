@@ -97,7 +97,12 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
 
     setLoading(true);
     try {
-      await AsyncStorage.setItem('agent_data', JSON.stringify(agentData));
+      // Hand the edited fields up to the parent. The parent owns the
+      // canonical agent record (with UUID, agent_code, rating, etc.)
+      // and writes the merged result back to AsyncStorage. Doing the
+      // merge here would re-read potentially-corrupted storage (e.g.
+      // from an older build that overwrote the whole blob with just
+      // form fields) and lose the UUID — which then breaks repCode().
       if (onSave) onSave(agentData);
       Alert.alert('Success', 'Profile updated successfully!');
       onClose();

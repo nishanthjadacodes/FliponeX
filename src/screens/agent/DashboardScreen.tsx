@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsFocused } from '@react-navigation/native';
 import {
   View,
   Text,
@@ -28,6 +30,7 @@ import { readCache, writeCache } from '../../utils/agent/cache';
 import ProfileModal, { type AgentProfile } from '../../components/agent/ProfileModal';
 import { LinearGradient } from 'expo-linear-gradient';
 import { repCode } from '../../utils/agent/repCode';
+import { formatBookingAddress } from '../../utils/addressFormat';
 
 interface DashboardScreenProps {
   navigation: {
@@ -55,16 +58,43 @@ interface QuickAction {
 
 const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
   const insets = useSafeAreaInsets();
+  const queryClient = useQueryClient();
+  const isFocused = useIsFocused();
   const [agent, setAgent] = useState<AgentProfile | null>(null);
   const [isOnline, setIsOnline] = useState<boolean>(false);
-  const [tasks, setTasks] = useState<AgentTask[]>([]);
-  const [todayEarnings, setTodayEarnings] = useState<number>(0);
-  const [totalJobs, setTotalJobs] = useState<number>(0);
-  const [newRequests, setNewRequests] = useState<number>(0);
-  const [rating, setRating] = useState<number>(0);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
   const [showProfileModal, setShowProfileModal] = useState<boolean>(false);
+
+  // ─── Dashboard data via TanStack Query ────────────────────────────
+  // getDashboard() returns tasks + earnings + counts. refetchInterval
+  // is gated on isFocused so the 15s poll only runs while the rep is
+  // actually looking at the Dashboard tab (it's a tab screen — stays
+  // mounted in the background otherwise). The queryFn also writes a
+  // cache snapshot so other surfaces have instant data.
+  const {
+    data: dashboard,
+    isLoading: loading,
+    refetch: refetchDashboard,
+  } = useQuery({
+    queryKey: ['agentDashboard'],
+    queryFn: async () => {
+      const data = await getDashboard();
+      writeCache<DashboardCache>('dashboard', {
+        tasks: data.tasks || [],
+        todayEarnings: data.todayEarnings || 0,
+        totalJobs: data.totalJobs || 0,
+        newRequests: data.newRequests || 0,
+        rating: data.rating || 0,
+      });
+      return data;
+    },
+    refetchInterval: isFocused ? 15_000 : false,
+  });
+  const tasks: AgentTask[] = dashboard?.tasks || [];
+  const todayEarnings: number = dashboard?.todayEarnings || 0;
+  const totalJobs: number = dashboard?.totalJobs || 0;
+  const newRequests: number = dashboard?.newRequests || 0;
+  const rating: number = dashboard?.rating || 0;
+
 
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(30)).current;
@@ -85,14 +115,13 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
 
   useEffect(() => {
     (async () => {
+      // Seed the query cache from the persisted snapshot so a COLD
+      // start shows last-known numbers instantly while the live
+      // fetch runs (TanStack Query's own cache is in-memory only —
+      // lost on a full app restart).
       const cached = await readCache<DashboardCache>('dashboard');
-      if (cached?.value) {
-        const d = cached.value;
-        setTasks(d.tasks || []);
-        setTodayEarnings(d.todayEarnings || 0);
-        setTotalJobs(d.totalJobs || 0);
-        setNewRequests(d.newRequests || 0);
-        setRating(d.rating || 0);
+      if (cached?.value && !queryClient.getQueryData(['agentDashboard'])) {
+        queryClient.setQueryData(['agentDashboard'], cached.value);
       }
       // Don't auto-restore the rep's previous online state on app
       // launch — explicit "Go Online" click is required EVERY app
@@ -103,9 +132,8 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
         await AsyncStorage.setItem(ONLINE_STATUS_KEY, 'false');
       } catch {}
       setIsOnline(false);
-      loadDashboardData();
     })();
-  }, []);
+  }, [queryClient]);
 
   // Auto-offline the rep whenever the app backgrounds (home button,
   // app switcher, screen lock, etc.). Without this the admin's
@@ -150,46 +178,24 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
     return () => clearInterval(id);
   }, [isOnline]);
 
+  // The 15s poll is now the query's refetchInterval (gated on
+  // isFocused). This effect only handles the TaskExecution
+  // force-refresh handshake: when the rep just marked work_completed,
+  // that screen sets a flag; on the next focus we wait 600ms for the
+  // backend write to commit, then refetch so todayEarnings isn't
+  // stale-zero from a read replica that hasn't caught up.
   useEffect(() => {
-    let pollId: ReturnType<typeof setInterval> | null = null;
-    const start = async (): Promise<void> => {
-      // If TaskExecution flagged a force-refresh (rep just marked
-      // work_completed), wait a beat for the backend to commit the
-      // status transition, then fetch. Without the small delay, the
-      // immediate fetch could land on the same DB read replica
-      // before the write has propagated, returning the stale
-      // todayEarnings=0.
-      let force = false;
+    if (!isFocused) return;
+    (async () => {
       try {
         const flag = await AsyncStorage.getItem('dashboard_force_refresh');
         if (flag) {
-          force = true;
           await AsyncStorage.removeItem('dashboard_force_refresh');
+          setTimeout(() => refetchDashboard(), 600);
         }
       } catch {}
-      if (force) {
-        // 600ms window — generous enough for Sequelize to commit
-        // and for the next /earnings query to pick up the new row.
-        setTimeout(() => loadDashboardData(), 600);
-      } else {
-        loadDashboardData();
-      }
-      pollId = setInterval(loadDashboardData, 15000);
-    };
-    const stop = (): void => {
-      if (pollId) {
-        clearInterval(pollId);
-        pollId = null;
-      }
-    };
-    const focusUnsub = navigation.addListener('focus', start);
-    const blurUnsub = navigation.addListener('blur', stop);
-    return () => {
-      stop();
-      focusUnsub();
-      blurUnsub();
-    };
-  }, [navigation]);
+    })();
+  }, [isFocused, refetchDashboard]);
 
   useEffect(() => {
     if (!loading) startAnimations();
@@ -242,46 +248,25 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
     ).start();
   };
 
-  const loadDashboardData = async (): Promise<void> => {
-    try {
-      const agentData = await AsyncStorage.getItem('agent_data');
-      if (agentData) setAgent(JSON.parse(agentData) as AgentProfile);
-      const data = await getDashboard();
-      // Diagnostic — visible via `adb logcat *:S ReactNativeJS:V` on
-      // the device. Helps verify the backend is returning a non-zero
-      // todayEarnings after a rep completes work.
-      console.log('[dashboard] todayEarnings from server:', data.todayEarnings,
-        '| totalJobs:', data.totalJobs, '| tasks status counts:',
-        (data.tasks || []).reduce<Record<string, number>>((acc, t) => {
-          acc[t.status] = (acc[t.status] || 0) + 1;
-          return acc;
-        }, {}));
-      setTasks(data.tasks || []);
-      setTodayEarnings(data.todayEarnings || 0);
-      setTotalJobs(data.totalJobs || 0);
-      setNewRequests(data.newRequests || 0);
-      setRating(data.rating || 0);
-      // Deliberately NOT setting isOnline from polled data. The toggle
-      // is purely local + AsyncStorage-backed; only manual taps change
-      // it. data.isOnline is ignored here on purpose.
-      writeCache<DashboardCache>('dashboard', {
-        tasks: data.tasks || [],
-        todayEarnings: data.todayEarnings || 0,
-        totalJobs: data.totalJobs || 0,
-        newRequests: data.newRequests || 0,
-        rating: data.rating || 0,
-      });
-    } catch (error) {
-      console.error('Dashboard load error:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
+  // Refresh the cached agent profile from AsyncStorage when the
+  // screen is focused (kept separate from the dashboard query — the
+  // agent profile is device-local, not part of getDashboard()).
+  useEffect(() => {
+    if (!isFocused) return;
+    AsyncStorage.getItem('agent_data')
+      .then((raw) => {
+        if (raw) setAgent(JSON.parse(raw) as AgentProfile);
+      })
+      .catch(() => {});
+  }, [isFocused]);
 
-  const onRefresh = (): void => {
+  // Pull-to-refresh spinner kept as local state so the background
+  // 15s poll doesn't flash the RefreshControl.
+  const [refreshing, setRefreshing] = useState<boolean>(false);
+  const onRefresh = async (): Promise<void> => {
     setRefreshing(true);
-    loadDashboardData();
+    await refetchDashboard();
+    setRefreshing(false);
   };
 
   // Re-entrancy guard — without it, tapping the Switch faster than
@@ -617,7 +602,7 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                     <Text style={styles.taskCustomer}>{task.customerName}</Text>
                     <Text style={styles.taskService}>{task.serviceName}</Text>
                     <Text style={styles.taskAddress} numberOfLines={1}>
-                      {task.address}
+                      {formatBookingAddress(task.address)}
                     </Text>
                   </View>
                   <View style={styles.taskRight}>

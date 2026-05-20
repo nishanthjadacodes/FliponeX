@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -14,6 +15,7 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
 import { getMyDocuments, uploadKYCDocument } from '../services/api';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 import SuccessToast from '../components/SuccessToast';
 import DocPreviewModal from '../components/DocPreviewModal';
 import * as haptics from '../utils/haptics';
@@ -60,12 +62,27 @@ const DOC_TYPES: DocType[] = [
   { key: 'address_proof',  label: 'Address Proof',    icon: '📋', desc: 'Utility bill / bank statement',    required: false },
 ];
 
+// Fetches the KYC document list. Backend may return { data: [...] }
+// or a bare array.
+const fetchDocuments = async (): Promise<DocumentItem[]> => {
+  const response: any = await getMyDocuments();
+  return Array.isArray(response) ? response : (response?.data || []);
+};
+
 const DocumentsScreen: React.FC = () => {
-  const [documents, setDocuments] = useState<DocumentItem[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
+  // Documents fetched + cached by TanStack Query.
+  const {
+    data: documents = [],
+    isLoading: loading,
+    isFetching: refreshing,
+    error: queryError,
+    refetch,
+  } = useQuery({ queryKey: ['documents'], queryFn: fetchDocuments });
+  const loadError = queryError
+    ? ((queryError as any)?.message || 'Could not load documents')
+    : null;
+
   const [uploading, setUploading] = useState<Record<string, boolean>>({});
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState>({ visible: false, title: '', subtitle: '', variant: 'success' });
 
   const showToast = (title: string, subtitle: string, variant: string = 'success'): void =>
@@ -80,29 +97,11 @@ const DocumentsScreen: React.FC = () => {
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [previewDoc, setPreviewDoc] = useState<DocumentItem | null>(null);
 
-  useEffect(() => {
-    loadDocuments();
-  }, []);
-
-  const loadDocuments = async (): Promise<void> => {
-    try {
-      setLoadError(null);
-      const response: any = await getMyDocuments();
-      // Backend may return { data: [...] } or [...] directly
-      const list: DocumentItem[] = Array.isArray(response) ? response : (response.data || []);
-      setDocuments(list);
-    } catch (error: any) {
-      console.log('Documents load error:', error?.message);
-      // Don't show alert — just show empty state with retry option
-      setLoadError(error?.message || 'Could not load documents');
-      setDocuments([]);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  const onRefresh = (): void => { setRefreshing(true); loadDocuments(); };
+  // loadDocuments() is now refetch() from the query above.
+  const onRefresh = useCallback((): void => {
+    refetch();
+  }, [refetch]);
+  useRefetchOnFocus(onRefresh);
 
   // Phase 1 — open picker (gallery / camera) with the styled crop UI
   // (react-native-image-crop-picker → UCrop on Android). Cropper has a
@@ -170,7 +169,7 @@ const DocumentsScreen: React.FC = () => {
       });
       setPendingUpload(null);
       showToast('Uploaded!', `${docType.label} added to your profile`, 'success');
-      await loadDocuments();
+      await refetch();
     } catch (uploadErr: any) {
       console.log('Upload error:', uploadErr?.message);
       showToast('Upload Failed', uploadErr?.message || 'Please try again', 'error');
@@ -306,7 +305,7 @@ const DocumentsScreen: React.FC = () => {
         </View>
 
         {loadError && (
-          <TouchableOpacity style={styles.errorBanner} onPress={loadDocuments}>
+          <TouchableOpacity style={styles.errorBanner} onPress={() => refetch()}>
             <Text style={styles.errorBannerIcon}>⚠️</Text>
             <View style={{ flex: 1 }}>
               <Text style={styles.errorBannerTitle}>Could not load saved documents</Text>

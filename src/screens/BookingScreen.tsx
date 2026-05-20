@@ -4388,7 +4388,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             <View style={styles.buttonContainer}>
               <TouchableOpacity
                 style={styles.trackBtn}
-                onPress={() => navigation.navigate('MyBookings')}
+                onPress={() => navigation.navigate('MyBookings', { tab: 'ongoing' })}
               >
                 <Text style={styles.trackBtnText}>Track My Booking</Text>
               </TouchableOpacity>

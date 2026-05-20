@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -15,22 +16,16 @@ import { STRINGS } from '../constants/strings';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { getBookingDetails } from '../services/api';
 import { formatBookingId } from '../utils/bookingId';
+import { formatBookingAddress, normalizeAddress } from '../utils/addressFormat';
 import DocPreviewModal, { fixDocUrl } from '../components/DocPreviewModal';
-// react-native-maps is already in package.json. Defensive require so a
-// dev-client missing the native module falls back to the placeholder
-// instead of crashing.
-let MapView: any = null;
-let Marker: any = null;
-let mapAvailable = false;
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
-  const m = require('react-native-maps');
-  MapView = m.default || m;
-  Marker = m.Marker;
-  mapAvailable = !!MapView && !!Marker;
-} catch (_) {
-  mapAvailable = false;
-}
+// react-native-maps is installed but disabled in this build —
+// embedding a Google MapView on Android requires a valid
+// `com.google.android.geo.API_KEY` in AndroidManifest.xml. Without
+// it the native Maps SDK crashes the app the moment MapView mounts
+// (no JS error, no error boundary — just "FliponeX keeps stopping").
+// Until the API key is provisioned, we ship a static card with an
+// "Open in Google Maps" deep-link instead — works on every Android
+// device regardless of Play Services or API-key state.
 
 interface Navigation {
   navigate: (route: string, params?: Record<string, unknown>) => void;
@@ -53,40 +48,29 @@ const TrackingScreen: React.FC<Props> = ({ navigation, route }) => {
   // Top inset so the back button isn't clipped behind status bar/notch
   // now that the React Navigation stack header is hidden for this screen.
   const insets = useSafeAreaInsets();
-  const [booking, setBooking] = useState<any>(null);
   // Currently-previewed doc (set when user taps a doc row).
   const [previewDoc, setPreviewDoc] = useState<any>(null);
-  const [loading, setLoading] = useState<boolean>(false);
 
-  useEffect(() => {
-    loadBookingDetails();
-  }, [bookingId]);
-
-  // Poll booking details every 30s so the rep's `current_lat/lng`
-  // (refreshed by the rep app's location ping every 60s) propagates to
-  // the customer's map without a manual pull-to-refresh. Stops when
-  // the screen unmounts so we don't leak intervals.
-  useEffect(() => {
-    const t = setInterval(() => {
-      loadBookingDetails();
-    }, 30_000);
-    return () => clearInterval(t);
-  }, [bookingId]);
-
-  const loadBookingDetails = async (): Promise<void> => {
-    try {
-      setLoading(true);
+  // Booking detail — shares the ['booking', bookingId] cache with
+  // BookingDetailsScreen, so arriving here from that screen is
+  // instant. `refetchInterval` polls every 30s so the rep's live
+  // current_lat/lng (pinged by the rep app every 60s) keeps flowing
+  // into the map without a manual pull-to-refresh. Polling stops
+  // automatically when this screen unmounts.
+  const {
+    data: booking = null,
+    isLoading: loading,
+  } = useQuery({
+    queryKey: ['booking', bookingId],
+    queryFn: async () => {
       const response: any = await getBookingDetails(bookingId);
-      // Backend may return { success, data: booking } OR booking directly
-      const data = response?.data || response;
-      setBooking(data);
-    } catch (error) {
-      console.error('Error loading booking details:', error);
-      Alert.alert('Error', 'Failed to load tracking information');
-    } finally {
-      setLoading(false);
-    }
-  };
+      let bookingData: any = response?.data || response;
+      if (bookingData && bookingData.data) bookingData = bookingData.data;
+      return bookingData;
+    },
+    enabled: bookingId != null,
+    refetchInterval: 30_000,
+  });
 
   const handleCallAgent = (): void => {
     if (booking?.agent?.mobile) {
@@ -326,16 +310,21 @@ const TrackingScreen: React.FC<Props> = ({ navigation, route }) => {
           <Text style={styles.sectionTitle}>Service Address</Text>
           <View style={styles.addressCard}>
             <Text style={styles.addressText}>
-              {booking?.service_address || booking?.address || booking?.customer_address || 'N/A'}
+              {formatBookingAddress(
+                booking?.service_address || booking?.address || booking?.customer_address,
+              ) || 'N/A'}
             </Text>
           </View>
         </View>
 
-        {/* Live Location — real react-native-maps MapView showing the
-            rep's last-known position (refreshed every 30s) + the
-            customer's destination. Falls back to the old placeholder
-            text only when the native map module isn't bundled, or
-            when no coords are available yet. */}
+        {/* Live Location — replaced the embedded MapView with a static
+            location card + "Open in Google Maps" deep-link. The
+            embedded map needs a Google Maps API key in
+            AndroidManifest, and without it react-native-maps native
+            code crashes the entire app. Linking out to Google Maps
+            sidesteps that requirement and works on every Android
+            device. We re-enable the embedded map once an API key is
+            provisioned. */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Live Location</Text>
           {(() => {
@@ -347,87 +336,118 @@ const TrackingScreen: React.FC<Props> = ({ navigation, route }) => {
               Number.isFinite(agentLat) && Number.isFinite(agentLng) &&
               (agentLat !== 0 || agentLng !== 0);
 
-            const destLat = Number(booking?.latitude ?? booking?.customer?.current_lat ?? NaN);
-            const destLng = Number(booking?.longitude ?? booking?.customer?.current_lng ?? NaN);
+            // Destination coords must come from THIS booking — never
+            // from `booking.customer.current_lat/lng` (the customer's
+            // current device location). That fallback caused every
+            // booking without its own stored coords to show the same
+            // pin pointing at the customer's house regardless of the
+            // actual service address.
+            const addrObj: any =
+              typeof booking?.address === 'object' && booking?.address ? booking.address : null;
+            const serviceAddrObj: any =
+              typeof booking?.service_address === 'object' && booking?.service_address
+                ? booking.service_address
+                : null;
+            const destLat = Number(
+              booking?.latitude ??
+                addrObj?.latitude ??
+                serviceAddrObj?.latitude ??
+                booking?.address_latitude ??
+                booking?.service_lat ??
+                NaN,
+            );
+            const destLng = Number(
+              booking?.longitude ??
+                addrObj?.longitude ??
+                serviceAddrObj?.longitude ??
+                booking?.address_longitude ??
+                booking?.service_lng ??
+                NaN,
+            );
             const hasDestCoords =
               Number.isFinite(destLat) && Number.isFinite(destLng) &&
               (destLat !== 0 || destLng !== 0);
 
-            // Map needs at least one coord to render. If neither side
-            // has shared a position yet, fall back to the helpful
-            // hint card so the user knows what's coming.
-            if (!mapAvailable || (!hasAgentCoords && !hasDestCoords)) {
+            const openInMaps = (lat: number, lng: number, label?: string): void => {
+              const labelPart = label ? `(${encodeURIComponent(label)})` : '';
+              const url = `https://www.google.com/maps/search/?api=1&query=${lat},${lng}${labelPart}`;
+              Linking.openURL(url).catch(() => {});
+            };
+
+            const openDirections = (): void => {
+              // Origin = agent's last-known position; destination = service address.
+              // Google Maps will fall back to "use my current location"
+              // if origin is missing.
+              const dest = `${destLat},${destLng}`;
+              const origin = hasAgentCoords ? `${agentLat},${agentLng}` : '';
+              const url = `https://www.google.com/maps/dir/?api=1${
+                origin ? `&origin=${origin}` : ''
+              }&destination=${dest}&travelmode=driving`;
+              Linking.openURL(url).catch(() => {});
+            };
+
+            if (!hasAgentCoords && !hasDestCoords) {
               return (
                 <View style={styles.mapPlaceholder}>
-                  <Text style={styles.mapText}>📍 Live Map</Text>
+                  <Text style={styles.mapText}>📍 Live Location</Text>
                   <Text style={styles.mapSubtext}>
-                    {!mapAvailable
-                      ? 'Map module not bundled yet — update the app to see live tracking.'
-                      : booking?.agent
-                        ? 'Waiting for the representative to share their location… (refreshes every 30s)'
-                        : 'Location tracking will be available once a representative is assigned.'}
+                    {booking?.agent
+                      ? 'Waiting for the representative to share their location… (refreshes every 30s)'
+                      : 'Location tracking will be available once a representative is assigned.'}
                   </Text>
                 </View>
               );
             }
 
-            // Centre the map on whichever coord is available; if both,
-            // bias slightly toward the midpoint so both markers fit
-            // inside a reasonable zoom level.
-            const centreLat = hasAgentCoords && hasDestCoords
-              ? (agentLat + destLat) / 2
-              : hasAgentCoords ? agentLat : destLat;
-            const centreLng = hasAgentCoords && hasDestCoords
-              ? (agentLng + destLng) / 2
-              : hasAgentCoords ? agentLng : destLng;
-            const latDelta = hasAgentCoords && hasDestCoords
-              ? Math.max(0.02, Math.abs(agentLat - destLat) * 1.6)
-              : 0.02;
-            const lngDelta = hasAgentCoords && hasDestCoords
-              ? Math.max(0.02, Math.abs(agentLng - destLng) * 1.6)
-              : 0.02;
-
             return (
               <View style={styles.mapWrap}>
-                <MapView
-                  style={styles.mapView}
-                  region={{
-                    latitude: centreLat,
-                    longitude: centreLng,
-                    latitudeDelta: latDelta,
-                    longitudeDelta: lngDelta,
-                  }}
-                  showsUserLocation={false}
-                  showsMyLocationButton={false}
-                >
+                <View style={styles.locCard}>
                   {hasAgentCoords && (
-                    <Marker
-                      coordinate={{ latitude: agentLat, longitude: agentLng }}
-                      title={booking?.agent?.name || 'Representative'}
-                      description="Live position"
-                      pinColor="#0D3B66"
-                    />
+                    <TouchableOpacity
+                      style={styles.locRow}
+                      activeOpacity={0.7}
+                      onPress={() => openInMaps(agentLat, agentLng, booking?.agent?.name || 'Representative')}
+                    >
+                      <View style={[styles.locDot, { backgroundColor: '#0D3B66' }]} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.locTitle}>
+                          {booking?.agent?.name || 'Representative'} — live position
+                        </Text>
+                        <Text style={styles.locSub}>
+                          {agentLat.toFixed(5)}, {agentLng.toFixed(5)} · tap to open
+                        </Text>
+                      </View>
+                      <Text style={styles.locChevron}>›</Text>
+                    </TouchableOpacity>
                   )}
                   {hasDestCoords && (
-                    <Marker
-                      coordinate={{ latitude: destLat, longitude: destLng }}
-                      title="Service address"
-                      description={booking?.address || ''}
-                      pinColor="#E63946"
-                    />
+                    <TouchableOpacity
+                      style={styles.locRow}
+                      activeOpacity={0.7}
+                      onPress={() =>
+                        openInMaps(destLat, destLng, normalizeAddress(booking?.address) || 'Service address')
+                      }
+                    >
+                      <View style={[styles.locDot, { backgroundColor: '#E63946' }]} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.locTitle}>Service address</Text>
+                        <Text style={styles.locSub} numberOfLines={2}>
+                          {formatBookingAddress(booking?.address) ||
+                            `${destLat.toFixed(5)}, ${destLng.toFixed(5)}`}
+                        </Text>
+                      </View>
+                      <Text style={styles.locChevron}>›</Text>
+                    </TouchableOpacity>
                   )}
-                </MapView>
-                <View style={styles.mapLegend}>
-                  <View style={styles.mapLegendItem}>
-                    <View style={[styles.mapLegendDot, { backgroundColor: '#0D3B66' }]} />
-                    <Text style={styles.mapLegendText}>
-                      {hasAgentCoords ? 'Rep' : 'Rep (waiting)'}
-                    </Text>
-                  </View>
-                  <View style={styles.mapLegendItem}>
-                    <View style={[styles.mapLegendDot, { backgroundColor: '#E63946' }]} />
-                    <Text style={styles.mapLegendText}>Service address</Text>
-                  </View>
+                  {hasAgentCoords && hasDestCoords && (
+                    <TouchableOpacity
+                      style={styles.directionsBtn}
+                      activeOpacity={0.85}
+                      onPress={openDirections}
+                    >
+                      <Text style={styles.directionsBtnText}>Get Directions in Google Maps</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
               </View>
             );
@@ -716,6 +736,55 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#475569',
     fontWeight: '600',
+  },
+  // Static "Live Location" card — replaces the embedded MapView while
+  // the Google Maps API key isn't provisioned. See the comment block
+  // at the top of this file for context.
+  locCard: {
+    padding: 12,
+    gap: 4,
+  },
+  locRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+    gap: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  locDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  locTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#0D3B66',
+  },
+  locSub: {
+    fontSize: 12,
+    color: '#5C6A7A',
+    marginTop: 2,
+  },
+  locChevron: {
+    fontSize: 22,
+    color: '#94A3B8',
+    fontWeight: '300',
+  },
+  directionsBtn: {
+    marginTop: 12,
+    backgroundColor: '#0D3B66',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  directionsBtnText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+    fontSize: 14,
+    letterSpacing: 0.2,
   },
   timeline: {
     paddingLeft: SIZES.BASE,

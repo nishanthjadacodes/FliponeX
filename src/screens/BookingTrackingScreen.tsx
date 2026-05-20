@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { getBookingDetails, updateBookingStatus, submitReview } from '../services/api';
 import { formatBookingId } from '../utils/bookingId';
+import { formatBookingAddress } from '../utils/addressFormat';
 
 interface Navigation {
   navigate: (route: string, params?: Record<string, unknown>) => void;
@@ -285,7 +286,7 @@ const BookingTrackingScreen: React.FC<Props> = ({ route, navigation }) => {
           </View>
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Address:</Text>
-            <Text style={styles.detailValue}>{booking.service_address}</Text>
+            <Text style={styles.detailValue}>{formatBookingAddress(booking.service_address)}</Text>
           </View>
           <View style={styles.detailRow}>
             <Text style={styles.detailLabel}>Service Mode:</Text>

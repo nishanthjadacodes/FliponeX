@@ -1,18 +1,19 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   FlatList,
   RefreshControl,
   ActivityIndicator,
-  Alert,
   StyleSheet,
   TouchableOpacity,
 } from 'react-native';
+import { useQuery } from '@tanstack/react-query';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import { getMyBookings, getMyEnquiries } from '../services/api';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import BookingCard from '../components/BookingCard';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 
 interface NavigationProp {
   navigate: (route: string, params?: Record<string, unknown>) => void;
@@ -51,114 +52,126 @@ interface Enquiry {
   [key: string]: any;
 }
 
+// ─── Query functions ────────────────────────────────────────────────
+// Extracted as module-level functions so TanStack Query owns them.
+// Both are RESILIENT — an API failure falls back to whatever data is
+// available rather than throwing, so the screen is never blocked
+// (matches the old hand-rolled behaviour).
+
+// API bookings merged with not-yet-synced local bookings.
+const fetchBookings = async (): Promise<Booking[]> => {
+  let apiBookings: Booking[] = [];
+  try {
+    const response: any = await getMyBookings();
+    apiBookings = Array.isArray(response) ? response : [];
+  } catch (apiError: any) {
+    console.log('API unavailable, showing local bookings only:', apiError?.message);
+  }
+
+  // Build lookup: service_id → service name (from API data).
+  const serviceNameByServiceId: Record<string, string> = {};
+  const apiBookingIds = new Set<any>();
+  apiBookings.forEach((b: Booking) => {
+    apiBookingIds.add(b.id);
+    if (b.service_id && b.service?.name) {
+      serviceNameByServiceId[b.service_id as any] = b.service.name;
+    }
+  });
+
+  // Local bookings not yet returned by the API (just created, unsynced).
+  let localOnlyBookings: Booking[] = [];
+  try {
+    const stored = await AsyncStorage.getItem('my_bookings');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) {
+        localOnlyBookings = parsed
+          .filter((b: Booking) => !apiBookingIds.has(b.id))
+          .map((b: Booking) => ({
+            ...b,
+            service_name: b.service_name || serviceNameByServiceId[b.service_id as any] || '',
+          }));
+      }
+    }
+  } catch (error) {
+    console.log('Error reading local bookings:', error);
+  }
+
+  return [...apiBookings, ...localOnlyBookings];
+};
+
+// Enquiries (B2B) — separate backend table.
+const fetchEnquiries = async (): Promise<Enquiry[]> => {
+  try {
+    const enqRes: any = await getMyEnquiries();
+    return Array.isArray(enqRes?.data) ? enqRes.data : [];
+  } catch (e: any) {
+    console.log('Enquiries unavailable:', e?.message);
+    return [];
+  }
+};
+
 const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
   const [activeTab, setActiveTab] = useState<string>('ongoing');
-  const [bookings, setBookings] = useState<Booking[]>([]);
-  const [enquiries, setEnquiries] = useState<Enquiry[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
-  const isLoadingRef = useRef<boolean>(false);
 
-  // Load bookings whenever the screen comes into focus
-  useEffect(() => {
-    const unsubscribe = navigation.addListener?.('focus', () => {
-      loadBookings();
-    });
-    return unsubscribe;
-  }, [navigation]);
+  // ─── Server state via TanStack Query ──────────────────────────────
+  // Replaces the old useState + useEffect + isLoadingRef + manual
+  // focus-listener plumbing. Query gives us caching, request dedup,
+  // background refresh and loading/fetching flags for free.
+  const {
+    data: bookings = [],
+    isLoading: bookingsLoading,
+    isFetching,
+    refetch: refetchBookings,
+  } = useQuery({ queryKey: ['bookings'], queryFn: fetchBookings });
 
-  // Also refresh if coming from booking confirmation with refresh parameter
+  const {
+    data: enquiries = [],
+    refetch: refetchEnquiries,
+  } = useQuery({ queryKey: ['enquiries'], queryFn: fetchEnquiries });
+
+  const onRefresh = useCallback((): void => {
+    refetchBookings();
+    refetchEnquiries();
+  }, [refetchBookings, refetchEnquiries]);
+
+  // Refetch both lists when the tab regains focus (replaces the old
+  // navigation.addListener('focus') wiring).
+  useRefetchOnFocus(onRefresh);
+
+  // Refresh if coming from booking confirmation with refresh parameter.
   useEffect(() => {
     if (route.params?.refresh) {
-      loadBookings();
-      // Reset the refresh parameter to avoid infinite loops
+      onRefresh();
       navigation.setParams({ refresh: undefined });
     }
-  }, [route.params?.refresh]);
+  }, [route.params?.refresh, onRefresh, navigation]);
 
-  const loadBookings = async (): Promise<void> => {
-    if (isLoadingRef.current) return;
-    isLoadingRef.current = true;
-    try {
-      setLoading(true);
-
-      // --- 1. API bookings (primary source, has full data + service association) ---
-      let apiBookings: Booking[] = [];
-      try {
-        const response: any = await getMyBookings();
-        apiBookings = Array.isArray(response) ? response : [];
-      } catch (apiError: any) {
-        console.log('API unavailable, showing local bookings only:', apiError?.message);
-      }
-
-      // Build lookup: service_id → service name (from API data)
-      const serviceNameByServiceId: Record<string, string> = {};
-      const apiBookingIds = new Set<any>();
-      apiBookings.forEach((b: Booking) => {
-        apiBookingIds.add(b.id);
-        if (b.service_id && b.service?.name) {
-          serviceNameByServiceId[b.service_id as any] = b.service.name;
-        }
-      });
-
-      // --- 2. Local bookings (my_bookings only — single source of truth) ---
-      // Only include bookings not already returned by the API (recently created, not yet synced)
-      let localOnlyBookings: Booking[] = [];
-      try {
-        const stored = await AsyncStorage.getItem('my_bookings');
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (Array.isArray(parsed)) {
-            localOnlyBookings = parsed
-              .filter((b: Booking) => !apiBookingIds.has(b.id))
-              .map((b: Booking) => ({
-                ...b,
-                // Fill in service_name from API data if the local copy is missing it
-                service_name: b.service_name || serviceNameByServiceId[b.service_id as any] || '',
-              }));
-          }
-        }
-      } catch (error) {
-        console.log('Error reading local bookings:', error);
-      }
-
-      // API bookings first (complete data), then local-only ones (recently created, not yet synced)
-      setBookings([...apiBookings, ...localOnlyBookings]);
-
-      // Enquiries run on a separate table on the backend — pull them too so
-      // the Enquiries tab is always up to date alongside Bookings.
-      try {
-        const enqRes: any = await getMyEnquiries();
-        setEnquiries(Array.isArray(enqRes?.data) ? enqRes.data : []);
-      } catch (e: any) {
-        console.log('Enquiries unavailable:', e?.message);
-      }
-
-    } catch (error) {
-      console.error('Error loading bookings:', error);
-      Alert.alert('Error', 'Failed to load bookings');
-      setBookings([]);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      isLoadingRef.current = false;
+  // Honour an explicit `tab` param from callers. This screen lives in
+  // the bottom-tab navigator, so it stays mounted and keeps whatever
+  // tab the user last left it on. After a successful booking the
+  // "Track My Booking" button passes { tab: 'ongoing' } so the user
+  // always lands on the ongoing list (where their fresh pending
+  // booking is) instead of whatever tab — e.g. 'completed' — was
+  // active from a previous visit.
+  useEffect(() => {
+    const requested = route.params?.tab;
+    if (requested && requested !== activeTab) {
+      setActiveTab(requested);
     }
-  };
-
-  const onRefresh = (): void => {
-    setRefreshing(true);
-    loadBookings();
-  };
+    if (requested) {
+      navigation.setParams({ tab: undefined });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route.params?.tab]);
 
   const getBookingsByTab = (): Booking[] => {
-    console.log('=== FILTERING BOOKINGS ===');
-    console.log('Active tab:', activeTab);
-    console.log('Total bookings:', bookings.length);
-
-    const filteredBookings = bookings.filter((booking: Booking) => {
+    // Drop malformed entries (no id AND no booking_number) — they show
+    // up after AsyncStorage cache corruption and produce duplicate
+    // FlatList keys, which can crash Hermes on some Android builds.
+    return bookings.filter((booking: Booking) => {
+      if (booking.id == null && booking.booking_number == null) return false;
       const status = booking.status || 'unknown';
-      console.log(`Booking ${booking.id || booking.booking_number} status: ${status}`);
-
       switch (activeTab) {
         case 'ongoing':
           return ['pending', 'assigned', 'accepted', 'documents_collected', 'submitted', 'confirmed'].includes(status);
@@ -170,11 +183,6 @@ const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
           return false;
       }
     });
-
-    console.log(`Filtered ${filteredBookings.length} bookings for ${activeTab} tab`);
-    console.log('======================');
-
-    return filteredBookings;
   };
 
   const renderEmptyState = () => (
@@ -280,76 +288,47 @@ const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
     </View>
   );
 
-  const EnquiriesTab: React.FC = () => (
-    <FlatList
-      data={enquiries}
-      renderItem={renderEnquiryItem}
-      keyExtractor={(item) => String(item.id)}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-      contentContainerStyle={styles.listContainer}
-      showsVerticalScrollIndicator={false}
-      ListEmptyComponent={renderEnquiryEmptyState}
-    />
-  );
-
-  const OngoingTab: React.FC = () => (
-    <FlatList
-      data={getBookingsByTab()}
-      renderItem={renderBookingItem}
-      keyExtractor={(item) => String(item.id || item.booking_number)}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
-      contentContainerStyle={styles.listContainer}
-      showsVerticalScrollIndicator={false}
-      ListEmptyComponent={renderEmptyState}
-    />
-  );
-
-  const CompletedTab: React.FC = () => (
-    <FlatList
-      data={getBookingsByTab()}
-      renderItem={renderBookingItem}
-      keyExtractor={(item) => String(item.id || item.booking_number)}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
-      contentContainerStyle={styles.listContainer}
-      showsVerticalScrollIndicator={false}
-      ListEmptyComponent={renderEmptyState}
-    />
-  );
-
-  const CancelledTab: React.FC = () => (
-    <FlatList
-      data={getBookingsByTab()}
-      renderItem={renderBookingItem}
-      keyExtractor={(item) => String(item.id || item.booking_number)}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-      }
-      contentContainerStyle={styles.listContainer}
-      showsVerticalScrollIndicator={false}
-      ListEmptyComponent={renderEmptyState}
-    />
-  );
-
+  // Inline the FlatList — defining tabs as inner components inside
+  // the parent (the old pattern: const OngoingTab = () => …) creates
+  // a fresh component identity on every state change, which made
+  // React unmount + remount the FlatList constantly. On some Android
+  // devices (Samsung One UI, Xiaomi MIUI, low-RAM phones) that churn
+  // crashed the app when the user tapped the Bookings tab. Inlining
+  // keeps the same FlatList instance across re-renders.
+  //
+  // keyExtractor uses index as a last-resort fallback so two bookings
+  // with the same (or null) id never produce duplicate keys — Hermes
+  // throws on duplicate keys and that's a hard crash too.
   const renderContent = () => {
-    switch (activeTab) {
-      case 'ongoing':
-        return <OngoingTab />;
-      case 'completed':
-        return <CompletedTab />;
-      case 'cancelled':
-        return <CancelledTab />;
-      case 'enquiries':
-        return <EnquiriesTab />;
-      default:
-        return <OngoingTab />;
+    if (activeTab === 'enquiries') {
+      return (
+        <FlatList
+          data={enquiries}
+          renderItem={renderEnquiryItem}
+          keyExtractor={(item, index) => String(item.id ?? `enq-${index}`)}
+          refreshControl={<RefreshControl refreshing={isFetching} onRefresh={onRefresh} />}
+          contentContainerStyle={styles.listContainer}
+          showsVerticalScrollIndicator={false}
+          ListEmptyComponent={renderEnquiryEmptyState}
+        />
+      );
     }
+    return (
+      <FlatList
+        data={getBookingsByTab()}
+        renderItem={renderBookingItem}
+        keyExtractor={(item, index) =>
+          String(item.id ?? item.booking_number ?? `bk-${index}`)
+        }
+        refreshControl={<RefreshControl refreshing={isFetching} onRefresh={onRefresh} />}
+        contentContainerStyle={styles.listContainer}
+        showsVerticalScrollIndicator={false}
+        ListEmptyComponent={renderEmptyState}
+      />
+    );
   };
 
-  if (loading && bookings.length === 0) {
+  if (bookingsLoading) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color={COLORS.PRIMARY} />

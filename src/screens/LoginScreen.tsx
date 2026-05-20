@@ -21,6 +21,7 @@ import {
   ScrollView,
   Alert,
   Image,
+  BackHandler,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -66,6 +67,29 @@ const LoginScreen: React.FC<Props> = ({ navigation, route }) => {
     const id = setTimeout(() => setResendCooldown((s) => s - 1), 1000);
     return () => clearTimeout(id);
   }, [resendCooldown]);
+
+  // Hardware back press → route to ModeSelect (toggle page) instead of
+  // exiting the app. The flash notification flow uses navigation.reset
+  // which wipes the stack, so Login has no parent to pop to; we hop
+  // there explicitly with replace.
+  useEffect(() => {
+    const onBack = (): boolean => {
+      if (phase === 'otp') {
+        // From the OTP step, fall back to the mobile-entry step first.
+        setPhase('mobile');
+        setOtp('');
+        return true;
+      }
+      if (navigation.replace) {
+        navigation.replace('ModeSelect');
+      } else {
+        navigation.navigate('ModeSelect');
+      }
+      return true;
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+    return () => sub.remove();
+  }, [phase, navigation]);
 
   const isValidMobile = (v: string): boolean => /^[6-9]\d{9}$/.test(v);
 

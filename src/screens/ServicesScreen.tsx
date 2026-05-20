@@ -7,6 +7,7 @@
 // without scrolling. Tap any card → navigates to ServiceDetails →
 // the existing booking flow takes over.
 import { useEffect, useState, useMemo, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -22,6 +23,26 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS } from '../constants/colors';
 import { getServices, type Service } from '../services/api';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
+
+// Fetches BOTH consumer + industrial catalogues in parallel and merges
+// them (de-duped by id, since a `service_type: 'both'` row appears in
+// each). Resilient — a failed bucket just contributes nothing.
+const fetchAllServices = async (): Promise<Service[]> => {
+  const [consumerRes, industrialRes] = await Promise.all([
+    getServices('consumer').catch(() => null),
+    getServices('industrial').catch(() => null),
+  ]);
+  const pickList = (res: any): Service[] =>
+    Array.isArray(res?.data) ? res.data
+    : Array.isArray(res) ? res
+    : Array.isArray(res?.services) ? res.services
+    : [];
+  const merged = new Map<string, Service>();
+  pickList(consumerRes).forEach((s: any) => merged.set(String(s.id), s));
+  pickList(industrialRes).forEach((s: any) => merged.set(String(s.id), s));
+  return Array.from(merged.values());
+};
 import ServiceCard, { iconForCategory } from '../components/ServiceCard';
 import * as haptics from '../utils/haptics';
 
@@ -39,9 +60,12 @@ interface Props {
 
 const ServicesScreen: React.FC<Props> = ({ navigation, route }) => {
   const insets = useSafeAreaInsets();
-  const [services, setServices] = useState<Service[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
+  const {
+    data: services = [],
+    isLoading: loading,
+    isFetching: refreshing,
+    refetch,
+  } = useQuery({ queryKey: ['services'], queryFn: fetchAllServices });
   const [search, setSearch] = useState<string>('');
   // If the user arrived here via Home → "View All →", the category
   // they tapped on is in route.params.category. Pre-select it so the
@@ -58,50 +82,13 @@ const ServicesScreen: React.FC<Props> = ({ navigation, route }) => {
     }
   }, [route?.params?.category]);
 
-  const load = useCallback(async (): Promise<void> => {
-    try {
-      // Fetch BOTH consumer + industrial in parallel so the All
-      // Services tab shows the full catalogue. Earlier this screen
-      // only called getServices() (default type='consumer'), which
-      // hid every B2B / industrial row — admins were adding them in
-      // the dashboard and they never surfaced to customers. The
-      // category chips are derived from whatever comes back, so
-      // adding industrial brings in chips like "GST Registration",
-      // "Trade License", "Industrial Licensing" automatically.
-      const [consumerRes, industrialRes] = await Promise.all([
-        getServices('consumer').catch(() => null),
-        getServices('industrial').catch(() => null),
-      ]);
-      const pickList = (res: any): Service[] =>
-        Array.isArray(res?.data) ? res.data
-        : Array.isArray(res) ? res
-        : Array.isArray(res?.services) ? res.services
-        : [];
-      const consumerList = pickList(consumerRes);
-      const industrialList = pickList(industrialRes);
-      // De-duplicate by id in case the backend returns the same row
-      // under both buckets (`service_type: 'both'`).
-      const merged = new Map<string, Service>();
-      consumerList.forEach((s: any) => merged.set(String(s.id), s));
-      industrialList.forEach((s: any) => merged.set(String(s.id), s));
-      setServices(Array.from(merged.values()));
-    } catch (e: any) {
-      console.log('ServicesScreen load error:', e?.message || e);
-      setServices([]);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  const onRefresh = (): void => {
-    setRefreshing(true);
-    load();
-  };
+  // Service catalogue is fetched + cached by TanStack Query (see
+  // fetchAllServices above). useRefetchOnFocus keeps it fresh when
+  // the user returns to the tab.
+  const onRefresh = useCallback((): void => {
+    refetch();
+  }, [refetch]);
+  useRefetchOnFocus(onRefresh);
 
   // Build the category chip list dynamically from whatever services the
   // backend returned. "All" sits first; everything else is alphabetised

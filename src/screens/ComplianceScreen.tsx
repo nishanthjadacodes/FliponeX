@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   View,
   Text,
@@ -47,6 +48,7 @@ import {
   type ComplianceType,
 } from '../services/api';
 import { getToken } from '../utils/storage';
+import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
 import SuccessToast from '../components/SuccessToast';
 import * as haptics from '../utils/haptics';
 
@@ -144,10 +146,26 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
       if (t) setImgAuthHeader({ Authorization: `Bearer ${t}` });
     })();
   }, []);
-  const [docs, setDocs] = useState<ComplianceDoc[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [refreshing, setRefreshing] = useState<boolean>(false);
-  const [needsCompanyProfile, setNeedsCompanyProfile] = useState<boolean>(false);
+  // Compliance docs — fetched + cached by TanStack Query. The endpoint
+  // returns the doc list AND a needsCompanyProfile flag, so the queryFn
+  // packages both.
+  const {
+    data: complianceData,
+    isLoading: loading,
+    isFetching: refreshing,
+    refetch,
+  } = useQuery({
+    queryKey: ['complianceDocs'],
+    queryFn: async () => {
+      const res: any = await getComplianceDocs();
+      return {
+        docs: (Array.isArray(res?.data) ? res.data : []) as ComplianceDoc[],
+        needsCompanyProfile: !!res?.needsCompanyProfile,
+      };
+    },
+  });
+  const docs: ComplianceDoc[] = complianceData?.docs ?? [];
+  const needsCompanyProfile: boolean = complianceData?.needsCompanyProfile ?? false;
 
   const [uploadOpen, setUploadOpen] = useState<boolean>(false);
   const [uploading, setUploading] = useState<boolean>(false);
@@ -212,27 +230,15 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
     setToast({ visible: true, title, subtitle, variant });
   };
 
-  const load = useCallback(async (): Promise<void> => {
-    try {
-      const res = await getComplianceDocs();
-      setDocs(Array.isArray(res?.data) ? res.data : []);
-      setNeedsCompanyProfile(!!res?.needsCompanyProfile);
-    } catch (e: any) {
-      console.log('Compliance load error:', e?.message || e);
-      setDocs([]);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
+  // load() is now refetch() from the query above.
+  const load = useCallback((): void => {
+    refetch();
+  }, [refetch]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  useRefetchOnFocus(load);
 
   const onRefresh = (): void => {
-    setRefreshing(true);
-    load();
+    refetch();
   };
 
   // Group docs by status, sorted within group by daysLeft (most urgent first).
