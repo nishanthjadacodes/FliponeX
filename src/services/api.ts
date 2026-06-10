@@ -136,7 +136,18 @@ export interface SendOTPResponse {
   message: string;
   devOtp?: string;
   otp?: string;
+  // Backend marks isNewUser=true when the mobile has never completed an
+  // OTP verify before. The customer login flow uses this to decide
+  // whether to show the signup form (name/email/address) before the
+  // OTP step.
+  isNewUser?: boolean;
   offlineMode?: boolean;
+}
+
+export interface SignupExtras {
+  name?: string;
+  email?: string;
+  address?: string;
 }
 
 export interface VerifyOTPResponse {
@@ -157,14 +168,19 @@ export interface SignupPayload {
 // ─── Auth ──────────────────────────────────────────────────────────────────
 export const sendOTP = async (mobile: string): Promise<SendOTPResponse> => {
   try {
-    const response = await api.post<SendOTPResponse>('/auth/send-otp', { mobile });
+    // Pass role='customer' so the backend auto-creates first-time numbers
+    // with the customer role. Without it the backend default still works
+    // (it's 'customer') but being explicit keeps the contract symmetric
+    // with the rep app, which MUST send role='agent' to avoid being
+    // auto-classed as a customer.
+    const response = await api.post<SendOTPResponse>('/auth/send-otp', { mobile, role: 'customer' });
     // Clear any stale offline OTP so verifyOTP doesn't compare against an old local value
     await AsyncStorage.removeItem(`otp_${mobile}`);
     return response.data;
   } catch (error: any) {
     if (!error.response) {
       console.log('Network unavailable, falling back to offline OTP mode');
-      const localOTP = Math.floor(100000 + Math.random() * 900000).toString();
+      const localOTP = Math.floor(1000 + Math.random() * 9000).toString();
       const offlineOTPData = {
         mobile,
         otp: localOTP,
@@ -184,7 +200,11 @@ export const sendOTP = async (mobile: string): Promise<SendOTPResponse> => {
   }
 };
 
-export const verifyOTP = async (mobile: string, otp: string): Promise<VerifyOTPResponse> => {
+export const verifyOTP = async (
+  mobile: string,
+  otp: string,
+  extras?: SignupExtras,
+): Promise<VerifyOTPResponse> => {
   try {
     console.log('=== VERIFYING OTP ===');
     console.log('Mobile:', mobile, 'OTP:', otp);
@@ -222,10 +242,16 @@ export const verifyOTP = async (mobile: string, otp: string): Promise<VerifyOTPR
       // Explicit role='customer' so new accounts created via this app get
       // the customer role. Backend defaults to 'agent' otherwise, which
       // would then trip the role gate on the customer login screen.
+      // `extras` ships the signup form values (name / email / address) so
+      // the backend can save them in the same atomic update as the
+      // verify. Backend ignores these for already-verified users.
       const response = await api.post<VerifyOTPResponse>('/auth/verify-otp', {
         mobile,
         otp,
         role: 'customer',
+        ...(extras?.name ? { name: extras.name } : {}),
+        ...(extras?.email ? { email: extras.email } : {}),
+        ...(extras?.address ? { address: extras.address } : {}),
       });
       console.log('API OTP verification successful');
       return response.data;
@@ -406,28 +432,43 @@ export const updateProfile = async (
 // Remove the current profile picture (sets User.profile_pic to NULL).
 // UI should optimistically clear the local state so the avatar reverts
 // to the first-letter initial without waiting for a re-fetch.
-export const deleteAvatar = async (): Promise<{ success: boolean }> => {
-  try {
-    const response = await api.delete<{ success: boolean }>('/profile/avatar');
-    return response.data;
-  } catch (error: any) {
-    console.error('Delete avatar error:', error);
-    throw error.response?.data || { message: 'Failed to remove avatar' };
+export const deleteAvatar = async (
+  // Optional explicit auth token. The REP app MUST pass its agent token
+  // — otherwise this deletes the CUSTOMER's avatar (getToken() returns
+  // the customer token), corrupting the wrong account.
+  authToken?: string,
+): Promise<{ success: boolean }> => {
+  const token = authToken || (await getToken());
+  const res = await fetch(`${api.defaults.baseURL}/profile/avatar`, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      (json as any)?.message || `Failed to remove avatar (HTTP ${res.status})`,
+    );
   }
+  return json as { success: boolean };
 };
 
 // Upload / replace the user's avatar (profile picture). Returns the new
 // URL the backend stored on User.profile_pic — typically a Cloudinary URL
 // in production, /uploads/<filename> on local. UI updates state with the
 // returned URL so the new avatar renders without an extra GET.
-export const uploadAvatar = async (file: {
-  uri: string;
-  name: string;
-  type: string;
-}): Promise<{ success: boolean; profile_pic: string }> => {
+export const uploadAvatar = async (
+  file: { uri: string; name: string; type: string },
+  // Optional explicit auth token. The REP app MUST pass its agent token
+  // here — otherwise getToken() returns the CUSTOMER token and the
+  // rep's photo uploads onto the customer's account.
+  authToken?: string,
+): Promise<{ success: boolean; profile_pic: string }> => {
   const fd = new FormData();
   fd.append('file', file as any);
-  const token = await getToken();
+  const token = authToken || (await getToken());
   const res = await fetch(`${api.defaults.baseURL}/profile/avatar`, {
     method: 'POST',
     headers: {

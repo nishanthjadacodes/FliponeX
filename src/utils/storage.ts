@@ -16,6 +16,16 @@ const USER_MODE_KEY = '@flipon_user_mode';
 // so a cold start restores the exact screen the user was on.
 export const NAV_STATE_KEY = '@flipon_nav_state';
 
+// Per-LoginScreen mid-flow snapshots. The customer + rep apps both store
+// {step, mobile, devOtp, savedAt} so a cold start mid-OTP doesn't drop
+// the user back at the mobile-entry step. Cleared on successful login
+// and on explicit "back to ModeSelect" — never relied on for auth.
+export const CUSTOMER_LOGIN_STATE_KEY = '@flipon_customer_login_state';
+export const AGENT_LOGIN_STATE_KEY = '@flipon_agent_login_state';
+// Match the splash's RESUME_WINDOW_MS — anything older is treated as a
+// fresh launch (the OTP would be expired backend-side anyway after 30m).
+export const LOGIN_STATE_TTL_MS = 30 * 60 * 1000;
+
 export type UserMode = 'customer' | 'agent';
 
 // Clear everything that ties the device to the current account. Must be

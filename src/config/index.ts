@@ -25,10 +25,11 @@ export const API_BASE_URL_CANDIDATES: readonly string[] = [
 // If you later set up a shorter stable alias in Vercel → Project → Domains
 // (e.g. fliponex.vercel.app / admindashboard.vercel.app), swap the strings
 // below — same single place, both URLs.
-// Stable Vercel alias — see CUSTOMER_WEBSITE_URL note above. Vercel
-// auto-aliased this project to `admindashboard-topaz-six` because the
-// shorter name was already taken by another user.
-export const ADMIN_DASHBOARD_URL = 'https://admindashboard-topaz-six.vercel.app';
+// Custom domain — the admin console (FliponeX Admin Console landing +
+// "Sign In to Admin Console" CTA) now lives on www.fliponex.com. The
+// previous Vercel preview alias (admindashboard-topaz-six.vercel.app)
+// is stale; this is the canonical production URL.
+export const ADMIN_DASHBOARD_URL = 'https://www.fliponex.com';
 
 // Use the STABLE Vercel project alias (fliponex-web.vercel.app), not the
 // random per-deployment URL — that one rotates on every redeploy and would

@@ -18,28 +18,27 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
     "paths": {
       "@/*": [
-        "src/*"
+        "./src/*"
       ],
       "@components/*": [
-        "src/components/*"
+        "./src/components/*"
       ],
       "@screens/*": [
-        "src/screens/*"
+        "./src/screens/*"
       ],
       "@services/*": [
-        "src/services/*"
+        "./src/services/*"
       ],
       "@utils/*": [
-        "src/utils/*"
+        "./src/utils/*"
       ],
       "@constants/*": [
-        "src/constants/*"
+        "./src/constants/*"
       ],
       "@config/*": [
-        "src/config/*"
+        "./src/config/*"
       ]
     }
   },

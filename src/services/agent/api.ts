@@ -118,26 +118,26 @@ const fetchAPI: FetchAPIFn = async (endpoint, options = {}) => {
 // ─── Hardcoded OTP mapping ────────────────────────────────────────────────
 const getHardcodedOTP = (mobile: string): string => {
   const otpMap: Record<string, string> = {
-    '9876543210': '123456',
-    '9876543211': '111111',
-    '9876543212': '222222',
-    '9876543213': '333333',
-    '9876543214': '444444',
-    '9876543215': '555555',
-    '9876543216': '666666',
-    '9876543217': '777777',
-    '9876543218': '888888',
-    '9876543219': '999999',
-    '9000000000': '000000',
-    '9000000001': '101010',
-    '9000000002': '202020',
-    '9000000003': '303030',
-    '9000000004': '404040',
-    '9000000005': '505050',
-    '9000000006': '606060',
-    '9000000007': '707070',
-    '9000000008': '808080',
-    '9000000009': '909090',
+    '9876543210': '1234',
+    '9876543211': '1111',
+    '9876543212': '2222',
+    '9876543213': '3333',
+    '9876543214': '4444',
+    '9876543215': '5555',
+    '9876543216': '6666',
+    '9876543217': '7777',
+    '9876543218': '8888',
+    '9876543219': '9999',
+    '9000000000': '0000',
+    '9000000001': '1010',
+    '9000000002': '2020',
+    '9000000003': '3030',
+    '9000000004': '4040',
+    '9000000005': '5050',
+    '9000000006': '6060',
+    '9000000007': '7070',
+    '9000000008': '8080',
+    '9000000009': '9090',
   };
 
   if (otpMap[mobile]) return otpMap[mobile];
@@ -148,8 +148,8 @@ const getHardcodedOTP = (mobile: string): string => {
     hash = ((hash << 5) - hash) + mobile.charCodeAt(i);
     hash = hash & hash;
   }
-  const otp = Math.abs(hash) % 1000000;
-  return otp.toString().padStart(6, '0');
+  const otp = Math.abs(hash) % 10000;
+  return otp.toString().padStart(4, '0');
 };
 
 const generateOTP = (mobile: string): string => {
@@ -184,9 +184,13 @@ export const sendOTP = async (mobile: string, method: OTPMethod = 'sms'): Promis
     throw new Error('Invalid mobile number');
   }
 
+  // Pass role='agent' so the backend auto-creates first-time numbers
+  // with the agent role. Without this the backend defaults to 'customer'
+  // and the role-mismatch check below then rejects the just-created user
+  // with "already registered as a customer".
   const response = await fetchAPI('/auth/send-otp', {
     method: 'POST',
-    body: JSON.stringify({ mobile }),
+    body: JSON.stringify({ mobile, role: 'agent' }),
   });
 
   if (response.success && !response.fallback) {
@@ -196,7 +200,7 @@ export const sendOTP = async (mobile: string, method: OTPMethod = 'sms'): Promis
       response.dev_otp ||
       response.otp ||
       (typeof response.message === 'string'
-        ? (response.message.match(/\b\d{6}\b/) || [])[0]
+        ? (response.message.match(/\b\d{4}\b/) || [])[0]
         : null) ||
       null;
 
@@ -242,8 +246,8 @@ export const verifyOTP = async (
   otp: string,
   role: string = 'agent',
 ): Promise<VerifyOTPResult> => {
-  if (!otp || otp.length !== 6) {
-    throw new Error('Please enter a valid 6-digit OTP');
+  if (!otp || otp.length !== 4) {
+    throw new Error('Please enter a valid 4-digit OTP');
   }
 
   const stored = await AsyncStorage.getItem('current_otp');
@@ -412,6 +416,12 @@ export interface DashboardData {
   completedJobs: number;
   rating: number;
   isOnline: boolean;
+  // Identity re-fetched live from the server's /profile endpoint. `null`
+  // when that call failed (e.g. cold-start timeout) so callers can tell
+  // "fetch failed" apart from "no avatar set". The rep app uses this to
+  // re-hydrate the profile picture after a logout wiped the device-local
+  // agent_data cache — the backend is the source of truth for the avatar.
+  profile: { id?: string; profile_pic?: string | null } | null;
 }
 
 export const getDashboard = async (): Promise<DashboardData> => {
@@ -459,7 +469,14 @@ export const getDashboard = async (): Promise<DashboardData> => {
 
   // Profile response shape varies — backend returns `{ success, user }`,
   // older code returned the user directly. Cover both.
-  const u: any = (profile as any)?.user || profile || {};
+  //
+  // `fromNetwork` is the `user` payload — it's ONLY present when /profile
+  // actually responded over the wire. On a cold-start timeout getProfile()
+  // falls back to the device-local agent_data cache (a flat record with no
+  // `.user` wrapper), and that stale cache is exactly what we must NOT
+  // treat as authoritative for the avatar.
+  const fromNetwork: any = (profile as any)?.user;
+  const u: any = fromNetwork || profile || {};
 
   return {
     tasks,
@@ -470,6 +487,13 @@ export const getDashboard = async (): Promise<DashboardData> => {
     completedJobs: completedTasks.length,
     rating: completedTasks.length > 0 ? 4.5 : 0,
     isOnline: !!u.online_status,
+    // Surface a profile object ONLY when /profile genuinely came back from
+    // the server. On a failed fetch (cold start) we return null so the
+    // caller keeps the cached avatar instead of clobbering it with a
+    // spurious `profile_pic: null` from the stale local fallback.
+    profile: fromNetwork && fromNetwork.id
+      ? { id: fromNetwork.id, profile_pic: fromNetwork.profile_pic ?? null }
+      : null,
   };
 };
 

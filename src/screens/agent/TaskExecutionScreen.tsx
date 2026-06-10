@@ -14,10 +14,13 @@ import {
   Platform,
   KeyboardAvoidingView,
 } from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
 import { captureWithCrop, pickWithCrop } from '../../utils/cropPicker';
 import { formatBookingAddress } from '../../utils/addressFormat';
 import * as Location from 'expo-location';
+import {
+  locationAsker,
+  requestPermissionWithRationale,
+} from '../../utils/permissions';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import {
   updateTaskStatus,
@@ -103,10 +106,6 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
   const [updating, setUpdating] = useState<boolean>(false);
   const [otpModalVisible, setOtpModalVisible] = useState<boolean>(false);
   const [otp, setOtp] = useState<string>('');
-  // DEV-MODE OTP capture — backend returns the customer's completion OTP in
-  // the work_completed response so the rep can complete the booking even if
-  // the customer never received the SMS/push. Hidden in production.
-  const [devOtp, setDevOtp] = useState<string | null>(null);
   const [documentsModalVisible, setDocumentsModalVisible] = useState<boolean>(false);
   const [capturedPhotos, setCapturedPhotos] = useState<PhotoAsset[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -165,10 +164,6 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
 
       if (data.success && data.data) {
         const b = data.data;
-        // Capture the dev-mode OTP if the booking is already at the
-        // work_completed/submitted stage. This way navigating away and
-        // back doesn't lose the OTP banner.
-        if (b.completion_otp) setDevOtp(String(b.completion_otp));
         // Prefer the customer's actual coordinates (last known position
         // pinged from their device) over geocoding the typed address.
         // Android's Location.geocodeAsync returns empty on devices
@@ -214,8 +209,8 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
     customerLng: number | null,
   ): Promise<void> => {
     try {
-      const perm = await Location.requestForegroundPermissionsAsync();
-      if (perm.status !== 'granted') {
+      const perm = await requestPermissionWithRationale('location', locationAsker);
+      if (!perm.granted) {
         setTask((t) => (t ? { ...t, distance: 'Enable location' } : t));
         return;
       }
@@ -346,13 +341,6 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         return;
       }
       setTask((t) => (t ? { ...t, status: newStatus } : t));
-      // Backend returns the customer's completion OTP on the work_completed
-      // response so we can show it in the OTP modal — handy when SMS/push
-      // delivery to the customer hasn't been wired up yet.
-      const otpFromServer =
-        res?.completion_otp || res?.data?.completion_otp || null;
-      console.log('[updateStatus] OTP from server:', otpFromServer, 'response keys:', Object.keys(res || {}));
-      if (otpFromServer) setDevOtp(String(otpFromServer));
       if (!silent) {
         Alert.alert('Success', `Status updated: ${newStatus.replace(/_/g, ' ')}`);
       }
@@ -467,7 +455,6 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
       setUpdating(false);
       setOtpModalVisible(false);
       setOtp('');
-      setDevOtp(null);
     }
   };
 
@@ -513,31 +500,39 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
     Linking.openURL(`tel:${phone}`).catch(() => Alert.alert('Error', 'Unable to open phone dialer'));
   };
 
+  // Document capture/pick now goes through the SAME styled cropper the
+  // customer app uses for uploads — captureWithCrop / pickWithCrop give
+  // the branded crop overlay (frame, grid, clear confirm tick) instead
+  // of the bare system picker. One photo per action — the cropper crops
+  // a single image; tap the add control again for the next document.
   const captureDocument = async (): Promise<void> => {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission Required', 'Camera permission is needed to capture document photos.');
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ['images'],
-      quality: 0.7,
-      allowsEditing: false,
-    });
-    if (!result.canceled && result.assets?.[0]) {
-      setCapturedPhotos((prev) => [...prev, result.assets[0] as PhotoAsset]);
-    }
+    const file = await captureWithCrop({ namePrefix: 'document' });
+    if (!file) return;
+    setCapturedPhotos((prev) => [
+      ...prev,
+      {
+        uri: file.uri,
+        name: file.name,
+        type: file.type,
+        fileName: file.name,
+        mimeType: file.type,
+      } as PhotoAsset,
+    ]);
   };
 
   const pickDocument = async (): Promise<void> => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      quality: 0.7,
-      allowsMultipleSelection: true,
-    });
-    if (!result.canceled && result.assets) {
-      setCapturedPhotos((prev) => [...prev, ...(result.assets as unknown as PhotoAsset[])]);
-    }
+    const file = await pickWithCrop({ namePrefix: 'document' });
+    if (!file) return;
+    setCapturedPhotos((prev) => [
+      ...prev,
+      {
+        uri: file.uri,
+        name: file.name,
+        type: file.type,
+        fileName: file.name,
+        mimeType: file.type,
+      } as PhotoAsset,
+    ]);
   };
 
   const removePhoto = (index: number): void => {
@@ -892,18 +887,6 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
 
             {/* DEV MODE banner — shows the customer's OTP when SMS/push
                 delivery isn't wired up. Auto-fills the input when tapped. */}
-            {devOtp && (
-              <TouchableOpacity
-                style={styles.devOtpBanner}
-                onPress={() => setOtp(devOtp)}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.devOtpBannerLabel}>DEV MODE · Customer&apos;s OTP</Text>
-                <Text style={styles.devOtpBannerCode}>{devOtp}</Text>
-                <Text style={styles.devOtpBannerHint}>Tap to auto-fill</Text>
-              </TouchableOpacity>
-            )}
-
             <TextInput
               style={styles.otpInput}
               placeholder="Enter 6-digit OTP"
@@ -1253,35 +1236,6 @@ const styles = StyleSheet.create({
   awaitingOtpHint: {
     fontSize: 12,
     color: '#1B4B72',
-  },
-  devOtpBanner: {
-    backgroundColor: '#FEF3C7',
-    borderWidth: 1.5,
-    borderColor: '#F59E0B',
-    borderRadius: SIZES.radius,
-    paddingVertical: SIZES.base + 4,
-    paddingHorizontal: SIZES.base,
-    alignItems: 'center',
-    marginBottom: SIZES.base + 4,
-  },
-  devOtpBannerLabel: {
-    fontSize: 10,
-    fontWeight: '900',
-    color: '#92400E',
-    letterSpacing: 1.2,
-  },
-  devOtpBannerCode: {
-    fontSize: 26,
-    fontWeight: '900',
-    color: '#0D3B66',
-    letterSpacing: 6,
-    marginVertical: 4,
-    fontVariant: ['tabular-nums'],
-  },
-  devOtpBannerHint: {
-    fontSize: 10,
-    color: '#92400E',
-    fontWeight: '600',
   },
   modalActions: { flexDirection: 'row', gap: SIZES.base },
   modalButton: { flex: 1, padding: SIZES.padding, borderRadius: SIZES.radius, alignItems: 'center' },
