@@ -438,8 +438,8 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
   };
 
   const handleCompleteTask = async (): Promise<void> => {
-    if (!otp || otp.length !== 6) {
-      Alert.alert('Error', 'Please enter a valid 6-digit OTP');
+    if (!otp || otp.length !== 4) {
+      Alert.alert('Error', 'Please enter a valid 4-digit OTP');
       return;
     }
     setUpdating(true);
@@ -728,7 +728,7 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
             <View style={styles.awaitingOtpBox}>
               <Text style={styles.awaitingOtpTitle}>⏳ Awaiting OTP</Text>
               <Text style={styles.awaitingOtpHint}>
-                Ask the customer for their 6-digit completion OTP.
+                Ask the customer for their 4-digit completion OTP.
               </Text>
             </View>
             <TouchableOpacity
@@ -883,15 +883,15 @@ const TaskExecutionScreen: React.FC<TaskExecutionScreenProps> = ({ route, naviga
         >
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Complete Task</Text>
-            <Text style={styles.modalDescription}>Enter the 6-digit OTP provided by the customer</Text>
+            <Text style={styles.modalDescription}>Enter the 4-digit OTP provided by the customer</Text>
 
             {/* DEV MODE banner — shows the customer's OTP when SMS/push
                 delivery isn't wired up. Auto-fills the input when tapped. */}
             <TextInput
               style={styles.otpInput}
-              placeholder="Enter 6-digit OTP"
+              placeholder="Enter 4-digit OTP"
               keyboardType="numeric"
-              maxLength={6}
+              maxLength={4}
               value={otp}
               onChangeText={setOtp}
             />
