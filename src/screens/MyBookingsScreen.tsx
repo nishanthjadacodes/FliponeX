@@ -9,6 +9,7 @@ import {
   TouchableOpacity,
 } from 'react-native';
 import { useQuery } from '@tanstack/react-query';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { COLORS, SIZES, BORDER_RADIUS } from '../constants/colors';
 import { getMyBookings, getMyEnquiries } from '../services/api';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -112,6 +113,7 @@ const fetchEnquiries = async (): Promise<Enquiry[]> => {
 };
 
 const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
+  const insets = useSafeAreaInsets();
   const [activeTab, setActiveTab] = useState<string>('ongoing');
 
   // ─── Server state via TanStack Query ──────────────────────────────
@@ -201,11 +203,24 @@ const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
     </View>
   );
 
-  const renderBookingItem = ({ item }: { item: Booking }) => (
-    <BookingCard
-      booking={item}
-      onPress={() => navigation.navigate('BookingDetails', { bookingId: item.id || item.booking_number })}
-    />
+  // One stable press handler for every card — receives the booking,
+  // so each BookingCard gets the SAME onPress reference. Combined
+  // with React.memo on BookingCard, unchanged rows skip re-rendering
+  // when the list refetches.
+  const handleBookingPress = useCallback(
+    (b: { id?: string | number; booking_number?: string | number }) => {
+      navigation.navigate('BookingDetails', {
+        bookingId: b.id || b.booking_number,
+      });
+    },
+    [navigation],
+  );
+
+  const renderBookingItem = useCallback(
+    ({ item }: { item: Booking }) => (
+      <BookingCard booking={item} onPress={handleBookingPress} />
+    ),
+    [handleBookingPress],
   );
 
   const renderTabBar = () => (
@@ -339,7 +354,10 @@ const MyBookingsScreen: React.FC<Props> = ({ navigation, route }) => {
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
+      {/* paddingTop from the safe-area inset so "My Bookings" never
+          sits under the status bar / notch — the old hardcoded
+          paddingTop: 30 was too short on tall-status-bar phones. */}
+      <View style={[styles.header, { paddingTop: insets.top + 14 }]}>
         <Text style={styles.title}>My Bookings</Text>
       </View>
 
@@ -361,6 +379,9 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.PRIMARY,
     padding: SIZES.BASE,
     paddingTop: 30,
+    // Breathing room below the "My Bookings" title before the
+    // header's bottom edge.
+    paddingBottom: 18,
   },
   title: {
     fontSize: SIZES.XLARGE,
@@ -417,10 +438,10 @@ const styles = StyleSheet.create({
   enqMeta: { fontSize: 11, color: '#6C757D', fontWeight: '600' },
   enqQuote: { fontSize: 12, color: '#1976D2', fontWeight: '800' },
   listContainer: {
-    // Tiny top padding so the first card has breathing space below the
-    // tab bar but isn't shifted way down. BookingCard now uses marginBottom
-    // only so cards stack neatly without doubled padding.
-    paddingTop: SIZES.BASE / 2,
+    // Clear gap between the ongoing/completed/cancelled/B2B tab row
+    // and the first booking card. BookingCard uses marginBottom only,
+    // so cards still stack neatly without doubled padding.
+    paddingTop: SIZES.BASE * 2,
     paddingHorizontal: 0,
     paddingBottom: SIZES.BASE,
   },

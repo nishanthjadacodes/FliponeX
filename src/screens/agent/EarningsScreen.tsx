@@ -14,6 +14,7 @@ import { readCache, writeCache } from '../../utils/agent/cache';
 import { COLORS } from '../../constants/agent/colors';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRefetchOnFocus } from '../../lib/useRefetchOnFocus';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type PeriodId = 'all' | 'today' | 'week' | 'month';
 
@@ -38,6 +39,7 @@ interface EarningsScreenProps {
 }
 
 const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
+  const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
 
   // Earnings via TanStack Query. getEarnings() returns the record
@@ -181,7 +183,7 @@ const EarningsScreen: React.FC<EarningsScreenProps> = ({ navigation }) => {
               props — so React re-renders triggered by setTodayEarnings
               etc. never reached the displayed value. Same fix as the
               home dashboard's Today's Earnings tile. */}
-          <View style={styles.header}>
+          <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
             <Text style={styles.headerTitle}>Earnings & Collections</Text>
             <Animated.View style={[styles.statsRow, { transform: [{ scale: scaleAnim }] }]}>
               <View style={styles.statCard}>
@@ -330,7 +332,9 @@ const styles = StyleSheet.create({
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFFBEB' },
   loadingText: { fontSize: 15, color: '#475569', fontWeight: '600' },
 
-  header: { paddingTop: 56, paddingBottom: 18, paddingHorizontal: 16 },
+  // paddingTop applied inline as insets.top + 12 so the header clears
+  // the status bar / notch on every device (was a hardcoded 56).
+  header: { paddingBottom: 18, paddingHorizontal: 16 },
   headerTitle: {
     fontSize: 24, fontWeight: '900', color: '#0F172A', letterSpacing: 0.2, marginBottom: 14,
   },

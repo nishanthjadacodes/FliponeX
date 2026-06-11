@@ -16,10 +16,10 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Image, ActivityIndicator } from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
+import { captureWithCrop, pickWithCrop, isPermissionDeniedError } from '../../utils/cropPicker';
+import { Linking } from 'react-native';
 import { getDashboard, updateOnlineStatus, updateProfile } from '../../services/agent/api';
 import { uploadAvatar, deleteAvatar } from '../../services/api';
-import { storeUser, getUser } from '../../utils/storage';
 import { COLORS } from '../../constants/agent/colors';
 import { repCode } from '../../utils/agent/repCode';
 import ProfileModal, { type AgentProfile } from '../../components/agent/ProfileModal';
@@ -28,6 +28,7 @@ import BankDetailsModal from '../../components/agent/BankDetailsModal';
 import SupportModal from '../../components/agent/SupportModal';
 import PolicyModal, { type PolicyType } from '../../components/agent/PolicyModal';
 import { LinearGradient } from 'expo-linear-gradient';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 interface AgentRecord {
   name?: string;
@@ -47,6 +48,10 @@ interface ProfileScreenProps {
 }
 
 const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
+  // This screen had NO safe-area handling — its top card used a
+  // hardcoded marginTop and the Logout button only had a 20px spacer,
+  // so the button sat under the Android nav bar on many devices.
+  const insets = useSafeAreaInsets();
   const [agent, setAgent] = useState<AgentRecord | null>(null);
   const [isOnline, setIsOnline] = useState<boolean>(false);
   const [todayEarnings, setTodayEarnings] = useState<number>(0);
@@ -120,6 +125,21 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
       setTotalJobs(data.totalJobs || 0);
       setRating(data.rating || 0);
       setIsOnline(data.isOnline || false);
+
+      // Re-hydrate the avatar from the server. agent_data is wiped on
+      // logout, so without this a re-login shows no photo and prompts
+      // for a new upload even though one is still stored on the backend.
+      // The server's profile_pic is the source of truth — mirror it back
+      // into both the in-memory record and the agent_data cache so the
+      // Dashboard hero picks it up too. `data.profile` is null when the
+      // /profile call failed, so a cold start never blanks a good photo.
+      if (data.profile) {
+        setAgent((prev) => {
+          const merged = { ...(prev || {}), ...data.profile } as AgentRecord;
+          AsyncStorage.setItem('agent_data', JSON.stringify(merged)).catch(() => {});
+          return merged;
+        });
+      }
     } catch (error) {
       console.error('Error loading profile:', error);
     } finally {
@@ -185,7 +205,11 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
         onPress: async () => {
           try {
             setAvatarUploading(true);
-            await deleteAvatar();
+            // Use the AGENT token so the delete hits the rep's own
+            // account, never the customer's (see services/api).
+            const agentToken =
+              (await AsyncStorage.getItem('agent_token')) || undefined;
+            await deleteAvatar(agentToken);
             setAgent((prev) => ({ ...(prev || {}), profile_pic: null }) as any);
             try {
               const data = await AsyncStorage.getItem('agent_data');
@@ -194,8 +218,6 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
                 'agent_data',
                 JSON.stringify({ ...parsed, profile_pic: null }),
               );
-              const cached = (await getUser()) || {};
-              await storeUser({ ...cached, profile_pic: null });
             } catch (_) { /* non-fatal */ }
           } catch (e: any) {
             Alert.alert('Could not remove photo', e?.message || 'Try again');
@@ -211,44 +233,29 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
 
   const doPickAvatar = async (source: 'camera' | 'library'): Promise<void> => {
     try {
-      const perm =
+      // Same branded cropper the customer app uses for document uploads
+      // in the booking flow — a styled toolbar with a green confirm tick
+      // and an X to cancel — instead of the bare system photo editor.
+      const file =
         source === 'camera'
-          ? await ImagePicker.requestCameraPermissionsAsync()
-          : await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert(
-          'Permission needed',
-          `Grant ${source === 'camera' ? 'camera' : 'photo library'} access in Settings to update your profile picture.`,
-        );
-        return;
-      }
-      const result: any =
-        source === 'camera'
-          ? await ImagePicker.launchCameraAsync({
-              mediaTypes: 'images' as any,
-              allowsEditing: true,
-              aspect: [1, 1],
-              quality: 0.85,
-            })
-          : await ImagePicker.launchImageLibraryAsync({
-              mediaTypes: 'images' as any,
-              allowsEditing: true,
-              aspect: [1, 1],
-              quality: 0.85,
-            });
-      if (result.canceled || !result.assets?.[0]) return;
-      const asset = result.assets[0];
-      const uri = asset.uri;
-      const name = asset.fileName || `agent-avatar-${Date.now()}.jpg`;
-      const type = asset.mimeType || 'image/jpeg';
+          ? await captureWithCrop({ namePrefix: 'agent-avatar' })
+          : await pickWithCrop({ namePrefix: 'agent-avatar' });
+      if (!file) return;
+      const { uri, name, type } = file;
 
       setAvatarUploading(true);
-      const { profile_pic } = await uploadAvatar({ uri, name, type });
+      // Upload with the AGENT token so the photo lands on the rep's own
+      // account. With no token it would fall back to the CUSTOMER token
+      // and overwrite the customer's profile picture.
+      const agentToken =
+        (await AsyncStorage.getItem('agent_token')) || undefined;
+      const { profile_pic } = await uploadAvatar({ uri, name, type }, agentToken);
       setAgent((prev) => ({ ...(prev || {}), profile_pic }) as any);
 
-      // Mirror to BOTH the agent_data cache (used by this screen + the
-      // dashboard) and the shared user cache so any other surface that
-      // reads from getUser() also sees the new pic.
+      // Mirror to the agent_data cache only (this screen + the dashboard
+      // read it). Deliberately NOT written to the shared getUser() /
+      // storeUser() 'user' cache — that key belongs to the CUSTOMER
+      // account, and writing it here was corrupting the customer's pic.
       try {
         const data = await AsyncStorage.getItem('agent_data');
         const parsed = data ? JSON.parse(data) : {};
@@ -256,11 +263,23 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
           'agent_data',
           JSON.stringify({ ...parsed, profile_pic }),
         );
-        const cached = (await getUser()) || {};
-        await storeUser({ ...cached, profile_pic });
       } catch (_) { /* non-fatal */ }
     } catch (e: any) {
       console.log('[agent-avatar] upload failed:', e?.message);
+      // Permission denial path — Android won't re-prompt once the user
+      // chose "Don't ask again", so the only way back is the app's
+      // settings page. Drop them there with one tap.
+      if (isPermissionDeniedError(e)) {
+        Alert.alert(
+          'Photo access needed',
+          'FliponeX needs access to your photos / camera to set a profile picture. Open Settings to grant access, then try again.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ],
+        );
+        return;
+      }
       Alert.alert('Upload failed', e?.message || 'Could not upload your photo. Try again.');
     } finally {
       setAvatarUploading(false);
@@ -310,8 +329,14 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
               'agent_payment_methods',
               'agent_bank_details',
               '@flipon_user_mode',
+              // Clear the saved navigation stack too — otherwise Splash's
+              // resume logic restores the rep app within 30 min and the
+              // logout silently bounces back in with stale profile data.
+              '@flipon_nav_state',
             ]);
-            navigation.reset({ index: 0, routes: [{ name: 'Splash' }] });
+            // Go straight to the mode-select toggle (2 apps + 2 web
+            // surfaces) — never via Splash, which would try to resume.
+            navigation.reset({ index: 0, routes: [{ name: 'ModeSelect' }] });
           },
         },
       ],
@@ -333,6 +358,9 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
               'agent_payment_methods',
               'agent_bank_details',
               '@flipon_user_mode',
+              // Same as logout — drop the saved stack so the next cold
+              // start can't resume back into the rep app.
+              '@flipon_nav_state',
             ]);
             navigation.reset({ index: 0, routes: [{ name: 'ModeSelect' }] });
           },
@@ -353,7 +381,7 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
         >
-          <View style={styles.profileHeader}>
+          <View style={[styles.profileHeader, { marginTop: insets.top + 16 }]}>
             <Animated.View style={[styles.avatar, { transform: [{ scale: scaleAnim }] }]}>
               {(agent as any)?.profile_pic ? (
                 <Image
@@ -515,7 +543,9 @@ const ProfileScreen: React.FC<ProfileScreenProps> = ({ navigation }) => {
           </View>
 
           <Text style={styles.version}>FlipOneX Representative v1.0.0</Text>
-          <View style={{ height: 20 }} />
+          {/* Bottom spacer scales with the device's nav-bar / gesture
+              inset so the Logout button is never hidden behind it. */}
+          <View style={{ height: insets.bottom + 24 }} />
         </ScrollView>
 
         <ProfileModal visible={showEditProfile} onClose={() => setShowEditProfile(false)} onSave={handleProfileSave} />
@@ -610,7 +640,8 @@ const styles = StyleSheet.create({
   profileHeader: {
     backgroundColor: '#FFFFFF',
     padding: 18,
-    marginTop: 56,
+    // marginTop applied inline as insets.top + 16 so the card clears
+    // the status bar / notch on every device (was a hardcoded 56).
     marginHorizontal: 16,
     borderRadius: 20,
     flexDirection: 'row',

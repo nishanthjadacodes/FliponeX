@@ -145,16 +145,27 @@ const NotificationBanner: React.FC<Props> = ({ navigationRef, apiBase }) => {
     }
   }, [apiBase, getActiveToken]);
 
-  // Fetch on mount + every AppState transition to 'active'.
+  // Fetch on mount, on every AppState transition to 'active', AND on a
+  // recurring 60s poll while the app is foregrounded. The recurring
+  // poll is what lets a notification that arrives WHILE the app is open
+  // still surface — previously the banner only fetched on the
+  // background→foreground transition, so a rep sitting in the app never
+  // saw a "new job" banner until they switched away and back.
   useEffect(() => {
     fetchInbox();
+    const poll = setInterval(() => {
+      if (AppState.currentState === 'active') fetchInbox();
+    }, 60_000);
     const sub = AppState.addEventListener('change', (state: AppStateStatus) => {
       if (state === 'active' && appState.current !== 'active') {
         fetchInbox();
       }
       appState.current = state;
     });
-    return () => sub.remove();
+    return () => {
+      clearInterval(poll);
+      sub.remove();
+    };
   }, [fetchInbox]);
 
   // ─── Promote next from queue → current ─────────────────────────────

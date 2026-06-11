@@ -181,7 +181,11 @@ const ServicesScreen: React.FC<Props> = ({ navigation, route }) => {
                 key={cat}
                 onPress={() => {
                   haptics.tap();
-                  setActiveCategory(cat);
+                  // Defer the grid re-filter (150+ services) by one
+                  // frame so the chip's touch highlight paints
+                  // immediately instead of stalling behind the
+                  // re-render.
+                  requestAnimationFrame(() => setActiveCategory(cat));
                 }}
                 style={[styles.chip, active && styles.chipActive]}
                 activeOpacity={0.85}

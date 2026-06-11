@@ -153,11 +153,17 @@ const PaymentMethodsModal: React.FC<PaymentMethodsModalProps> = ({ visible, onCl
               onChangeText={(v) => update('walletMobile', v.replace(/[^0-9]/g, ''))}
             />
 
+            {/* The company never takes cash directly — every payment is
+                settled online through the company gateway. This toggle is
+                the representative opting in to COLLECT cash from a customer
+                and then pay it online to the company on the customer's
+                behalf. It is not a "cash settlement" channel. */}
             <View style={styles.toggleRow}>
               <View style={{ flex: 1 }}>
-                <Text style={styles.fieldLabel}>Accept Cash on Delivery</Text>
+                <Text style={styles.fieldLabel}>Collect Cash & Pay Online</Text>
                 <Text style={styles.toggleSub}>
-                  Customers can hand cash on completion and you settle later.
+                  Willing to collect cash from the customer and complete the
+                  online payment to the company on their behalf.
                 </Text>
               </View>
               <Switch

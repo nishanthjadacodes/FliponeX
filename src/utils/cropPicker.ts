@@ -18,6 +18,11 @@
 // back to expo-image-picker and shows no crop UI.
 
 import * as ExpoImagePicker from 'expo-image-picker';
+import {
+  cameraAsker,
+  galleryAsker,
+  requestPermissionWithRationale,
+} from './permissions';
 
 let CropPicker: any = null;
 let cropPickerAvailable = false;
@@ -58,6 +63,13 @@ const CROP_OPTIONS = {
   showCropGuidelines: true,
   includeBase64: false,
   compressImageQuality: 0.85,
+  // Cap the output dimensions. A modern OEM camera (Xiaomi / Realme /
+  // Vivo phones ship 50–108MP sensors) would otherwise hand back a huge
+  // bitmap that spikes memory on low-RAM devices and bloats the upload
+  // on slow rural connections. 2400px keeps document text crisply
+  // legible while keeping the file light and the decode cheap.
+  compressImageMaxWidth: 2400,
+  compressImageMaxHeight: 2400,
   mediaType: 'photo' as const,
   // Android UCrop styling — these props become a coloured toolbar +
   // a clearly-visible "Done" tick button on the right side of the
@@ -76,6 +88,27 @@ const CROP_OPTIONS = {
   // as readable yellow with dark icons.
   cropperStatusBarColor: '#F9A825',
 };
+
+// Tagged error for "the user has denied photo/camera access". Callers
+// catch this and prompt the user to open the app's settings — silently
+// returning null would leave the user staring at an unresponsive
+// picker button with no idea why.
+export const PICKER_PERMISSION_DENIED = 'PICKER_PERMISSION_DENIED';
+
+function makePermissionError(message?: string): Error {
+  const err: any = new Error(message || 'Photo / camera access denied');
+  err.code = PICKER_PERMISSION_DENIED;
+  return err;
+}
+
+/**
+ * True when an error was thrown because the user denied photo or camera
+ * access. Callers use it to decide whether to show an "Open Settings"
+ * Alert (the only path back when "Don't ask again" was selected).
+ */
+export function isPermissionDeniedError(e: unknown): boolean {
+  return (e as any)?.code === PICKER_PERMISSION_DENIED;
+}
 
 function toPickedFile(asset: any, fallbackPrefix: string): PickedFile {
   // Library returns { path, mime, ... }; the legacy expo path returns
@@ -97,24 +130,43 @@ export async function captureWithCrop(
 ): Promise<PickedFile | null> {
   const namePrefix = options.namePrefix || 'photo';
 
+  // In-app rationale before the OS prompt. Already-granted → no modal.
+  // User declines rationale → treat as permission-denied so the
+  // existing isPermissionDeniedError() branch fires the "open settings"
+  // UI the caller already shows for an OS denial.
+  const gate = await requestPermissionWithRationale('camera', cameraAsker);
+  if (!gate.granted) throw makePermissionError('Camera access not granted');
+
   if (cropPickerAvailable && CropPicker) {
     try {
       const asset = await CropPicker.openCamera(CROP_OPTIONS);
       if (!asset) return null;
       return toPickedFile(asset, namePrefix);
     } catch (e: any) {
-      // E_PICKER_CANCELLED → user backed out. Anything else → swallow
-      // and try the expo fallback so the app still works on devices
-      // where the native module misbehaves.
+      // E_PICKER_CANCELLED → user backed out, treat as no-op.
       if (e?.code === 'E_PICKER_CANCELLED') return null;
-      console.log('[cropPicker] camera failed, falling back to expo:', e?.message);
+      // Permission denial — surface a tagged error so the caller can
+      // show an Open Settings prompt.
+      if (e?.code === 'E_NO_LIBRARY_PERMISSION' || e?.code === 'E_NO_CAMERA_PERMISSION') {
+        throw makePermissionError(e?.message);
+      }
+      // Any other rn-image-crop-picker error — propagate.
+      // We deliberately DO NOT fall through to expo-image-picker:
+      // expo's launchCameraAsync hits the "unregistered
+      // ActivityResultLauncher" IllegalStateException on
+      // aggressive-memory OEMs (Realme/Oppo/Vivo/Xiaomi) — which is
+      // exactly the failure mode this wrapper was created to escape.
+      // Failing visibly here lets the caller show a useful message.
+      console.log('[cropPicker] camera failed (no fallback):', e?.message);
+      throw e;
     }
   }
 
-  // Fallback path — expo-image-picker. No crop UI but at least the
-  // upload still works on older APKs.
+  // Reached ONLY when react-native-image-crop-picker isn't in the bundle
+  // (older dev-client APK, web preview). Production builds always
+  // include it, so this branch is a development safety net.
   const perm = await ExpoImagePicker.requestCameraPermissionsAsync();
-  if (!perm.granted) return null;
+  if (!perm.granted) throw makePermissionError('Camera access denied');
   const result: any = await ExpoImagePicker.launchCameraAsync({
     mediaTypes: 'images' as any,
     allowsEditing: true,
@@ -133,6 +185,10 @@ export async function pickWithCrop(
 ): Promise<PickedFile | null> {
   const namePrefix = options.namePrefix || 'photo';
 
+  // Mirrors captureWithCrop's gate — see comment there.
+  const gate = await requestPermissionWithRationale('gallery', galleryAsker);
+  if (!gate.granted) throw makePermissionError('Photo library access not granted');
+
   if (cropPickerAvailable && CropPicker) {
     try {
       const asset = await CropPicker.openPicker(CROP_OPTIONS);
@@ -140,12 +196,21 @@ export async function pickWithCrop(
       return toPickedFile(asset, namePrefix);
     } catch (e: any) {
       if (e?.code === 'E_PICKER_CANCELLED') return null;
-      console.log('[cropPicker] gallery failed, falling back to expo:', e?.message);
+      if (e?.code === 'E_NO_LIBRARY_PERMISSION' || e?.code === 'E_NO_CAMERA_PERMISSION') {
+        throw makePermissionError(e?.message);
+      }
+      // Same reasoning as captureWithCrop: do NOT fall through to
+      // expo's launchImageLibraryAsync. Realme 11x and similar
+      // aggressive-memory OEMs throw "unregistered
+      // ActivityResultLauncher" the moment expo's launch is hit — the
+      // exact crash this whole wrapper exists to avoid.
+      console.log('[cropPicker] gallery failed (no fallback):', e?.message);
+      throw e;
     }
   }
 
   const perm = await ExpoImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!perm.granted) return null;
+  if (!perm.granted) throw makePermissionError('Photo access denied');
   const result: any = await ExpoImagePicker.launchImageLibraryAsync({
     mediaTypes: 'images' as any,
     allowsEditing: true,
@@ -157,3 +222,22 @@ export async function pickWithCrop(
 
 /** True once the project has been rebuilt with the native module. */
 export const isStyledCropAvailable = (): boolean => cropPickerAvailable;
+
+/**
+ * True when an error is the Android "unregistered ActivityResultLauncher"
+ * failure. expo-image-picker / expo-document-picker throw this when the
+ * host Activity was destroyed + recreated while the system picker was
+ * open — common on aggressive-memory OEMs (Realme / Oppo / Vivo /
+ * Xiaomi) and on any phone with the "Don't keep activities" developer
+ * option enabled.
+ *
+ * Image picking routes through react-native-image-crop-picker, which is
+ * immune (it uses the classic startActivityForResult path). Document
+ * picking has no bundled native alternative, so its call sites use this
+ * to detect the failure and steer the user to the Camera/Gallery flow,
+ * which always works.
+ */
+export function isActivityLauncherError(e: unknown): boolean {
+  const msg = String((e as any)?.message ?? e ?? '');
+  return /unregistered|ActivityResultLauncher|IllegalState/i.test(msg);
+}

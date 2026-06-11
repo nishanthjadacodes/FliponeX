@@ -27,6 +27,7 @@ import {
   getServices,
   getTrendingServices,
   getOffers,
+  getProfile,
   getInboxNotifications,
   markAllNotificationsRead,
   markNotificationRead,
@@ -36,6 +37,10 @@ import { clearAuthSession } from '../utils/storage';
 import { useQuery } from '@tanstack/react-query';
 import { useAppStore } from '../store/useAppStore';
 import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
+// expo-image for the REMOTE avatar only — native disk caching means
+// the profile pic isn't re-downloaded on every Home visit. Static
+// require() assets stay on RN's <Image> (nothing to cache).
+import { Image as ExpoImage } from 'expo-image';
 import B2BToggle from '../components/B2BToggle';
 import ServiceCard, { iconForCategory } from '../components/ServiceCard';
 import * as haptics from '../utils/haptics';
@@ -101,10 +106,34 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   const trendingServices: Service[] = trendingOffers?.trending || [];
   const offers: OfferItem[] = trendingOffers?.offers || [];
 
+  // Logged-in user's canonical profile — fetched HERE too, not only on
+  // the Profile screen. After a logout the local user cache is wiped, and
+  // a fresh login may not carry profile_pic; without this query the
+  // header avatar stayed on the letter fallback until the user opened
+  // Profile (whose fetch was the only thing populating the store).
+  // Shares the ['profile'] cache key with ProfileScreen — fetched once,
+  // both surfaces stay in sync (an avatar change there updates this too).
+  const { data: profileData } = useQuery({
+    queryKey: ['profile'],
+    queryFn: async () => {
+      const p: any = await getProfile();
+      return p?.user || p?.data || p || {};
+    },
+  });
+
   // Logged-in user comes straight from the shared Zustand store —
   // ProfileScreen keeps it current, so the header avatar / greeting
   // update the instant the user edits their profile (no focus-reload).
   const user = useAppStore((s) => s.user);
+
+  // Mirror the freshly-fetched profile into the shared store so the
+  // header avatar / greeting show the server's uploaded photo right
+  // away — no need to visit the Profile screen first.
+  useEffect(() => {
+    if (profileData && (profileData.id || profileData.mobile)) {
+      useAppStore.getState().setUser(profileData);
+    }
+  }, [profileData]);
 
   // Category chip list — derived from whatever services came back.
   const categories = useMemo<any[]>(
@@ -190,10 +219,21 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
     const seenBuckets = new Set<string>();
     const out: Service[] = [];
 
+    // `services` is already scoped to the active Common / Industrial
+    // toggle (the query key includes serviceType). Build a set of its
+    // ids so the backend trending list — which is NOT toggle-aware —
+    // is filtered down to only services that belong to the current
+    // mode. This is what stops common + industrial trending mixing.
+    const inScopeIds = new Set<string>(
+      (services as any[]).map((s) => String(s?.id)).filter(Boolean),
+    );
+
     // 1. Backend's trending list keeps its priority, but only one per
-    //    bucket so the row doesn't collapse onto one category.
+    //    bucket so the row doesn't collapse onto one category — AND
+    //    only items that are in the current toggle's catalogue.
     for (const s of trendingServices as any[]) {
       if (!s?.id) continue;
+      if (!inScopeIds.has(String(s.id))) continue; // wrong toggle mode
       const b = bucketOf(s);
       if (seenIds.has(String(s.id))) continue;
       if (seenBuckets.has(b)) continue;
@@ -519,15 +559,18 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
   }
 
   const handleCategoryPress = (category: string) => {
-    setSelectedCategory(category);
+    // Defer the (potentially heavy) services-grid re-filter by one
+    // frame so the category chip's touch highlight paints immediately
+    // instead of stalling behind the re-render.
+    requestAnimationFrame(() => setSelectedCategory(category));
   };
 
   const handleShareApp = async (): Promise<void> => {
     try {
-      const message = `Check out FlipOn Digital! Your trusted service partner for all document needs.\n\nDownload now: https://play.google.com/store/apps/details?id=com.flipon.digital`;
+      const message = `Check out FliponeX! Your trusted service partner for all document needs.\n\nDownload now: https://play.google.com/store/apps/details?id=com.fliponex.customer`;
       await Share.share({
         message,
-        title: 'FlipOn Digital App',
+        title: 'FliponeX App',
       });
     } catch (error) {
       console.error('Error sharing app:', error);
@@ -697,7 +740,10 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
 
   // Combined sticky brand block — greeting + buttons + search all stick together
   const renderStickyBrand = () => (
-    <View style={styles.stickyBrand} collapsable={false}>
+    <View
+      style={[styles.stickyBrand, { paddingTop: insets.top + 10 }]}
+      collapsable={false}
+    >
       <View style={styles.headerTop}>
         {/* App logo — small circular image to reinforce branding */}
         <View style={styles.brandLogoWrap}>
@@ -753,10 +799,12 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             accessibilityLabel="Open profile"
           >
             {user?.profile_pic ? (
-              <Image
+              <ExpoImage
                 source={{ uri: user.profile_pic }}
                 style={styles.iconAvatarImg}
-                resizeMode="cover"
+                contentFit="cover"
+                cachePolicy="memory-disk"
+                transition={150}
               />
             ) : user?.name && user.name.trim().length > 0 ? (
               <Text style={[styles.iconButtonText, { fontWeight: '900' }]}>
@@ -788,7 +836,7 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             { icon: '💼', iconBg: '#E3EEF8', label: 'Pay After Service', sub: 'Pay only once task is completed' },
             { icon: '🎧', iconBg: '#FCE4EC', label: '24x7 Support', sub: 'We are always here to help' },
           ]}
-          cardWidth={200}
+          cardWidth={180}
           intervalMs={2800}
           slideDurationMs={650}
           renderItem={(item: any) => (
@@ -825,13 +873,12 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                 AND wrapped awkwardly on narrow screens. adjustsFontSizeToFit
                 ensures the text shrinks if it would otherwise wrap on
                 very small devices. */}
-            <Text
-              style={styles.heroCardTitle}
-              numberOfLines={1}
-              adjustsFontSizeToFit
-              minimumFontScale={0.7}
-            >
-              Get Any Common & Industrial Services
+            {/* Wraps to 2 lines at a real, readable size. Forcing one
+                line + adjustsFontSizeToFit shrank this long headline
+                down to ~12px — "big but cramped". Two lines at the
+                full font size reads much larger. */}
+            <Text style={styles.heroCardTitle} numberOfLines={2}>
+              Get Any Common and Industrial Services
             </Text>
             <Text style={styles.heroCardTitleAccent}>At Your Doorstep</Text>
 
@@ -840,8 +887,10 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
                   once the GST registration flow ships. */}
               {['Aadhaar', 'PAN', 'Loans', '100+ Services'].map((label) => (
                 <View key={label} style={styles.heroPill}>
-                  <Text style={styles.heroPillTick}>✓</Text>
-                  <Text style={styles.heroPillText}>{label}</Text>
+                  {/* Tick dropped — the four pills (incl. "100+ Services")
+                      have to share one row, and the ✓ + its gap cost the
+                      ~40px that pushed the last pill onto a 2nd line. */}
+                  <Text style={styles.heroPillText} numberOfLines={1}>{label}</Text>
                 </View>
               ))}
             </View>
@@ -851,85 +900,52 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
               <Text style={styles.heroTaglineText}>Fast · Secure · Reliable</Text>
               <View style={styles.heroTaglineLine} />
             </View>
-
-            <TouchableOpacity
-              style={styles.heroCardCta}
-              activeOpacity={0.85}
-              onPress={scrollToServices}
-            >
-              <Text style={styles.heroCardCtaText}>Book Service Now  →</Text>
-            </TouchableOpacity>
+            {/* "Book Service Now" CTA removed — the quad-card grid right
+                below already has a prominent "Book Now" tile that does
+                the same scrollToServices(), so this button was redundant
+                and cost ~50px of vertical real estate on the home page. */}
           </View>
 
-          {/* Delivery-rep illustration with a stylized scene behind it
-              that mirrors the marketing reference: a navy door panel
-              with brass handle, faint city-skyline silhouettes (lighter
-              navy rectangles in varying heights), a small grid of dots
-              in the upper-right corner, and a green plant tucked next
-              to the door. All scene elements are absolute-positioned
-              behind the agent image so the figure stays anchored in
-              the foreground. */}
+          {/* Delivery-rep panel. agent.png ships with its own complete
+              scene baked in (wall, blue door, plant, skyline), so the
+              hand-built decorations that used to sit behind it only
+              clashed — double doors / double skylines. The image now
+              fills this rounded panel edge-to-edge via resizeMode
+              "cover", so the photo's own background IS the panel: no
+              floating box, no mismatched edges. */}
           <View style={styles.heroCardRight}>
-            {/* Top-right grid dots */}
-            <View style={styles.heroSceneDots} pointerEvents="none">
-              {Array.from({ length: 9 }).map((_, i) => (
-                <View key={i} style={styles.heroSceneDot} />
-              ))}
-            </View>
-
-            {/* City skyline silhouette — lighter navy rectangles. */}
-            <View style={styles.heroSceneSkyline} pointerEvents="none">
-              <View style={[styles.skyBldg, { height: 40, marginRight: 2 }]} />
-              <View style={[styles.skyBldg, { height: 28, marginRight: 2 }]} />
-              <View style={[styles.skyBldg, { height: 56, marginRight: 2 }]} />
-              <View style={[styles.skyBldg, { height: 36, marginRight: 2 }]} />
-              <View style={[styles.skyBldg, { height: 48 }]} />
-            </View>
-
-            {/* Door panel — taller than the rep, sits flush right behind */}
-            <View style={styles.heroSceneDoorFrame} pointerEvents="none">
-              <View style={styles.heroSceneDoor}>
-                <View style={styles.heroSceneDoorHandle} />
-              </View>
-            </View>
-
-            {/* Plant block was removed — the floating leaf emoji over a
-                small terracotta tile read as awkward clip-art rather
-                than scenery. The agent PNG already has its own subtle
-                background details; keeping the scene clean (just
-                door + skyline + dots + halo) makes the figure pop. */}
-
-            {/* Soft halo behind the rep for the "spotlight" effect */}
-            <View style={styles.heroRepHalo} pointerEvents="none" />
-
-            {/* Foreground: the rep PNG */}
             <Image
               source={require('../../assets/agent.png')}
               style={styles.heroRepImage}
-              resizeMode="contain"
+              resizeMode="cover"
             />
           </View>
         </View>
       </View>
 
-      {/* ─── 4-card action grid in a SINGLE ROW: Book New Service /
+      {/* ─── 4-card action grid in a SINGLE ROW: Book Now /
           My Bookings / My Documents / Refer & Earn. Each card is now
           ~23% width so all 4 fit horizontally on a phone screen. */}
+      {/* Cards use a slightly-lightened version of the original brand
+          colours (not pale) — white text + icons read clearly on
+          them; only the CTA sits on a white pill. */}
       <View style={styles.quadCards}>
         <TouchableOpacity
-          style={[styles.quadCard, { backgroundColor: '#1976D2' }]}
+          style={[styles.quadCard, { backgroundColor: '#3B8AE0' }]}
           onPress={scrollToServices}
           activeOpacity={0.85}
         >
           <View style={styles.quadCardIcon}>
             <Text style={styles.quadCardIconText}>+</Text>
           </View>
-          <Text style={styles.quadCardTitle}>Book{'\n'}New</Text>
-          <Text style={styles.quadCardCtaText}>BOOK NOW →</Text>
+          <Text style={styles.quadCardTitle}>Book{'\n'}Now</Text>
+          <View style={styles.quadCardCtaPill}>
+            <Text style={[styles.quadCardCtaText, { color: '#1565C0' }]} numberOfLines={1}>BOOK →</Text>
+          </View>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.quadCard, { backgroundColor: '#2E7D32' }]}
+          style={[styles.quadCard, { backgroundColor: '#45A049' }]}
           onPress={() => navigation.navigate('MyBookings')}
           activeOpacity={0.85}
         >
@@ -937,11 +953,13 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             <Text style={styles.quadCardIconText}>📋</Text>
           </View>
           <Text style={styles.quadCardTitle}>My{'\n'}Bookings</Text>
-          <Text style={styles.quadCardCtaText}>VIEW →</Text>
+          <View style={styles.quadCardCtaPill}>
+            <Text style={[styles.quadCardCtaText, { color: '#2E7D32' }]}>VIEW →</Text>
+          </View>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.quadCard, { backgroundColor: '#7B1FA2' }]}
+          style={[styles.quadCard, { backgroundColor: '#9A3DBE' }]}
           onPress={() => handleQuickAction('documents')}
           activeOpacity={0.85}
         >
@@ -949,29 +967,29 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             <Text style={styles.quadCardIconText}>📁</Text>
           </View>
           <Text style={styles.quadCardTitle}>KYC{'\n'}Documents</Text>
-          <Text style={styles.quadCardCtaText}>VIEW →</Text>
+          <View style={styles.quadCardCtaPill}>
+            <Text style={[styles.quadCardCtaText, { color: '#7B1FA2' }]}>VIEW →</Text>
+          </View>
         </TouchableOpacity>
 
-        {/* Refer & Earn — gold↘amber linear gradient (not pure yellow) so
-            it reads as a premium "rewards" tile next to the solid colored
-            siblings. Dark navy text + dark CTA pill keep contrast high. */}
-        <TouchableOpacity onPress={handleShareApp} activeOpacity={0.85} style={styles.quadCardWrap}>
-          <LinearGradient
-            colors={['#FCD34D', '#F59E0B', '#D97706']}
-            start={{ x: 0, y: 0 }}
-            end={{ x: 1, y: 1 }}
-            style={styles.quadCard}
-          >
-            <Text style={styles.quadCardGiftEmoji}>🎁</Text>
-            <Text style={styles.quadCardTitleGold}>Refer{'\n'}& Earn</Text>
-            <Text style={styles.quadCardCtaTextGold}>₹20 →</Text>
-          </LinearGradient>
+        {/* Refer & Earn — slightly-lightened gold, consistent with the
+            other three cards. */}
+        <TouchableOpacity
+          style={[styles.quadCard, { backgroundColor: '#F4B52E' }]}
+          onPress={handleShareApp}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.quadCardGiftEmoji}>🎁</Text>
+          <Text style={styles.quadCardTitle}>Refer{'\n'}& Earn</Text>
+          <View style={styles.quadCardCtaPill}>
+            <Text style={[styles.quadCardCtaText, { color: '#B7791F' }]}>₹20 →</Text>
+          </View>
         </TouchableOpacity>
       </View>
 
       {/* 30-day Critical Compliance Alert — only renders when the user
           has at least one document expiring in <30 days. Sits directly
-          below the quad cards (Book New / My Bookings / KYC Documents /
+          below the quad cards (Book Now / My Bookings / KYC Documents /
           Refer & Earn) so the "Action Required Immediately" prompt is
           the first thing the user sees after the primary actions. Spec
           wording exactly: "Action Required Immediately to avoid
@@ -1085,10 +1103,26 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
         )}
       </View>
 
-      {/* ─── Trending Services section REMOVED — was here, taking too
-          much vertical real estate. Customers now search via the bar
-          above or browse the categories strip + popular grid below. */}
-      {false && displayedTrending.length > 0 && (
+      {/* Why-FliponeX promo strip was here — now lives at the very
+          bottom of the home screen (right above the WhatsApp button)
+          so it appears AFTER the user has scrolled past the services
+          listing, matching the requested layout. */}
+
+      <View style={styles.categoriesContainer}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+          <View style={styles.categoriesRow}>
+            {categories.map(renderCategoryChip)}
+          </View>
+        </ScrollView>
+      </View>
+
+      {/* ─── Trending Services — sits right after the category-chips
+          row. `displayedTrending` is built only from `services`,
+          which is itself scoped to the active Common / Industrial
+          toggle (the query key includes serviceType) — so Common
+          mode shows common trending and Industrial mode shows
+          industrial trending, never mixed. Horizontal auto-scroll. */}
+      {displayedTrending.length > 0 && (
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>📈 Trending Services</Text>
           <AutoCarousel
@@ -1116,19 +1150,6 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
           />
         </View>
       )}
-
-      {/* Why-FliponeX promo strip was here — now lives at the very
-          bottom of the home screen (right above the WhatsApp button)
-          so it appears AFTER the user has scrolled past the services
-          listing, matching the requested layout. */}
-
-      <View style={styles.categoriesContainer}>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          <View style={styles.categoriesRow}>
-            {categories.map(renderCategoryChip)}
-          </View>
-        </ScrollView>
-      </View>
 
     </View>
   );
@@ -1192,7 +1213,11 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             style={styles.globalViewAllBtn}
             onPress={() => {
               haptics.tap();
-              setShowAllServices((v) => !v);
+              // Expanding to the full catalogue (150+ cards) is a
+              // heavy re-render — defer it one frame so the button's
+              // press feedback shows instantly instead of looking
+              // frozen while the grid rebuilds.
+              requestAnimationFrame(() => setShowAllServices((v) => !v));
             }}
           >
             <Text style={styles.globalViewAllBtnText}>
@@ -1313,30 +1338,21 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
       >
         {renderRestOfHeader()}
 
-        {/* onLayout captures Y offset so the hook's "Book Now, Pay Later"
-            button can scroll the user straight to the services grid. */}
-        <View onLayout={(e: any) => { servicesYRef.current = e.nativeEvent.layout.y; }}>
-        {/* Categorized service sections (Swiggy/Zomato style).
-            Render is split into three layers so toggling View All ↔
-            Show Less doesn't re-do expensive work:
-              1. groupedServices — memoised grouping by category. Only
-                 recomputes when the source list (filteredServices or
-                 searchResults) actually changes, not on every toggle.
-              2. visibleSections — memoised slice. Recomputes only when
-                 showAllServices flips or groupedServices changes.
-              3. Plain View+map rendering. FlatList was overkill here
-                 (scrollEnabled=false, no virtualisation benefit) and
-                 added measurable lag on the 156-service expansion. */}
-        {renderServicesGrid()}
-        </View>
-
-        {/* Why FliponeX — moved to the very bottom of the home scroll,
-            right above the WhatsApp button, so it surfaces AFTER the
-            user has seen the services listing rather than competing
-            for vertical real estate above it. Same 4 hero banners
-            (Consumer / Industrial / Fast Track / Referral), same
-            auto-rotating carousel — only the position changed. */}
-        <View style={{ marginTop: 14, marginBottom: 6 }}>
+        {/* Why FliponeX — sits BETWEEN trending services (the last item
+            inside renderRestOfHeader) and the categorised services grid.
+            Order on the home scroll is now:
+              … trust strip → hero card → quad cards → smart alert
+              → toggle → search → categories → trending services →
+              ★ Why FliponeX ★ → services grid → WhatsApp FAB
+            This way the user sees the brand pitch right after the
+            attention-grabbing trending row but before scrolling into
+            the full catalogue. */}
+        {/* Tight wrapper — was marginTop:14 / marginBottom:6 which (on top
+            of bannerSectionTitle's marginTop:10 + Trending Services'
+            marginBottom:6) opened ~30px of dead space above and ~6px
+            below. Now 4/0 so Trending → Why FliponeX → Services grid
+            sit closer together and more of the catalogue scrolls in. */}
+        <View style={{ marginTop: 4, marginBottom: 0 }}>
           <Text style={styles.bannerSectionTitle}>✨ Why FliponeX</Text>
           <AutoCarousel
             items={HERO_BANNERS}
@@ -1386,6 +1402,23 @@ const HomeScreen: React.FC<Props> = ({ navigation }) => {
             )}
             style={{ paddingHorizontal: 6 }}
           />
+        </View>
+
+        {/* onLayout captures Y offset so the hook's "Book Now, Pay Later"
+            button can scroll the user straight to the services grid. */}
+        <View onLayout={(e: any) => { servicesYRef.current = e.nativeEvent.layout.y; }}>
+        {/* Categorized service sections (Swiggy/Zomato style).
+            Render is split into three layers so toggling View All ↔
+            Show Less doesn't re-do expensive work:
+              1. groupedServices — memoised grouping by category. Only
+                 recomputes when the source list (filteredServices or
+                 searchResults) actually changes, not on every toggle.
+              2. visibleSections — memoised slice. Recomputes only when
+                 showAllServices flips or groupedServices changes.
+              3. Plain View+map rendering. FlatList was overkill here
+                 (scrollEnabled=false, no virtualisation benefit) and
+                 added measurable lag on the 156-service expansion. */}
+        {renderServicesGrid()}
         </View>
 
         {/* WhatsApp FAB moved OUT of the ScrollView (rendered as a
@@ -1485,7 +1518,9 @@ const styles = StyleSheet.create({
   // flattening it into a touch-aggregating wrapper.
   stickyBrand: {
     backgroundColor: COLORS.PRIMARY,
-    paddingTop: 40,
+    // paddingTop is applied inline as insets.top + 10 so the brand bar
+    // clears the status bar / notch on EVERY device (was a hardcoded
+    // 40 that was too little on tall-notch phones, too much on others).
     paddingHorizontal: 14,
     paddingBottom: 14,
     borderBottomLeftRadius: 20,
@@ -1656,12 +1691,16 @@ const styles = StyleSheet.create({
 
   // ─── Hero hook banner (compact — all brief text still shown) ───
   // ─── Trust strip ────────────────────────────────────────────────────
+  // Tightened (paddingVertical 10→6, marginTop 10→6) along with a smaller
+  // per-item card (width 160→130, icon 36→30, cardWidth 200→160) so the
+  // 5 trust mini-cards take less vertical + horizontal space — more
+  // services scroll into the initial viewport.
   trustStrip: {
     backgroundColor: '#FFFFFF',
     marginHorizontal: 12,
-    marginTop: 10,
+    marginTop: 6,
     borderRadius: 12,
-    paddingVertical: 10,
+    paddingVertical: 6,
     elevation: 2,
     shadowColor: '#082B4C',
     shadowOffset: { width: 0, height: 2 },
@@ -1675,30 +1714,36 @@ const styles = StyleSheet.create({
   trustItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
+    // Width restored from 130 → 160 so the longest labels
+    // ("Real-time Tracking", "Pay After Service") fit on one line at
+    // 11px bold. With icon 30 + gap 6 + paddings 8, the text gets ~116px
+    // of breathing room — enough for any of the 5 trust phrases.
     width: 160,
-    paddingVertical: 4,
+    paddingVertical: 2,
     paddingHorizontal: 4,
   },
   trustItemIcon: {
-    width: 36,
-    height: 36,
-    borderRadius: 8,
+    width: 30,
+    height: 30,
+    borderRadius: 7,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  trustItemIconEmoji: { fontSize: 18 },
-  trustItemImg: { width: 22, height: 22 },
+  trustItemIconEmoji: { fontSize: 16 },
+  trustItemImg: { width: 18, height: 18 },
   trustItemLabel: { fontSize: 11, fontWeight: '800', color: '#0F172A' },
   trustItemSub: { fontSize: 9, color: '#64748B', marginTop: 1, lineHeight: 12 },
 
   // ─── Hero card (matches the marketing reference) ────────────────────
   heroCard: {
     backgroundColor: '#0D3B66',
-    marginHorizontal: 12,
+    // Narrow side margin → the card is wider horizontally.
+    marginHorizontal: 6,
     marginTop: 12,
     borderRadius: 16,
-    paddingVertical: 18,
+    // Trimmed vertical padding → shorter card.
+    paddingVertical: 6,
     paddingLeft: 16,
     paddingRight: 8,
     overflow: 'hidden',
@@ -1708,18 +1753,16 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.18,
     shadowRadius: 8,
   },
-  heroCardRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 4 },
+  heroCardRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 4 },
   heroCardLeft: { flex: 1 },
   heroCardTitle: {
     color: '#FFFFFF',
-    // Slightly smaller so the single-line headline
-    // "Get Any Common & Industrial Services" fits comfortably on a
-    // standard phone width (360-420dp) without needing aggressive
-    // font scaling. adjustsFontSizeToFit on the Text element acts
-    // as a safety net for very narrow devices.
-    fontSize: 14,
+    // Real, fixed size — the headline wraps to 2 lines (no
+    // adjustsFontSizeToFit shrinking). 19px bold across two lines
+    // reads clearly larger than a single shrunk-to-fit line.
+    fontSize: 19,
     fontWeight: '900',
-    lineHeight: 18,
+    lineHeight: 24,
     letterSpacing: 0.1,
   },
   heroCardTitleAccent: {
@@ -1733,14 +1776,13 @@ const styles = StyleSheet.create({
   heroPills: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 6,
+    gap: 4,
     marginTop: 12,
   },
   heroPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: 8,
+    paddingHorizontal: 5,
     paddingVertical: 4,
     borderRadius: 999,
     borderWidth: 1,
@@ -1754,7 +1796,7 @@ const styles = StyleSheet.create({
   },
   heroPillText: {
     color: '#FFFFFF',
-    fontSize: 10,
+    fontSize: 9,
     fontWeight: '700',
   },
   heroTaglineRow: {
@@ -1779,7 +1821,11 @@ const styles = StyleSheet.create({
   },
   heroCardCta: {
     backgroundColor: '#FCD34D',
-    paddingHorizontal: 18,
+    // Row layout — label + arrow centred on one shared line. Wider
+    // horizontal padding makes the button a little larger.
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 24,
     paddingVertical: 11,
     borderRadius: 999,
     alignSelf: 'flex-start',
@@ -1796,101 +1842,37 @@ const styles = StyleSheet.create({
     fontSize: 13,
     letterSpacing: 0.3,
   },
+  // Arrow as its own Text — sits in the button's centred row so it
+  // never wraps to a second line or drifts off the label's baseline.
+  heroCardCtaArrow: {
+    color: '#0D3B66',
+    fontWeight: '900',
+    fontSize: 15,
+    marginLeft: 6,
+  },
   heroCardRight: {
-    width: 138,
-    height: 200,
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    position: 'relative',
+    // Rounded panel that agent.png fills edge-to-edge (resizeMode
+    // "cover"). overflow:'hidden' + borderRadius clip the image into
+    // a tidy inset photo so its baked-in background never shows as a
+    // box.
+    //
+    // Height reduced from 176→140 after the "Book Service Now" CTA
+    // was removed from the left content: the right panel was the
+    // taller of the two columns, so trimming it 36px makes the hero
+    // card shrink to match the left content's natural height —
+    // eliminating the empty space that opened up below the "Fast ·
+    // Secure · Reliable" tagline.
+    width: 100,
+    height: 140,
+    borderRadius: 12,
     overflow: 'hidden',
   },
-  // Soft glow circle behind the rep — bigger, lighter, more diffuse so
-  // it reads as ambient lighting on the figure rather than a hard
-  // "framed" disc. The agent should look like they're standing in
-  // front of the scene, not pasted onto a square.
-  heroRepHalo: {
-    position: 'absolute',
-    bottom: 0,
-    alignSelf: 'center',
-    width: 140,
-    height: 140,
-    borderRadius: 70,
-    backgroundColor: 'rgba(252,211,77,0.16)',
-  },
-  // Larger figure that overlaps the hero card edges so it doesn't read
-  // as a boxed-in sticker. Slight scale-up + lower bottom anchor makes
-  // the rep feel "standing in the scene".
   heroRepImage: {
-    width: 130,
-    height: 200,
-    zIndex: 2,
-    marginBottom: -8,
+    // Fills the panel — "cover" scales the figure up and crops the
+    // photo's edges to the panel, so there is no letterbox gap.
+    width: '100%',
+    height: '100%',
   },
-
-  // ─── Background scene around the rep ────────────────────────────────
-  // Top-right grid of soft dots — purely decorative, hints at "digital
-  // services" without competing with the rep visually.
-  heroSceneDots: {
-    position: 'absolute',
-    top: 4,
-    right: 4,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    width: 30,
-    gap: 3,
-  },
-  heroSceneDot: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.30)',
-  },
-  // City skyline silhouettes — lighter navy rectangles peeking from
-  // behind the rep to suggest "doorstep at home/office in the city".
-  heroSceneSkyline: {
-    position: 'absolute',
-    bottom: 30,
-    left: 0,
-    right: 0,
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    justifyContent: 'center',
-  },
-  skyBldg: {
-    width: 12,
-    backgroundColor: 'rgba(255,255,255,0.10)',
-    borderTopLeftRadius: 2,
-    borderTopRightRadius: 2,
-  },
-  // Door panel sits behind the rep on the right side. A thinner brass
-  // handle disc on the right edge of the door reads as a doorknob.
-  heroSceneDoorFrame: {
-    position: 'absolute',
-    top: 6,
-    right: -2,
-    width: 50,
-    height: 150,
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    borderRadius: 6,
-    padding: 3,
-  },
-  heroSceneDoor: {
-    flex: 1,
-    backgroundColor: '#082B4C',
-    borderRadius: 4,
-    justifyContent: 'center',
-    alignItems: 'flex-end',
-    paddingRight: 4,
-  },
-  heroSceneDoorHandle: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#FCD34D',
-  },
-  // (heroScenePlant / heroScenePot / heroScenePlantTop styles
-  // removed — the floating leaf clip-art was replaced with a cleaner
-  // scene of just door + skyline + dots + halo.)
 
   // ─── 4-card action row — single horizontal line, 4 equal slots ─────
   // Each card is `flex: 1` inside a row container with small gaps so
@@ -1913,9 +1895,9 @@ const styles = StyleSheet.create({
   },
   quadCard: {
     flex: 1,
-    minHeight: 122,
+    minHeight: 100,
     borderRadius: 14,
-    paddingVertical: 12,
+    paddingVertical: 9,
     paddingHorizontal: 8,
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -1926,14 +1908,24 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
   },
   quadCardIcon: {
-    width: 32,
-    height: 32,
+    width: 28,
+    height: 28,
     borderRadius: 8,
+    // Translucent-white box on the coloured card; the white icon
+    // glyph sits inside it.
     backgroundColor: 'rgba(255,255,255,0.25)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  quadCardIconText: { color: '#FFFFFF', fontSize: 18, fontWeight: '900', lineHeight: 20 },
+  quadCardIconText: { color: '#FFFFFF', fontSize: 16, fontWeight: '900', lineHeight: 18 },
+  // White CTA pill — wraps "BOOK NOW →" / "VIEW →" / "₹20 →" so only
+  // the call-to-action is on white, not the whole card.
+  quadCardCtaPill: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
+  },
   quadCardTitle: {
     color: '#FFFFFF',
     fontSize: 11,
@@ -1948,7 +1940,7 @@ const styles = StyleSheet.create({
     lineHeight: 14,
     textAlign: 'center',
   },
-  quadCardGiftEmoji: { fontSize: 22 },
+  quadCardGiftEmoji: { fontSize: 19 },
   quadCardCtaText: {
     color: '#FFFFFF',
     fontSize: 9,
@@ -2095,7 +2087,7 @@ const styles = StyleSheet.create({
     paddingVertical: 12, paddingHorizontal: 12,
     shadowColor: '#082B4C', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.18, shadowRadius: 5, elevation: 4,
   },
-  actionBtnPrimary: { backgroundColor: '#E63946' },       // Book New Service — red (urgency)
+  actionBtnPrimary: { backgroundColor: '#E63946' },       // Book Now — red (urgency)
   actionBtnSecondary: { backgroundColor: '#0D3B66' },     // My Bookings — Prussian blue (trust)
   actionBtnIcon: { fontSize: 22 },
   actionBtnTitle: { color: '#fff', fontSize: 13, fontWeight: '800', letterSpacing: 0.2 },
@@ -2124,10 +2116,12 @@ const styles = StyleSheet.create({
   goldCardSubtitle: { fontSize: 11, color: '#8D6E2F', marginTop: 2, lineHeight: 15 },
   goldCardArrow: { fontSize: 24, color: '#C99100', fontWeight: '800', marginLeft: 6 },
 
-  // Promo-carousel heading
+  // Promo-carousel heading — only used by "Why FliponeX". marginTop
+  // reduced 10→2 so the title sits close under Trending Services
+  // instead of stacking on the wrapper's own margin.
   bannerSectionTitle: {
     fontSize: 13, fontWeight: '800', color: '#1A1A1A',
-    marginHorizontal: 12, marginTop: 10, marginBottom: 2,
+    marginHorizontal: 12, marginTop: 2, marginBottom: 2,
     letterSpacing: 0.2,
   },
 
@@ -2766,7 +2760,9 @@ const styles = StyleSheet.create({
   // ─── Inline search bar — rendered just above the services list ──────────
   inlineSearchWrap: {
     paddingHorizontal: 14,
-    marginTop: 14,
+    // Tightened — was 14, leaving a wide gap under the Common /
+    // Industrial toggle. Now the search bar sits close beneath it.
+    marginTop: 3,
     marginBottom: 6,
   },
   inlineSearchBar: {

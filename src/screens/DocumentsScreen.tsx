@@ -12,7 +12,6 @@ import {
   Modal,
   Alert,
 } from 'react-native';
-import * as ImagePicker from 'expo-image-picker';
 import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
 import { getMyDocuments, uploadKYCDocument } from '../services/api';
 import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';

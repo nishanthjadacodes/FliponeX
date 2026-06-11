@@ -1,3 +1,4 @@
+import { useQuery } from '@tanstack/react-query';
 import { View, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -63,6 +64,7 @@ import AgentReferralScreen from './src/screens/agent/ReferralScreen';
 import AgentProfileScreen from './src/screens/agent/ProfileScreen';
 import AgentTaskExecutionScreen from './src/screens/agent/TaskExecutionScreen';
 import AgentTeamTreeIncomeScreen from './src/screens/agent/TeamTreeIncomeScreen';
+import { getTasks } from './src/services/agent/api';
 
 const Stack = createStackNavigator<RootStackParamList>();
 const HomeTab = createBottomTabNavigator<HomeTabParamList>();
@@ -179,6 +181,22 @@ const AgentTabs = () => {
   // screen. Same pattern as the customer-side HomeTabs above.
   const insets = useSafeAreaInsets();
   const bottomInset = Math.max(insets.bottom, 10);
+
+  // ── New-task badge ───────────────────────────────────────────────
+  // Count of unaccepted ("new") jobs, surfaced as a badge on the Tasks
+  // tab so a rep sees a waiting order from any tab. This uses the SAME
+  // ['agentTasks','new'] TanStack Query cache as TaskListScreen — so the
+  // moment a rep accepts or rejects a task there, TaskListScreen
+  // invalidates the 'agentTasks' queries and this badge drops
+  // immediately, instead of staying stale until the next poll.
+  const { data: newTasks } = useQuery({
+    queryKey: ['agentTasks', 'new'],
+    queryFn: async () => (await getTasks('new')).tasks ?? [],
+    refetchInterval: 60_000,
+    staleTime: 10_000,
+  });
+  const newTaskCount = Array.isArray(newTasks) ? newTasks.length : 0;
+
   return (
     <AgentTab.Navigator
       screenOptions={({ route }) => ({
@@ -215,7 +233,11 @@ const AgentTabs = () => {
       })}
     >
       <AgentTab.Screen name="Dashboard" component={AgentDashboardScreen} />
-      <AgentTab.Screen name="Tasks" component={AgentTaskListScreen} />
+      <AgentTab.Screen
+        name="Tasks"
+        component={AgentTaskListScreen}
+        options={{ tabBarBadge: newTaskCount > 0 ? newTaskCount : undefined }}
+      />
       <AgentTab.Screen name="Earnings" component={AgentEarningsScreen} />
       <AgentTab.Screen name="Referral" component={AgentReferralScreen} />
       <AgentTab.Screen name="Profile" component={AgentProfileScreen} />

@@ -41,7 +41,10 @@ export interface BookingCardItem {
 
 export interface BookingCardProps {
   booking: BookingCardItem;
-  onPress?: () => void;
+  // Receives the booking so the parent can pass ONE stable callback
+  // (a single useCallback) instead of a fresh arrow per row — that's
+  // what lets the React.memo wrapper below actually skip re-renders.
+  onPress?: (booking: BookingCardItem) => void;
 }
 
 const BookingCard: React.FC<BookingCardProps> = ({ booking, onPress }) => {
@@ -55,7 +58,7 @@ const BookingCard: React.FC<BookingCardProps> = ({ booking, onPress }) => {
   };
   const handlePress = (): void => {
     haptics.tap();
-    onPress?.();
+    onPress?.(booking);
   };
 
   const getStatusColor = (): string => {
@@ -174,9 +177,9 @@ const BookingCard: React.FC<BookingCardProps> = ({ booking, onPress }) => {
             const label = formatBookingAddress(booking.address || booking.service_address);
             if (!label) return null;
             return (
-              <View style={styles.detailRow}>
-                <Text style={styles.detailLabel}>Address:</Text>
-                <Text style={styles.detailValue} numberOfLines={2}>
+              <View style={styles.addressRow}>
+                <Text style={styles.addressLabel}>Address:</Text>
+                <Text style={styles.addressValue} numberOfLines={3}>
                   {label}
                 </Text>
               </View>
@@ -200,12 +203,53 @@ const styles = StyleSheet.create({
   bookingInfo: { flex: 1 },
   bookingNumber: { fontSize: SIZES.SMALL, fontWeight: 'bold', color: COLORS.BLACK },
   serviceName: { fontSize: SIZES.FONT, color: COLORS.BLACK, flex: 1 },
-  statusBadge: { paddingHorizontal: SIZES.BASE / 2, paddingVertical: SIZES.BASE / 4, borderRadius: BORDER_RADIUS.SMALL, minWidth: 80 },
-  statusText: { fontSize: SIZES.SMALL, fontWeight: '600', color: COLORS.WHITE },
+  // The pill has a fixed minWidth so the colour band reads as a button
+  // rather than tightly hugging short words ("Pending", "Accepted").
+  // alignItems + justifyContent centre the label inside that fixed
+  // width — without these, the Text sat flush against the left edge
+  // and looked off-balance against longer labels like "Docs Collected".
+  // textAlign:'center' belt-and-braces in case the View ever grows
+  // taller (multi-line label) or the layout system shifts.
+  statusBadge: {
+    paddingHorizontal: SIZES.BASE / 2,
+    paddingVertical: SIZES.BASE / 4,
+    borderRadius: BORDER_RADIUS.SMALL,
+    minWidth: 80,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statusText: {
+    fontSize: SIZES.SMALL,
+    fontWeight: '600',
+    color: COLORS.WHITE,
+    textAlign: 'center',
+  },
   details: { marginTop: SIZES.BASE / 2 },
   detailRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: SIZES.BASE / 4 },
   detailLabel: { fontSize: SIZES.SMALL, color: COLORS.GRAY },
   detailValue: { fontSize: SIZES.SMALL, fontWeight: '600', color: COLORS.BLACK },
+  // Address gets its own row: the value is `flex: 1` so a long
+  // address wraps WITHIN the card instead of running off the right
+  // edge, and `flex-start` keeps the "Address:" label aligned to the
+  // top of a multi-line value.
+  addressRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    paddingVertical: SIZES.BASE / 4,
+  },
+  addressLabel: {
+    fontSize: SIZES.SMALL,
+    color: COLORS.GRAY,
+    marginRight: 10,
+  },
+  addressValue: {
+    flex: 1,
+    fontSize: SIZES.SMALL,
+    fontWeight: '600',
+    color: COLORS.BLACK,
+    textAlign: 'right',
+  },
   paidPill: {
     backgroundColor: '#D1FAE5',
     paddingHorizontal: 8,
@@ -231,4 +275,9 @@ const styles = StyleSheet.create({
   },
 });
 
-export default BookingCard;
+// Memoized — BookingCard renders inside a FlatList. The `booking`
+// prop is referentially stable across refetches (TanStack Query's
+// structural sharing reuses unchanged row objects) and `onPress` is a
+// single stable callback from the parent, so memo lets unchanged rows
+// skip re-rendering when the list updates.
+export default React.memo(BookingCard);

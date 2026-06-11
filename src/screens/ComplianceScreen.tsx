@@ -19,8 +19,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import MaterialIcon from 'react-native-vector-icons/MaterialIcons';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import * as ImagePicker from 'expo-image-picker';
-import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
+import { captureWithCrop, pickWithCrop, isActivityLauncherError } from '../utils/cropPicker';
 // expo-file-system v18 (Expo SDK 54+) deprecated `createDownloadResumable`
 // + `cacheDirectory` on the main entry — they now live under the
 // `expo-file-system/legacy` sub-path. Trying that first means the resumable
@@ -80,17 +79,65 @@ interface PickedFile {
   type: string;
 }
 
-const COMPLIANCE_TYPES: { value: ComplianceType; label: string }[] = [
-  { value: 'factory_license', label: 'Factory License' },
-  { value: 'fire_noc', label: 'Fire NOC' },
-  { value: 'pollution_noc', label: 'Pollution NOC' },
-  { value: 'gst_certificate', label: 'GST' },
-  { value: 'incorporation', label: 'Incorporation' },
-  { value: 'iso_cert', label: 'ISO' },
-  { value: 'trade_license', label: 'Trade License' },
-  { value: 'esi_pf', label: 'ESI/PF' },
-  { value: 'other', label: 'Other' },
+// Document types shown as picker chips in the Smart Alert upload modal.
+//   • key            — unique chip id (also drives the active-chip state)
+//   • label          — chip text + auto-filled into document_name
+//   • complianceType — the backend `compliance_type` ENUM value to store
+//
+// The backend ENUM only has the 9 business/industrial values. Common
+// citizen-document types (Aadhaar, PAN, Driving Licence, …) therefore
+// store as `complianceType: 'other'` with the real name kept in the
+// free-text `document_name` — the Smart Alert monitoring is driven by
+// `expiry_date`, not by the type, so alerts work identically.
+const COMPLIANCE_TYPES: {
+  key: string;
+  label: string;
+  complianceType: ComplianceType;
+}[] = [
+  // ─── Business / industrial (proper ENUM values) ───────────────────
+  { key: 'factory_license', label: 'Factory License', complianceType: 'factory_license' },
+  { key: 'fire_noc', label: 'Fire NOC', complianceType: 'fire_noc' },
+  { key: 'pollution_noc', label: 'Pollution NOC', complianceType: 'pollution_noc' },
+  { key: 'gst_certificate', label: 'GST', complianceType: 'gst_certificate' },
+  { key: 'incorporation', label: 'Incorporation', complianceType: 'incorporation' },
+  { key: 'iso_cert', label: 'ISO', complianceType: 'iso_cert' },
+  { key: 'trade_license', label: 'Trade License', complianceType: 'trade_license' },
+  { key: 'esi_pf', label: 'ESI / PF', complianceType: 'esi_pf' },
+  // ─── Common citizen documents (store as 'other' + document_name) ──
+  { key: 'aadhaar', label: 'Aadhaar Card', complianceType: 'other' },
+  { key: 'pan_card', label: 'PAN Card', complianceType: 'other' },
+  { key: 'voter_id', label: 'Voter ID', complianceType: 'other' },
+  { key: 'ration_card', label: 'Ration Card', complianceType: 'other' },
+  { key: 'driving_licence', label: 'Driving Licence', complianceType: 'other' },
+  { key: 'passport', label: 'Passport', complianceType: 'other' },
+  { key: 'vehicle_rc', label: 'Vehicle RC', complianceType: 'other' },
+  { key: 'vehicle_insurance', label: 'Vehicle Insurance', complianceType: 'other' },
+  { key: 'health_insurance', label: 'Health Insurance', complianceType: 'other' },
+  { key: 'life_policy', label: 'LIC / Life Policy', complianceType: 'other' },
+  { key: 'income_certificate', label: 'Income Certificate', complianceType: 'other' },
+  { key: 'caste_certificate', label: 'Caste Certificate', complianceType: 'other' },
+  { key: 'domicile_certificate', label: 'Domicile Certificate', complianceType: 'other' },
+  { key: 'birth_certificate', label: 'Birth Certificate', complianceType: 'other' },
+  { key: 'marriage_certificate', label: 'Marriage Certificate', complianceType: 'other' },
+  { key: 'msme_udyam', label: 'MSME / Udyam', complianceType: 'other' },
+  { key: 'fssai', label: 'FSSAI / Food License', complianceType: 'other' },
+  { key: 'pf_epfo', label: 'PF / EPFO', complianceType: 'other' },
+  // ─── Catch-all ────────────────────────────────────────────────────
+  { key: 'other', label: 'Other', complianceType: 'other' },
 ];
+
+// A document belongs to the BUSINESS / INDUSTRIAL register when its
+// stored compliance_type is one of the real industrial ENUM values.
+// Everything else — common citizen documents (stored as 'other') and
+// untyped register rows — belongs to the COMMON register. This rule
+// is consistent with the upload chip split (industrial chips carry a
+// real complianceType; common chips carry 'other').
+const BUSINESS_COMPLIANCE_TYPES = new Set<string>([
+  'factory_license', 'fire_noc', 'pollution_noc', 'gst_certificate',
+  'incorporation', 'iso_cert', 'trade_license', 'esi_pf',
+]);
+const isBusinessDoc = (d: { compliance_type?: string | null }): boolean =>
+  !!d.compliance_type && BUSINESS_COMPLIANCE_TYPES.has(d.compliance_type);
 
 const MONTH_LABELS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -117,14 +164,15 @@ const monthKey = (iso: string): string => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 };
 
-// "yellow" status (action-soon, <=60 days) maps to ACCENT — the same
-// gold-yellow used for the critical "Plan renewal" chip. WARNING is
-// an orange tone reserved for harsher signals; using it here made
-// the action-soon state read as alarming and inconsistent with the
-// rest of the compliance UI.
+// "yellow" status (action-soon, <=60 days) uses a bright CANARY
+// YELLOW — distinct from the app's gold/amber ACCENT. Canary reads
+// as a clear "heads-up" without the alarming feel of orange.
+// NOTE: canary yellow is bright, so anything that puts TEXT on this
+// colour must use dark text (see regStatusPillText handling).
+const CANARY_YELLOW = '#FFD400';
 const statusColor = (s: ComplianceDoc['status']): string => {
   if (s === 'red') return COLORS.ERROR;
-  if (s === 'yellow') return COLORS.ACCENT;
+  if (s === 'yellow') return CANARY_YELLOW;
   return COLORS.SUCCESS;
 };
 
@@ -172,7 +220,9 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
   const [renewingId, setRenewingId] = useState<string | null>(null);
 
   // Upload form state
-  const [pickedType, setPickedType] = useState<ComplianceType>('factory_license');
+  // Holds the selected chip's `key` (see COMPLIANCE_TYPES) — not the
+  // backend ENUM value, since several common types share 'other'.
+  const [pickedType, setPickedType] = useState<string>('factory_license');
   const [expiryDate, setExpiryDate] = useState<Date>(() => {
     const d = new Date();
     d.setFullYear(d.getFullYear() + 1);
@@ -326,7 +376,16 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
       setPickedFile({ uri: f.uri, name, type: mime });
     } catch (e: any) {
       console.log('compliance file pick error:', e?.message || e);
-      showToast('File picker error', e?.message || 'Could not open file picker', 'error');
+      // Aggressive-memory OEMs can recreate the host Activity while the
+      // system file picker is open, leaving expo's launcher unregistered.
+      // Steer the user to Camera/Gallery, which always works.
+      showToast(
+        'File picker unavailable',
+        isActivityLauncherError(e)
+          ? 'This device blocked the file picker. Please use Camera or Gallery to photograph the document instead.'
+          : e?.message || 'Could not open file picker',
+        'error',
+      );
     }
   };
 
@@ -398,10 +457,19 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
       setUploading(true);
       haptics.tap();
       const expiry_date = expiryDate.toISOString().slice(0, 10); // YYYY-MM-DD
+      // Resolve the picked chip's key → the backend ENUM value. Common
+      // citizen types resolve to 'other'; their real name rides along
+      // in document_name.
+      const resolvedType =
+        COMPLIANCE_TYPES.find((t) => t.key === pickedType)?.complianceType || 'other';
       await uploadComplianceDoc(pickedFile, {
-        compliance_type: pickedType,
+        compliance_type: resolvedType,
         document_name: documentName.trim() || undefined,
-        issuing_authority: issuingAuthority.trim() || undefined,
+        // Common / consumer docs have no statutory department — never
+        // save an authority for them, even if a stale value lingers in
+        // the field from a type the user picked then switched away from.
+        issuing_authority:
+          resolvedType === 'other' ? undefined : issuingAuthority.trim() || undefined,
         document_number: documentNumber.trim() || undefined,
         issue_date: issueDate ? issueDate.toISOString().slice(0, 10) : undefined,
         expiry_date,
@@ -765,14 +833,16 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
               style={[
                 styles.renewBtn,
                 {
-                  backgroundColor: doc.status === 'red' ? COLORS.ERROR : COLORS.ACCENT,
+                  // Yellow-status "Plan Renewal" button now uses the
+                  // canary yellow (was COLORS.ACCENT gold).
+                  backgroundColor: doc.status === 'red' ? COLORS.ERROR : CANARY_YELLOW,
                 },
               ]}
               onPress={() => handleRenew(doc)}
               disabled={renewingId === doc.id}
             >
               {renewingId === doc.id ? (
-                <ActivityIndicator color="#fff" />
+                <ActivityIndicator color={doc.status === 'red' ? '#fff' : COLORS.PRIMARY_DARK} />
               ) : (
                 <Text
                   style={[
@@ -787,6 +857,129 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
           )}
         </View>
       </View>
+    );
+  };
+
+  // One type-picker chip — shared by the Common + Business chip
+  // sections in the upload modal.
+  const renderTypeChip = (t: { key: string; label: string }) => {
+    const active = pickedType === t.key;
+    return (
+      <TouchableOpacity
+        key={t.key}
+        onPress={() => {
+          haptics.tap();
+          setPickedType(t.key);
+          // Auto-fill the document name from the chip label (except
+          // "Other", which has no canonical name).
+          if (t.key !== 'other') setDocumentName(t.label);
+        }}
+        style={[styles.chip, active && styles.chipActive]}
+      >
+        <Text style={[styles.chipText, active && styles.chipTextActive]}>
+          {t.label}
+        </Text>
+      </TouchableOpacity>
+    );
+  };
+
+  // One register table row — shared by the Common + Business
+  // register sections. `i` is the per-section index (each section
+  // numbers its rows from 1).
+  const renderRegRow = (d: ComplianceDoc, i: number, showAuthority: boolean) => {
+    const dotColor = statusColor(d.status);
+    const statusWord =
+      d.status === 'red'
+        ? 'High alert'
+        : d.status === 'yellow'
+          ? 'Little alert'
+          : 'Safe';
+    return (
+      <TouchableOpacity
+        key={d.id}
+        style={styles.regRow}
+        activeOpacity={0.7}
+        onPress={() => openEdit(d)}
+      >
+        <Text style={styles.cellSno}>{i + 1}</Text>
+        <Text style={styles.cellName} numberOfLines={2}>
+          {d.document_name || d.label}
+        </Text>
+        {showAuthority && (
+          <Text style={styles.cellAuthority} numberOfLines={2}>
+            {d.issuing_authority || '—'}
+          </Text>
+        )}
+        <Text style={styles.cellDocNo} numberOfLines={1}>
+          {d.document_number || '—'}
+        </Text>
+        <Text style={styles.cellDate}>
+          {d.issue_date
+            ? new Date(d.issue_date).toLocaleDateString('en-GB').replace(/\//g, '.')
+            : '—'}
+        </Text>
+        <Text style={styles.cellDate}>
+          {d.expiry_date
+            ? new Date(d.expiry_date).toLocaleDateString('en-GB').replace(/\//g, '.')
+            : '—'}
+        </Text>
+        <View style={styles.cellStatus}>
+          <View style={[styles.regStatusPill, { backgroundColor: dotColor }]}>
+            <Text
+              style={[
+                styles.regStatusPillText,
+                d.status === 'yellow' && styles.regStatusPillTextOnYellow,
+              ]}
+            >
+              {statusWord}
+            </Text>
+          </View>
+          <Text style={styles.statusDays}>
+            {d.daysLeft != null
+              ? d.daysLeft < 0
+                ? `Expired ${Math.abs(d.daysLeft)}d ago`
+                : `${d.daysLeft}d left`
+              : ''}
+          </Text>
+        </View>
+        <View style={styles.cellPdfWrap}>
+          <TouchableOpacity
+            style={styles.cellPdfPreview}
+            onPress={(e) => {
+              e.stopPropagation();
+              handlePreview(d);
+            }}
+          >
+            {previewingId === d.id ? (
+              <ActivityIndicator size="small" color={COLORS.PRIMARY} />
+            ) : (
+              <View style={styles.pdfThumb}>
+                <Text style={styles.pdfThumbIcon}>
+                  {d.mime_type?.includes('pdf') ? '📄' : '🖼️'}
+                </Text>
+                <Text style={styles.pdfThumbText} numberOfLines={1}>
+                  View
+                </Text>
+              </View>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.cellDeleteBtn}
+            onPress={(e) => {
+              e.stopPropagation();
+              confirmDelete(d);
+            }}
+            disabled={deletingId === d.id}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            {deletingId === d.id ? (
+              <ActivityIndicator size="small" color="#0F172A" />
+            ) : (
+              <MaterialIcon name="delete-outline" size={22} color="#0F172A" />
+            )}
+          </TouchableOpacity>
+        </View>
+      </TouchableOpacity>
     );
   };
 
@@ -851,7 +1044,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
           <View style={{ width: 64 }} />
         </View>
         <Text style={styles.headerSubtitle}>
-          Smart alerts for your factory licenses, NOCs and certificates
+          Smart alerts for all your documents, licences and certificates
         </Text>
       </View>
 
@@ -876,7 +1069,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 <Text style={styles.calendarLegendText}>Critical (≤30 days)</Text>
               </View>
               <View style={styles.calendarLegendItem}>
-                <View style={[styles.calendarLegendSwatch, { backgroundColor: COLORS.ACCENT }]} />
+                <View style={[styles.calendarLegendSwatch, { backgroundColor: CANARY_YELLOW }]} />
                 <Text style={styles.calendarLegendText}>Action soon (≤60 days)</Text>
               </View>
               <View style={styles.calendarLegendItem}>
@@ -894,15 +1087,16 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                   m.status === 'red'
                     ? COLORS.ERROR
                     : m.status === 'yellow'
-                      ? COLORS.ACCENT
+                      ? CANARY_YELLOW
                       : m.status === 'green'
                         ? COLORS.SUCCESS
                         : null;
                 // When the month has expiring docs, the whole cell is now
-                // a filled colored box (was a small 8px dot before — too
-                // subtle to scan at a glance). Text colors flip to white
-                // on the colored fill for legibility.
+                // a filled colored box. Text flips to white on red/green
+                // fills, but to DARK on the bright canary-yellow fill
+                // (white would be unreadable on it).
                 const isFilled = !!fillColor;
+                const isYellowFill = m.status === 'yellow';
                 return (
                   <TouchableOpacity
                     key={m.key}
@@ -920,6 +1114,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                       style={[
                         styles.calendarMonth,
                         isFilled && styles.calendarMonthFilled,
+                        isYellowFill && styles.calendarTextOnYellow,
                       ]}
                     >
                       {m.label}
@@ -928,6 +1123,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                       style={[
                         styles.calendarYear,
                         isFilled && styles.calendarYearFilled,
+                        isYellowFill && styles.calendarTextOnYellow,
                       ]}
                     >
                       {String(m.year).slice(2)}
@@ -958,7 +1154,7 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
           </>
         ) : (
           <>
-            {/* ─── Personal Compliance Register ──────────────────────
+            {/* ─── Compliance Register (Common + Business) ───────────
                 Spreadsheet-style table — wide enough that we wrap it in
                 a horizontal ScrollView. Sticky-ish first column shows the
                 row index + tap-to-edit. Status pill auto-colors green /
@@ -975,120 +1171,94 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 style={styles.registerScroll}
               >
                 <View style={styles.registerTable}>
-                  {/* Header row */}
-                  <View style={[styles.regRow, styles.regHeader]}>
-                    <Text style={[styles.cellSno, styles.regHeaderText]}>S. No</Text>
-                    <Text style={[styles.cellName, styles.regHeaderText]}>Document Name</Text>
-                    <Text style={[styles.cellAuthority, styles.regHeaderText]}>
-                      Statutory Department / Concerned Office
-                    </Text>
-                    <Text style={[styles.cellDocNo, styles.regHeaderText]}>Document No</Text>
-                    <Text style={[styles.cellDate, styles.regHeaderText]}>Date of Issue</Text>
-                    <Text style={[styles.cellDate, styles.regHeaderText]}>Valid Upto</Text>
-                    <Text style={[styles.cellStatus, styles.regHeaderText]}>Status</Text>
-                    <Text style={[styles.cellPdfWrap, styles.regHeaderText]}>PDF/JPEG</Text>
-                  </View>
-
-                  {/* Data rows — sorted by urgency (most critical first) */}
-                  {[...grouped.red, ...grouped.yellow, ...grouped.green].map((d, i) => {
-                    const dotColor = statusColor(d.status);
-                    const statusWord =
-                      d.status === 'red'
-                        ? 'High alert'
-                        : d.status === 'yellow'
-                          ? 'Little alert'
-                          : 'Safe';
+                  {(() => {
+                    const allSorted = [
+                      ...grouped.red,
+                      ...grouped.yellow,
+                      ...grouped.green,
+                    ];
+                    const common = allSorted.filter((d) => !isBusinessDoc(d));
+                    const business = allSorted.filter((d) => isBusinessDoc(d));
+                    // "Statutory Department / Concerned Office" applies
+                    // ONLY to business / industrial documents — common /
+                    // personal docs (Aadhaar, PAN, …) have no statutory
+                    // department. So the whole column (header + every
+                    // cell) is shown only when the register actually
+                    // holds a business document; an all-common register
+                    // drops the column entirely.
+                    const showAuthority = business.length > 0;
                     return (
-                      <TouchableOpacity
-                        key={d.id}
-                        style={styles.regRow}
-                        activeOpacity={0.7}
-                        onPress={() => openEdit(d)}
-                      >
-                        <Text style={styles.cellSno}>{i + 1}</Text>
-                        <Text style={styles.cellName} numberOfLines={2}>
-                          {d.document_name || d.label}
-                        </Text>
-                        <Text style={styles.cellAuthority} numberOfLines={2}>
-                          {d.issuing_authority || '—'}
-                        </Text>
-                        <Text style={styles.cellDocNo} numberOfLines={1}>
-                          {d.document_number || '—'}
-                        </Text>
-                        <Text style={styles.cellDate}>
-                          {d.issue_date
-                            ? new Date(d.issue_date).toLocaleDateString('en-GB').replace(/\//g, '.')
-                            : '—'}
-                        </Text>
-                        <Text style={styles.cellDate}>
-                          {d.expiry_date
-                            ? new Date(d.expiry_date).toLocaleDateString('en-GB').replace(/\//g, '.')
-                            : '—'}
-                        </Text>
-                        <View style={styles.cellStatus}>
-                          <View
-                            style={[styles.regStatusPill, { backgroundColor: dotColor }]}
-                          >
-                            <Text style={styles.regStatusPillText}>{statusWord}</Text>
-                          </View>
-                          <Text style={styles.statusDays}>
-                            {d.daysLeft != null
-                              ? d.daysLeft < 0
-                                ? `Expired ${Math.abs(d.daysLeft)}d ago`
-                                : `${d.daysLeft}d left`
-                              : ''}
+                      <>
+                        {/* Header row — a plain static row (NOT inside the
+                            scroll below), so these column headings stay
+                            visible however long the document list grows. */}
+                        <View style={[styles.regRow, styles.regHeader]}>
+                          <Text style={[styles.cellSno, styles.regHeaderText]}>S. No</Text>
+                          <Text style={[styles.cellName, styles.regHeaderText]}>Document Name</Text>
+                          {showAuthority && (
+                            <Text style={[styles.cellAuthority, styles.regHeaderText]}>
+                              Statutory Department / Concerned Office
+                            </Text>
+                          )}
+                          <Text style={[styles.cellDocNo, styles.regHeaderText]}>Document No</Text>
+                          <Text style={[styles.cellDate, styles.regHeaderText]}>Date of Issue</Text>
+                          <Text style={[styles.cellDate, styles.regHeaderText]}>Valid Upto</Text>
+                          <Text style={[styles.cellStatus, styles.regHeaderText, styles.regHeaderCenter]}>
+                            Status
+                          </Text>
+                          <Text style={[styles.cellPdfWrap, styles.regHeaderText, styles.regHeaderCenter]}>
+                            PDF/JPEG
                           </Text>
                         </View>
-                        <View style={styles.cellPdfWrap}>
-                          <TouchableOpacity
-                            style={styles.cellPdfPreview}
-                            onPress={(e) => {
-                              e.stopPropagation();
-                              handlePreview(d);
-                            }}
-                          >
-                            {previewingId === d.id ? (
-                              <ActivityIndicator size="small" color={COLORS.PRIMARY} />
-                            ) : (
-                              <View style={styles.pdfThumb}>
-                                <Text style={styles.pdfThumbIcon}>
-                                  {d.mime_type?.includes('pdf') ? '📄' : '🖼️'}
-                                </Text>
-                                <Text style={styles.pdfThumbText} numberOfLines={1}>
-                                  View
-                                </Text>
-                              </View>
-                            )}
-                          </TouchableOpacity>
-                          {/* Quick delete — removes the row from the
-                              register without having to open the edit
-                              sheet first. Same confirmation dialog the
-                              edit-sheet button uses, so the destructive
-                              action still needs explicit confirmation. */}
-                          <TouchableOpacity
-                            style={styles.cellDeleteBtn}
-                            onPress={(e) => {
-                              e.stopPropagation();
-                              confirmDelete(d);
-                            }}
-                            disabled={deletingId === d.id}
-                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                          >
-                            {deletingId === d.id ? (
-                              <ActivityIndicator size="small" color="#0F172A" />
-                            ) : (
-                              // Line-drawing trash can (MaterialIcons
-                              // delete-outline) — matches the reference
-                              // icon. Rendered in slate-900 with no
-                              // background fill per the request to drop
-                              // the red chip styling.
-                              <MaterialIcon name="delete-outline" size={22} color="#0F172A" />
-                            )}
-                          </TouchableOpacity>
-                        </View>
-                      </TouchableOpacity>
+
+                        {/* Data rows scroll vertically WITHIN this bounded
+                            box. The header above is a SIBLING of this
+                            ScrollView, not a child, so it stays frozen
+                            while a long list scrolls. Split into two
+                            sub-registers: Common and Business / Industrial,
+                            each urgency-sorted and numbered from 1. Width
+                            drops with the Statutory column so the rows
+                            still line up under the header. */}
+                        <ScrollView
+                          style={[
+                            styles.registerDataScroll,
+                            { width: showAuthority ? 870 : 700 },
+                          ]}
+                          nestedScrollEnabled
+                          showsVerticalScrollIndicator
+                        >
+                          <View style={styles.regSectionRow}>
+                            <Text style={styles.regSectionText}>
+                              👤  Common / Consumer
+                            </Text>
+                          </View>
+                          {common.length > 0 ? (
+                            common.map((d, i) => renderRegRow(d, i, showAuthority))
+                          ) : (
+                            <View style={styles.regRow}>
+                              <Text style={styles.regEmptyCell}>
+                                No common documents yet — tap “Add +”.
+                              </Text>
+                            </View>
+                          )}
+                          <View style={styles.regSectionRow}>
+                            <Text style={styles.regSectionText}>
+                              🏭  Business / Industrial
+                            </Text>
+                          </View>
+                          {business.length > 0 ? (
+                            business.map((d, i) => renderRegRow(d, i, showAuthority))
+                          ) : (
+                            <View style={styles.regRow}>
+                              <Text style={styles.regEmptyCell}>
+                                No business documents yet — tap “Add +”.
+                              </Text>
+                            </View>
+                          )}
+                        </ScrollView>
+                      </>
                     );
-                  })}
+                  })()}
                 </View>
               </ScrollView>
 
@@ -1140,39 +1310,22 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
               showsVerticalScrollIndicator={false}
               keyboardShouldPersistTaps="handled"
             >
-              {/* Type chips */}
-              <Text style={styles.fieldLabel}>Document type</Text>
+              {/* Type chips — split into two sections so common
+                  (citizen) and industrial (business) customers each
+                  see the document types relevant to them. */}
+              <Text style={styles.fieldLabel}>Common / Consumer</Text>
               <View style={styles.chipsWrap}>
-                {COMPLIANCE_TYPES.map((t) => {
-                  const active = pickedType === t.value;
-                  return (
-                    <TouchableOpacity
-                      key={t.value}
-                      onPress={() => {
-                        haptics.tap();
-                        setPickedType(t.value);
-                        // Auto-fill the document name from the chip label so
-                        // the user doesn't have to retype it. ALWAYS
-                        // overwrite (except for "Other" which has no
-                        // canonical label) — the user can still edit the
-                        // text afterwards if they want a custom title.
-                        // Previous behaviour preserved user typing, which
-                        // meant tapping a chip after typing one letter
-                        // by accident left the field stuck without
-                        // updating, confusing users into thinking the
-                        // chip didn't auto-fill at all.
-                        if (t.value !== 'other') {
-                          setDocumentName(t.label);
-                        }
-                      }}
-                      style={[styles.chip, active && styles.chipActive]}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t.label}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
+                {COMPLIANCE_TYPES.filter((t) => t.complianceType === 'other').map(
+                  renderTypeChip,
+                )}
+              </View>
+              <Text style={[styles.fieldLabel, { marginTop: 14 }]}>
+                Business / Industrial
+              </Text>
+              <View style={styles.chipsWrap}>
+                {COMPLIANCE_TYPES.filter((t) => t.complianceType !== 'other').map(
+                  renderTypeChip,
+                )}
               </View>
 
               {/* Document Name (free-text, overrides the chip label in the
@@ -1187,15 +1340,25 @@ const ComplianceScreen: React.FC<Props> = ({ navigation }) => {
                 placeholderTextColor={COLORS.TEXT_SECONDARY}
               />
 
-              {/* Statutory Department / Concerned Office */}
-              <Text style={styles.fieldLabel}>Statutory Department / Concerned Office</Text>
-              <TextInput
-                style={styles.noteInput}
-                value={issuingAuthority}
-                onChangeText={setIssuingAuthority}
-                placeholder="e.g. RTO Goa, Pollution Dept (Govt. of Goa), Ashok Kumar"
-                placeholderTextColor={COLORS.TEXT_SECONDARY}
-              />
+              {/* Statutory Department / Concerned Office — business /
+                  industrial documents only. Common / consumer docs
+                  (Aadhaar, PAN, …) have no statutory department, so this
+                  field is hidden once a common type chip is picked. */}
+              {COMPLIANCE_TYPES.find((t) => t.key === pickedType)?.complianceType !==
+                'other' && (
+                <>
+                  <Text style={styles.fieldLabel}>
+                    Statutory Department / Concerned Office
+                  </Text>
+                  <TextInput
+                    style={styles.noteInput}
+                    value={issuingAuthority}
+                    onChangeText={setIssuingAuthority}
+                    placeholder="e.g. RTO Goa, Pollution Dept (Govt. of Goa), Ashok Kumar"
+                    placeholderTextColor={COLORS.TEXT_SECONDARY}
+                  />
+                </>
+              )}
 
               {/* Document Number */}
               <Text style={styles.fieldLabel}>Document No</Text>
@@ -1704,6 +1867,20 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     overflow: 'hidden',
   },
+  // The register body scrolls vertically inside this fixed-width,
+  // capped-height box so a long document list scrolls HERE instead of
+  // stretching the whole page — and the header row above (its sibling)
+  // stays put. The width must equal one regRow's total width so the
+  // body columns line up with the static header:
+  //   cellSno 44 + cellName 130 + cellAuthority 170 + cellDocNo 130 +
+  //   cellDate 90 + cellDate 90 + cellStatus 100 + cellPdfWrap 100 = 854,
+  //   + regRow paddingHorizontal (8 × 2) = 870.
+  // An explicit width is also required because a vertical ScrollView
+  // can't size its cross-axis from inside a horizontal ScrollView.
+  registerDataScroll: {
+    width: 870,
+    maxHeight: 340,
+  },
   regRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1716,11 +1893,40 @@ const styles = StyleSheet.create({
   regHeader: {
     backgroundColor: '#5B7FB8',
   },
+  // Full-width sub-register divider row ("Common Documents" /
+  // "Business / Industrial") inside the compliance table.
+  regSectionRow: {
+    alignSelf: 'stretch',
+    backgroundColor: '#EEF3F9',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+  },
+  regSectionText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#0D3B66',
+    letterSpacing: 0.3,
+  },
+  regEmptyCell: {
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    fontSize: 12,
+    color: '#94A3B8',
+    fontStyle: 'italic',
+  },
   regHeaderText: {
     color: COLORS.WHITE,
     fontWeight: '800',
     fontSize: 11,
     letterSpacing: 0.2,
+  },
+  // Centres a header label over a centered-content column (Status,
+  // PDF/JPEG). Those data cells centre their content, so without this
+  // the header text sits left of the column it labels.
+  regHeaderCenter: {
+    textAlign: 'center',
   },
   cellSno: { width: 44, fontSize: 12, color: COLORS.TEXT, textAlign: 'center' },
   cellName: { width: 130, fontSize: 12, color: COLORS.TEXT, paddingHorizontal: 6, fontWeight: '600' },
@@ -1762,6 +1968,15 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     fontSize: 10,
     letterSpacing: 0.2,
+  },
+  // Dark text for the canary-yellow status pill — white is unreadable
+  // on bright yellow.
+  regStatusPillTextOnYellow: {
+    color: '#3A2E00',
+  },
+  // Dark text for canary-yellow calendar month cells.
+  calendarTextOnYellow: {
+    color: '#3A2E00',
   },
   statusDays: {
     fontSize: 9,

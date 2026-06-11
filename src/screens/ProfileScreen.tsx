@@ -5,15 +5,19 @@ import {
   Switch, KeyboardAvoidingView, Platform, Image,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-import * as ImagePicker from 'expo-image-picker';
+import { captureWithCrop, pickWithCrop, isPermissionDeniedError } from '../utils/cropPicker';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { clearAuthSession } from '../utils/storage';
 import { getProfile, updateProfile, getMyBookings, getMyDocuments, uploadAvatar, deleteAvatar } from '../services/api';
 import * as api from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
+// expo-image for the REMOTE avatar — native disk caching avoids
+// re-downloading the profile pic on every screen visit.
+import { Image as ExpoImage } from 'expo-image';
 import {
   STRINGS,
   PRIVACY_POLICY,
@@ -110,6 +114,7 @@ const fetchProfileStats = async (): Promise<ProfileStats> => {
 
 const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   const queryClient = useQueryClient();
+  const insets = useSafeAreaInsets();
 
   // ─── Server state via TanStack Query ──────────────────────────────
   // `profile` is the API user object; `stats` is the booking/KYC
@@ -150,6 +155,16 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   // Avatar upload state — flips while the camera/gallery picker is open
   // and during the multipart upload, dimming the camera-overlay button.
   const [avatarUploading, setAvatarUploading] = useState<boolean>(false);
+  // Full-screen avatar preview (WhatsApp-style) — opens when the user
+  // taps their profile picture. The camera-overlay button still
+  // handles changing the photo; tapping the image itself = preview.
+  const [avatarPreviewOpen, setAvatarPreviewOpen] = useState<boolean>(false);
+  // True when the preview image fails to load — shows a fallback
+  // message + the close button instead of a stuck black screen.
+  const [avatarPreviewError, setAvatarPreviewError] = useState<boolean>(false);
+  // True while the preview image is still downloading — drives a
+  // spinner so the user sees "loading" instead of a blank black box.
+  const [avatarPreviewLoading, setAvatarPreviewLoading] = useState<boolean>(false);
 
   // Feature modals
   const [showReferral, setShowReferral] = useState<boolean>(false);
@@ -289,9 +304,9 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
   // the useQuery calls + useRefetchOnFocus at the top of the component.
 
   // Avatar picker — bottom-sheet style choice between Camera and Gallery,
-  // then resizes / crops to a 1:1 square via the picker's allowsEditing
-  // option. Uploads with auth, then patches local state with the returned
-  // URL so the new avatar shows immediately (no refetch needed).
+  // then runs the shared branded cropper. Uploads with auth, then patches
+  // local state with the returned URL so the new avatar shows immediately
+  // (no refetch needed).
   const pickAvatar = (): void => {
     if (avatarUploading) return;
     haptics.tap();
@@ -358,41 +373,22 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
   const doPickAvatar = async (source: 'camera' | 'gallery'): Promise<void> => {
     try {
-      // Permissions
-      if (source === 'camera') {
-        const perm = await ImagePicker.requestCameraPermissionsAsync();
-        if (!perm.granted) {
-          Alert.alert('Permission needed', 'Camera access is required to take a photo.');
-          return;
-        }
-      } else {
-        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-        if (!perm.granted) {
-          Alert.alert('Permission needed', 'Photo library access is required.');
-          return;
-        }
-      }
-
-      const result: any = source === 'camera'
-        ? await ImagePicker.launchCameraAsync({
-            mediaTypes: ImagePicker.MediaTypeOptions.Images,
-            allowsEditing: true,
-            aspect: [1, 1],
-            quality: 0.7,
-          })
-        : await ImagePicker.launchImageLibraryAsync({
-            mediaTypes: ImagePicker.MediaTypeOptions.Images,
-            allowsEditing: true,
-            aspect: [1, 1],
-            quality: 0.7,
-          });
-
-      if (result?.canceled || !result?.assets?.[0]) return;
-      const asset = result.assets[0];
-      const uri: string = asset.uri;
-      const name: string =
-        asset.fileName || `avatar_${Date.now()}.${(asset.uri.split('.').pop() || 'jpg')}`;
-      const type: string = asset.mimeType || 'image/jpeg';
+      // Use the shared react-native-image-crop-picker wrapper — the SAME
+      // branded cropper as the booking-flow doc uploads and the rep app.
+      // This replaces expo-image-picker, whose launchImageLibraryAsync /
+      // launchCameraAsync threw "Attempting to launch an unregistered
+      // ActivityResultLauncher" on devices that destroy + recreate the
+      // host Activity while the gallery/camera is open — OEMs with
+      // aggressive memory management, or phones with the "Don't keep
+      // activities" developer option ON. crop-picker uses the classic
+      // startActivityForResult path, which survives that recreation, so
+      // the crash can't happen. (cropPicker handles its own permissions.)
+      const file =
+        source === 'camera'
+          ? await captureWithCrop({ namePrefix: 'avatar' })
+          : await pickWithCrop({ namePrefix: 'avatar' });
+      if (!file) return;
+      const { uri, name, type } = file;
 
       setAvatarUploading(true);
       const { profile_pic } = await uploadAvatar({ uri, name, type });
@@ -404,6 +400,21 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     } catch (e: any) {
       console.log('avatar pick error:', e?.message || e);
       haptics.error();
+      // Permission denial (or "Don't ask again") needs an explicit path
+      // back — Android won't re-prompt and a silent failure looks like
+      // a broken button. Open Settings drops the user on the app's
+      // permission page so they can flip Photos & Videos on.
+      if (isPermissionDeniedError(e)) {
+        Alert.alert(
+          'Photo access needed',
+          'FliponeX needs access to your photos to set a profile picture. Open Settings to grant access, then try again.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ],
+        );
+        return;
+      }
       Alert.alert('Upload failed', e?.message || 'Could not update profile picture.');
     } finally {
       setAvatarUploading(false);
@@ -524,10 +535,12 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
           text: 'Logout',
           style: 'destructive',
           onPress: async () => {
-            // clearAuthSession wipes the mode too — next cold start routes
-            // to ModeSelect instead of straight back into customer tabs.
+            // clearAuthSession wipes the token, mode AND the saved nav
+            // stack. Reset straight to the ModeSelect toggle (2 apps + 2
+            // web surfaces) — going via Splash would replay the video and
+            // could resume back into the customer app.
             await clearAuthSession();
-            navigation.reset({ index: 0, routes: [{ name: 'Splash' }] });
+            navigation.reset({ index: 0, routes: [{ name: 'ModeSelect' }] });
           },
         },
       ],
@@ -575,7 +588,7 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
 
         {/* Compact sticky bar — stays pinned at the top while everything
             below scrolls. Shows just the name, mini-avatar and Edit CTA. */}
-        <View style={styles.stickyBar}>
+        <View style={[styles.stickyBar, { paddingTop: insets.top + 8 }]}>
           <View style={styles.stickyBarAvatar}>
             <Text style={styles.stickyBarAvatarText}>{initial}</Text>
           </View>
@@ -587,27 +600,10 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
               +91 {profile?.mobile || 'N/A'}
             </Text>
           </View>
-          {/* Right-side action cluster — keeps the 🌐 lang chip and
-              the Edit button glued together on the same horizontal
-              line at any screen width, with the row never wrapping
-              even when the user's name is long. flexShrink: 0 on
-              the wrapper guarantees the parent flex layout doesn't
-              squeeze these buttons into a stacked column. */}
-          <View style={styles.stickyBarActions}>
-            <TouchableOpacity
-              style={styles.stickyBarLang}
-              onPress={() => { haptics.tap(); setShowLanguage(true); }}
-              accessibilityLabel="Change language"
-            >
-              <Text style={styles.stickyBarLangText}>🌐</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.stickyBarEdit}
-              onPress={() => { haptics.tap(); setEditing(true); }}
-            >
-              <Text style={styles.stickyBarEditText}>Edit</Text>
-            </TouchableOpacity>
-          </View>
+          {/* The 🌐 language chip and Edit button were removed from this
+              sticky bar — both are already available below (Edit via the
+              hero's edit control, Language via the settings list), so the
+              duplicates here were just clutter. */}
         </View>
 
         {/* Branded hero header with big avatar (scrolls under the sticky bar).
@@ -616,17 +612,32 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
             The camera button overlay lets them pick a new photo at any time. */}
         <View style={styles.header}>
           <View style={styles.avatarRing}>
-            <View style={styles.avatar}>
+            <TouchableOpacity
+              style={styles.avatar}
+              activeOpacity={profile?.profile_pic ? 0.85 : 1}
+              onPress={() => {
+                // Tapping the picture opens a full-screen preview;
+                // changing the photo is the camera button below.
+                if (profile?.profile_pic) {
+                  haptics.tap();
+                  setAvatarPreviewError(false); // reset before opening
+                  setAvatarPreviewLoading(true); // show spinner until loaded
+                  setAvatarPreviewOpen(true);
+                }
+              }}
+            >
               {profile?.profile_pic ? (
-                <Image
+                <ExpoImage
                   source={{ uri: profile.profile_pic }}
                   style={styles.avatarImg}
-                  resizeMode="cover"
+                  contentFit="cover"
+                  cachePolicy="memory-disk"
+                  transition={150}
                 />
               ) : (
                 <Text style={styles.avatarText}>{initial}</Text>
               )}
-            </View>
+            </TouchableOpacity>
             <TouchableOpacity
               style={styles.avatarCameraBtn}
               onPress={pickAvatar}
@@ -780,7 +791,9 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
         </TouchableOpacity>
 
         <Text style={styles.version}>FlipOn Digital v1.0.0</Text>
-        <View style={{ height: 24 }} />
+        {/* Bottom spacer scales with the device's nav-bar / gesture
+            inset so the Logout button is never hidden behind it. */}
+        <View style={{ height: insets.bottom + 24 }} />
       </ScrollView>
 
       {/* Edit Profile Modal */}
@@ -1092,14 +1105,19 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>🌐 Choose Language</Text>
-            <Text style={styles.modalSubtitle}>App will display in your selected language</Text>
+            {/* Non-English rows hidden until the translation pass lands.
+                Selecting Hindi/Telugu (or Tamil/Kannada — which weren't
+                even in the i18n module) previously saved the choice but
+                left every screen rendering English, confusing users.
+                Restore the rows here, in LanguageSelectScreen's
+                LANGUAGES array, and add translation files when ready. */}
+            <Text style={styles.modalSubtitle}>
+              App will display in your selected language. More languages
+              coming soon.
+            </Text>
 
             {[
               { code: 'en', label: 'English', native: 'English' },
-              { code: 'hi', label: 'Hindi', native: 'हिन्दी' },
-              { code: 'te', label: 'Telugu', native: 'తెలుగు' },
-              { code: 'ta', label: 'Tamil', native: 'தமிழ்' },
-              { code: 'kn', label: 'Kannada', native: 'ಕನ್ನಡ' },
             ].map((l) => (
               <TouchableOpacity
                 key={l.code}
@@ -1133,6 +1151,64 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
               <Text style={{ color: '#6C757D', fontWeight: '700' }}>Close</Text>
             </TouchableOpacity>
           </View>
+        </View>
+      </Modal>
+
+      {/* ─── Avatar full-screen preview (WhatsApp-style) ─── */}
+      <Modal
+        visible={avatarPreviewOpen}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setAvatarPreviewOpen(false)}
+      >
+        {/* Plain View — the preview closes ONLY via the ✕ button (or
+            the Android back button). Tapping the image does nothing. */}
+        <View style={styles.avatarPreviewOverlay}>
+          {/* Close button — pinned below the status bar / notch via the
+              safe-area inset so it never merges with the screen top. */}
+          <TouchableOpacity
+            style={[styles.avatarPreviewClose, { top: insets.top + 10 }]}
+            onPress={() => setAvatarPreviewOpen(false)}
+            hitSlop={{ top: 16, bottom: 16, left: 16, right: 16 }}
+            accessibilityLabel="Close preview"
+          >
+            <Text style={styles.avatarPreviewCloseText}>✕</Text>
+          </TouchableOpacity>
+
+          {profile?.profile_pic && !avatarPreviewError ? (
+            <>
+              {/* React Native's <Image> (not expo-image) for the
+                  preview — its onLoadStart / onLoadEnd / onError
+                  events fire reliably, so the spinner always clears
+                  and we never get stuck on a blank black screen. */}
+              <Image
+                source={{ uri: profile.profile_pic }}
+                style={styles.avatarPreviewImg}
+                resizeMode="contain"
+                onLoadStart={() => setAvatarPreviewLoading(true)}
+                onLoadEnd={() => setAvatarPreviewLoading(false)}
+                onError={() => {
+                  setAvatarPreviewLoading(false);
+                  setAvatarPreviewError(true);
+                }}
+              />
+              {/* Spinner + label while the image downloads — so the
+                  load gap reads as "loading", never a black void. */}
+              {avatarPreviewLoading && (
+                <View style={styles.avatarPreviewSpinnerWrap} pointerEvents="none">
+                  <ActivityIndicator size="large" color="#FFFFFF" />
+                  <Text style={styles.avatarPreviewLoadingText}>Loading image…</Text>
+                </View>
+              )}
+            </>
+          ) : (
+            <Text style={styles.avatarPreviewFallback}>
+              {avatarPreviewError
+                ? "Couldn't load the image. Check your connection and tap ✕ to close."
+                : 'No profile picture to preview.'}
+            </Text>
+          )}
         </View>
       </Modal>
 
@@ -1266,7 +1342,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#0D3B66',
-    paddingTop: 38,
+    // paddingTop applied inline as insets.top + 8 so the bar clears the
+    // status bar on every device (was a hardcoded 38).
     paddingBottom: 10,
     paddingHorizontal: 14,
     shadowColor: '#082B4C',
@@ -1467,6 +1544,47 @@ const styles = StyleSheet.create({
 
   // Edit modal
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 20 },
+  // Full-screen avatar preview — near-black backdrop, image fills width.
+  avatarPreviewOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.95)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  avatarPreviewImg: { width: '100%', height: '70%' },
+  avatarPreviewSpinnerWrap: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarPreviewLoadingText: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 13,
+    marginTop: 12,
+  },
+  avatarPreviewClose: {
+    position: 'absolute',
+    right: 20,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+  },
+  avatarPreviewCloseText: {
+    color: '#FFFFFF',
+    fontSize: 20,
+    fontWeight: '700',
+    lineHeight: 22,
+  },
+  avatarPreviewFallback: {
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: 14,
+    textAlign: 'center',
+    paddingHorizontal: 40,
+  },
   modalCard: { backgroundColor: '#fff', borderRadius: 16, padding: 20 },
   modalTitle: { fontSize: 20, fontWeight: '800', color: '#1A1A1A', marginBottom: 16, textAlign: 'center' },
   inputLabel: { fontSize: 12, fontWeight: '700', color: '#6C757D', marginBottom: 4, marginTop: 4 },

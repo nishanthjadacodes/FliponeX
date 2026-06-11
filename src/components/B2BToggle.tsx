@@ -91,7 +91,17 @@ const B2BToggle: React.FC<B2BToggleProps> = ({ onToggle, currentMode }) => {
         {/* 🏠 next to "Common Services" — house glyph reads as "doorstep
             consumer". Active text turns navy on the gold pill. */}
         <Text style={styles.optionEmoji}>🏠</Text>
-        <Text style={[styles.optionText, !isIndustrial && styles.activeText]}>
+        {/* numberOfLines={1} + adjustsFontSizeToFit guarantee the full
+            "Common Services" / "Industrial Services" label stays on a
+            SINGLE line on every phone — they'd otherwise wrap to two
+            lines (icon on row 1, second word on row 2) on narrow
+            devices, breaking the pill alignment. */}
+        <Text
+          style={[styles.optionText, !isIndustrial && styles.activeText]}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.85}
+        >
           {STRINGS.COMMON}
         </Text>
       </TouchableOpacity>
@@ -103,7 +113,12 @@ const B2BToggle: React.FC<B2BToggleProps> = ({ onToggle, currentMode }) => {
       >
         {/* 🏭 factory glyph next to "Industrial Services". */}
         <Text style={styles.optionEmoji}>🏭</Text>
-        <Text style={[styles.optionText, isIndustrial && styles.activeText]}>
+        <Text
+          style={[styles.optionText, isIndustrial && styles.activeText]}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={0.85}
+        >
           {STRINGS.INDUSTRIAL}
         </Text>
       </TouchableOpacity>
@@ -130,7 +145,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 6,
     paddingVertical: 10,
-    paddingHorizontal: SIZES.BASE * 2,
+    // Tighter horizontal padding (was SIZES.BASE * 2 = 16) so the longer
+    // "Common Services" / "Industrial Services" labels have enough room
+    // to render on one line on a 320–360px phone alongside their emoji.
+    paddingHorizontal: SIZES.BASE,
     borderRadius: 999,
     zIndex: 1,
   },

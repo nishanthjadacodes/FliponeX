@@ -29,8 +29,15 @@ import {
 import { readCache, writeCache } from '../../utils/agent/cache';
 import ProfileModal, { type AgentProfile } from '../../components/agent/ProfileModal';
 import { LinearGradient } from 'expo-linear-gradient';
+// expo-image for the REMOTE avatar — native on-disk URL cache means the
+// uploaded photo survives app restarts. Compared with RN's stock Image,
+// the next dashboard render reads bytes from disk (instant), not the
+// network. Also seeded during login via ExpoImage.prefetch() so even
+// the first render after a fresh login is local-only.
+import { Image as ExpoImage } from 'expo-image';
 import { repCode } from '../../utils/agent/repCode';
 import { formatBookingAddress } from '../../utils/addressFormat';
+import { API_BASE_URL } from '../../config';
 
 interface DashboardScreenProps {
   navigation: {
@@ -63,6 +70,61 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
   const [agent, setAgent] = useState<AgentProfile | null>(null);
   const [isOnline, setIsOnline] = useState<boolean>(false);
   const [showProfileModal, setShowProfileModal] = useState<boolean>(false);
+
+  // ─── Notification bell ─────────────────────────────────────────────
+  // Unread in-app-inbox count for the header bell. Polled so the rep
+  // sees a badge the moment a new booking lands; tapping the bell
+  // acknowledges it and jumps to Tasks to accept the order.
+  const [bellUnread, setBellUnread] = useState<number>(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const pullUnread = async (): Promise<void> => {
+      try {
+        const token = await AsyncStorage.getItem('agent_token');
+        if (
+          !token ||
+          token.startsWith('demo_token_') ||
+          token.startsWith('offline_token_')
+        ) {
+          return;
+        }
+        const res = await fetch(
+          `${API_BASE_URL}/notifications/inbox?unread_only=true&limit=1`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!cancelled) setBellUnread(Number(json?.unread_count) || 0);
+      } catch {
+        /* offline / backend asleep — keep the last known count */
+      }
+    };
+    pullUnread();
+    const t = setInterval(pullUnread, 45_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [isFocused]);
+
+  // Bell tap — acknowledge (clear the badge + mark the inbox read) and
+  // route the rep to Tasks, where new booking orders are accepted.
+  const openRepBell = async (): Promise<void> => {
+    setBellUnread(0);
+    try {
+      const token = await AsyncStorage.getItem('agent_token');
+      if (token) {
+        fetch(`${API_BASE_URL}/notifications/read-all`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => {});
+      }
+    } catch {
+      /* non-fatal */
+    }
+    navigation.navigate('Tasks');
+  };
 
   // ─── Dashboard data via TanStack Query ────────────────────────────
   // getDashboard() returns tasks + earnings + counts. refetchInterval
@@ -260,6 +322,22 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
       .catch(() => {});
   }, [isFocused]);
 
+  // Re-hydrate the avatar from the server's dashboard payload. agent_data
+  // is wiped on logout, so a fresh re-login would otherwise show the 👤
+  // fallback in the hero even though a photo is still stored on the
+  // backend. dashboard.profile is null on a failed fetch, so a cold start
+  // never blanks a good photo. Also mirrored into agent_data so a later
+  // focus read (above) doesn't revert to the cached photo-less record.
+  useEffect(() => {
+    const p = dashboard?.profile;
+    if (!p) return;
+    setAgent((prev) => {
+      const merged = { ...(prev || {}), ...p } as AgentProfile;
+      AsyncStorage.setItem('agent_data', JSON.stringify(merged)).catch(() => {});
+      return merged;
+    });
+  }, [dashboard?.profile?.id, dashboard?.profile?.profile_pic]);
+
   // Pull-to-refresh spinner kept as local state so the background
   // 15s poll doesn't flash the RefreshControl.
   const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -442,12 +520,11 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                           the home hero so they can confirm at a glance
                           which account is signed in. Falls back to the
                           FliponeX partner logo when no upload exists. */}
+                      {/* Always the FlipOneX brand logo — the rep's
+                          profile photo now lives in the hero's top-right
+                          avatar, so the brand mark is never replaced. */}
                       <Image
-                        source={
-                          (agent as any)?.profile_pic
-                            ? { uri: (agent as any).profile_pic }
-                            : require('../../assets/logo1.jpeg')
-                        }
+                        source={require('../../assets/logo1.jpeg')}
                         style={styles.logoImg}
                         resizeMode="cover"
                       />
@@ -469,13 +546,58 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                     </Text>
                   </View>
 
+                  {/* Right column — top row (profile avatar + bell)
+                      above the online/offline switch. */}
+                  <View style={styles.heroRightCol}>
+                  <View style={styles.heroTopActions}>
+                  {/* Profile avatar — the rep's uploaded photo, or a
+                      person icon when none (like the customer app's
+                      header avatar). Tapping opens Profile. Kept SEPARATE
+                      from the FlipOneX logo on the left so the brand mark
+                      is never replaced by the photo. */}
+                  <TouchableOpacity
+                    style={styles.repAvatarBtn}
+                    onPress={() => navigation.navigate('Profile')}
+                    activeOpacity={0.8}
+                    accessibilityLabel="Profile"
+                  >
+                    {(agent as any)?.profile_pic ? (
+                      <ExpoImage
+                        source={{ uri: (agent as any).profile_pic }}
+                        style={styles.repAvatarImg}
+                        contentFit="cover"
+                        cachePolicy="memory-disk"
+                        transition={0}
+                      />
+                    ) : (
+                      <Text style={styles.repAvatarFallback}>👤</Text>
+                    )}
+                  </TouchableOpacity>
+                  {/* Notification bell — badge shows the unread inbox
+                      count; tapping acknowledges it and jumps to Tasks
+                      to accept the new booking order. */}
+                  <TouchableOpacity
+                    style={styles.bellBtn}
+                    onPress={openRepBell}
+                    activeOpacity={0.8}
+                    accessibilityLabel="Notifications"
+                  >
+                    <Text style={styles.bellIcon}>🔔</Text>
+                    {bellUnread > 0 && (
+                      <View style={styles.bellBadge} pointerEvents="none">
+                        <Text style={styles.bellBadgeText}>
+                          {bellUnread > 99 ? '99+' : bellUnread}
+                        </Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                  </View>
+
                   {/* Online/Offline switch — push right turns the rep ON
                       (admin can dispatch tasks), push left turns OFF.
                       State syncs to backend immediately via
                       updateOnlineStatus(); on failure we revert the
-                      optimistic UI change. The sliding pulse animation
-                      stays only while the toggle is ON for visual
-                      reinforcement. */}
+                      optimistic UI change. */}
                   <View style={styles.onlineToggleWrap}>
                     <Animated.View
                       style={[
@@ -501,6 +623,7 @@ const DashboardScreen: React.FC<DashboardScreenProps> = ({ navigation }) => {
                       thumbColor="#FFFFFF"
                       ios_backgroundColor="#475569"
                     />
+                  </View>
                   </View>
                 </View>
               </LinearGradient>
@@ -877,6 +1000,63 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     borderRadius: 22,
   },
+  // Right column of the hero — notification bell above the online switch.
+  heroRightCol: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  bellBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bellIcon: { fontSize: 18 },
+  // Red unread-count badge poking out of the bell's top-right corner.
+  bellBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#DC2626',
+    borderWidth: 1.5,
+    borderColor: '#003153',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  bellBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 9,
+    fontWeight: '900',
+  },
+  // Top row of the hero's right column — profile avatar beside the bell.
+  heroTopActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  // Profile avatar button — shows the rep's uploaded photo, or a 👤
+  // fallback. Same 38px circle as the bell so the row stays even.
+  repAvatarBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  repAvatarImg: { width: '100%', height: '100%' },
+  repAvatarFallback: { fontSize: 18 },
   onlineDot: {
     width: 8,
     height: 8,

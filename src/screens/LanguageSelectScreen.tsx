@@ -22,10 +22,15 @@ interface LanguageOption {
   flag: string;
 }
 
+// Only English is currently exposed. The Hindi / Telugu plumbing is
+// scaffolded (translation tables + setAppLanguage + persisted choice
+// exist) but no UI screen consumes the t() translator yet, so picking a
+// non-English language has no visible effect. Hidden until the
+// translation pass lands so users aren't misled into expecting an app
+// they can read in their language. Restore the Hindi / Telugu rows here
+// (and remove the "coming soon" hint below) once translations ship.
 const LANGUAGES: LanguageOption[] = [
   { code: 'en', label: 'English', native: 'English', flag: '🇮🇳' },
-  { code: 'hi', label: 'Hindi',   native: 'हिन्दी',   flag: '🇮🇳' },
-  { code: 'te', label: 'Telugu',  native: 'తెలుగు',  flag: '🇮🇳' },
 ];
 
 interface LanguageSelectProps {
@@ -77,7 +82,8 @@ const LanguageSelectScreen: React.FC<LanguageSelectProps> = ({ navigation }) => 
 
         <Text style={styles.title}>Choose your language</Text>
         <Text style={styles.subtitle}>
-          You can change this later from Profile → Language.
+          Hindi and Telugu coming soon. You can change this later from
+          Profile → Language.
         </Text>
 
         <View style={styles.optionsCol}>

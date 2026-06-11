@@ -10,8 +10,8 @@ import {
   ScrollView,
   KeyboardAvoidingView,
   Platform,
-  FlatList,
 } from 'react-native';
+import { FlashList } from '@shopify/flash-list';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { COLORS, SIZES } from '../../constants/agent/colors';
 import { INDIAN_STATES, INDIAN_DISTRICTS } from '../../constants/districts';
@@ -272,7 +272,7 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
               autoCorrect={false}
               autoCapitalize="words"
             />
-            <FlatList
+            <FlashList
               data={INDIAN_STATES.filter((s: string) =>
                 s.toLowerCase().includes(stateSearch.trim().toLowerCase()),
               )}
@@ -324,7 +324,7 @@ const ProfileModal: React.FC<ProfileModalProps> = ({ visible, onClose, onSave })
               autoCorrect={false}
               autoCapitalize="words"
             />
-            <FlatList
+            <FlashList
               data={INDIAN_DISTRICTS.filter((d: string) =>
                 d.toLowerCase().includes(districtSearch.trim().toLowerCase()),
               )}

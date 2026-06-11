@@ -10,6 +10,7 @@ import {
   Alert,
 } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // Defensive load — react-native-webview is a native module. If the dev-client
 // APK was built before it was installed, `require` throws at runtime. Fall
@@ -76,6 +77,10 @@ interface WebViewScreenProps {
 const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   const { url, title } = route.params || {};
   const webViewRef = useRef<any>(null);
+  // Bottom inset → the embedded site (admin dashboard / customer
+  // website) stops ABOVE the Android system navigation bar instead of
+  // running its content — and its scroll bottom — underneath it.
+  const insets = useSafeAreaInsets();
   const [loading, setLoading] = useState<boolean>(true);
   const [errored, setErrored] = useState<boolean>(false);
   const [canGoBack, setCanGoBack] = useState<boolean>(false);
@@ -230,7 +235,7 @@ const WebViewScreen: React.FC<WebViewScreenProps> = ({ route, navigation }) => {
   }
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { paddingBottom: insets.bottom }]}>
       <WebView
         key={webViewKey}
         ref={webViewRef}

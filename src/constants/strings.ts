@@ -25,8 +25,8 @@ export const STRINGS = {
   BOOKING: 'Book Service',
 
   // Service Type Toggle
-  COMMON: 'Common',
-  INDUSTRIAL: 'Industrial',
+  COMMON: 'Common Services',
+  INDUSTRIAL: 'Industrial Services',
 
   // Service related
   SERVICES: 'Services',
@@ -177,7 +177,7 @@ export const FAQS: FAQ[] = [
   },
   {
     q: 'Which payment modes are accepted?',
-    a: 'UPI (Google Pay, PhonePe, Paytm), credit/debit cards, net banking and wallets. Cash-on-completion is also available for select services.',
+    a: 'All payments are made online through the company\'s secure payment gateway — UPI (Google Pay, PhonePe, Paytm), credit/debit cards, net banking and wallets. You can pay upfront or choose "Pay After Service", settled online once the work is verified. Anyone may pay on the customer\'s behalf; if you prefer cash, hand it to your representative and they will complete the online payment to the company for you.',
   },
   {
     q: 'Is my payment secure?',

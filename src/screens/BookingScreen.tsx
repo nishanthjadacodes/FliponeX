@@ -25,10 +25,10 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { INDIAN_DISTRICTS, INDIAN_STATES } from '../constants/districts';
 import { formatBookingId, nextLocalBookingNumber } from '../utils/bookingId';
+import { lettersOnly, alphaNumeric } from '../utils/inputSanitizers';
 import * as Location from 'expo-location';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import * as ImagePicker from 'expo-image-picker';
-import { captureWithCrop, pickWithCrop } from '../utils/cropPicker';
+import { captureWithCrop, pickWithCrop, isActivityLauncherError } from '../utils/cropPicker';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 // Defensive load: expo-document-picker is a native module. If the dev-client
 // APK predates the install, require() works but calls throw at runtime.
@@ -417,7 +417,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter your name"
             value={applicantName}
-            onChangeText={setApplicantName}
+            onChangeText={(v: string) => setApplicantName(lettersOnly(v))}
           />
         </View>,
         <View key="mobile" style={styles.inputGroup}>
@@ -494,7 +494,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter applicant's full name"
             value={applicantName}
-            onChangeText={setApplicantName}
+            onChangeText={(v: string) => setApplicantName(lettersOnly(v))}
           />
         </View>
       );
@@ -508,7 +508,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter your full name"
             value={fullName}
-            onChangeText={setFullName}
+            onChangeText={(v: string) => setFullName(lettersOnly(v))}
           />
         </View>
       );
@@ -667,7 +667,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter relative's full name"
             value={relativeName}
-            onChangeText={setRelativeName}
+            onChangeText={(v: string) => setRelativeName(lettersOnly(v))}
           />
         </View>
       );
@@ -985,7 +985,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter father's full name"
             value={relativeName}
-            onChangeText={setRelativeName}
+            onChangeText={(v: string) => setRelativeName(lettersOnly(v))}
           />
         </View>
       );
@@ -999,7 +999,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter father's or husband's full name"
             value={relativeName}
-            onChangeText={setRelativeName}
+            onChangeText={(v: string) => setRelativeName(lettersOnly(v))}
           />
         </View>
       );
@@ -1069,7 +1069,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter mother's full name"
             value={relativeName}
-            onChangeText={setRelativeName}
+            onChangeText={(v: string) => setRelativeName(lettersOnly(v))}
           />
         </View>
       );
@@ -1285,7 +1285,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Enter father's full name"
             value={fatherName}
-            onChangeText={setFatherName}
+            onChangeText={(v: string) => setFatherName(lettersOnly(v))}
           />
         </View>
 
@@ -1480,7 +1480,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Street name, area, landmark"
             value={streetArea || addressLine1}
-            onChangeText={(v) => { setStreetArea(v); setAddressLine1(v); }}
+            onChangeText={(v: string) => {
+              const c = alphaNumeric(v);
+              setStreetArea(c);
+              setAddressLine1(c);
+            }}
           />
         </View>
 
@@ -1500,7 +1504,7 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Town or village"
             value={townVillage}
-            onChangeText={setTownVillage}
+            onChangeText={(v: string) => setTownVillage(lettersOnly(v))}
           />
         </View>
 
@@ -1530,7 +1534,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             style={styles.input}
             placeholder="Taluk / Tehsil / Mandal"
             value={talukaTehsil || subdivision}
-            onChangeText={(v) => { setTalukaTehsil(v); setSubdivision(v); }}
+            onChangeText={(v: string) => {
+              const c = lettersOnly(v);
+              setTalukaTehsil(c);
+              setSubdivision(c);
+            }}
           />
         </View>
 
@@ -1701,6 +1709,210 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
   useEffect(() => {
     setOptFastTrack(serviceMode === 'fast_track');
   }, [serviceMode]);
+
+  // ─── Booking-flow draft persistence ─────────────────────────────────
+  // The nav-state restore in Splash brings the user back to this screen
+  // after a cold start, but React mounts BookingScreen fresh so every
+  // useState resets to its initial value — i.e. the user lands on
+  // step 1 even though they were on step 4 when the OS killed the
+  // process (common on Realme/Oppo/Vivo/Xiaomi memory pressure or with
+  // "Don't keep activities" enabled). This block fixes that: the form
+  // state is mirrored into AsyncStorage on every change (debounced) and
+  // rehydrated on mount, so resume lands the user exactly where they
+  // left off, with everything they filled still in place. The cold-
+  // launch flow (Splash → ModeSelect → FlashNotifications → Login) is
+  // untouched — this only kicks in once BookingScreen actually mounts.
+  //
+  // Keyed by service id so two services in flight stay separate. Auto-
+  // expires after 24 h so stale forms (closed slots, outdated prices)
+  // don't resume. Cleared when the user reaches the confirmation step.
+  const draftKey = serviceData?.id
+    ? `booking_draft_${String(serviceData.id)}`
+    : null;
+  const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
+  const draftHydratedRef = useRef<boolean>(false);
+
+  // Restore — runs once when draftKey resolves. Sets `draftHydratedRef`
+  // to true as soon as the AsyncStorage read resolves (regardless of
+  // whether a draft was present) so the save effect knows it's safe to
+  // start writing. Without that ordering, the first save effect tick
+  // could clobber a real saved draft with the screen's default state
+  // before the read returns.
+  useEffect(() => {
+    if (!draftKey || draftHydratedRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(draftKey);
+        if (cancelled) return;
+        draftHydratedRef.current = true;
+        if (!raw) return;
+        const d: any = JSON.parse(raw);
+        if (
+          typeof d?.savedAt !== 'number' ||
+          Date.now() - d.savedAt > DRAFT_TTL_MS
+        ) {
+          AsyncStorage.removeItem(draftKey).catch(() => {});
+          return;
+        }
+        // currentStep is bounded so a corrupt blob can't drop the user
+        // onto step 6 (confirmation) with no booking actually placed.
+        if (typeof d.currentStep === 'number' && d.currentStep > 1 && d.currentStep < 6) {
+          setCurrentStep(d.currentStep);
+        }
+        // Step 1 — address / GPS
+        if (typeof d.address === 'string') setAddress(d.address);
+        if (d.latitude != null) setLatitude(d.latitude);
+        if (d.longitude != null) setLongitude(d.longitude);
+        if (typeof d.useCurrentLocation === 'boolean') setUseCurrentLocation(d.useCurrentLocation);
+        // Step 2 — personal details (UIDAI / PAN / Voter / Ration variants)
+        if (typeof d.fullName === 'string') setFullName(d.fullName);
+        if (typeof d.applicantName === 'string') setApplicantName(d.applicantName);
+        if (typeof d.aadhaarNumber === 'string') setAadhaarNumber(d.aadhaarNumber);
+        if (typeof d.dateOfBirth === 'string') setDateOfBirth(new Date(d.dateOfBirth));
+        if (typeof d.gender === 'string') setGender(d.gender);
+        if (typeof d.email === 'string') setEmail(d.email);
+        if (typeof d.maritalStatus === 'string') setMaritalStatus(d.maritalStatus);
+        if (typeof d.relationshipType === 'string') setRelationshipType(d.relationshipType);
+        if (typeof d.relativeName === 'string') setRelativeName(d.relativeName);
+        if (typeof d.socialCategory === 'string') setSocialCategory(d.socialCategory);
+        if (typeof d.disability === 'string') setDisability(d.disability);
+        if (typeof d.state === 'string') setState(d.state);
+        if (typeof d.district === 'string') setDistrict(d.district);
+        if (typeof d.subdivision === 'string') setSubdivision(d.subdivision);
+        if (typeof d.addressLine1 === 'string') setAddressLine1(d.addressLine1);
+        if (typeof d.addressLine2 === 'string') setAddressLine2(d.addressLine2);
+        if (typeof d.pincode === 'string') setPincode(d.pincode);
+        if (typeof d.mobile === 'string') setMobile(d.mobile);
+        if (typeof d.fatherName === 'string') setFatherName(d.fatherName);
+        if (typeof d.husbandName === 'string') setHusbandName(d.husbandName);
+        if (typeof d.motherName === 'string') setMotherName(d.motherName);
+        if (typeof d.disabilityType === 'string') setDisabilityType(d.disabilityType);
+        if (typeof d.assemblyConstituency === 'string') setAssemblyConstituency(d.assemblyConstituency);
+        if (typeof d.parliamentaryConstituency === 'string') setParliamentaryConstituency(d.parliamentaryConstituency);
+        if (typeof d.headOfFamily === 'string') setHeadOfFamily(d.headOfFamily);
+        if (typeof d.hofMobile === 'string') setHofMobile(d.hofMobile);
+        if (typeof d.rationDealerName === 'string') setRationDealerName(d.rationDealerName);
+        if (typeof d.houseNo === 'string') setHouseNo(d.houseNo);
+        if (typeof d.streetArea === 'string') setStreetArea(d.streetArea);
+        if (typeof d.wardName === 'string') setWardName(d.wardName);
+        if (typeof d.townVillage === 'string') setTownVillage(d.townVillage);
+        if (typeof d.postOffice === 'string') setPostOffice(d.postOffice);
+        if (typeof d.panchayat === 'string') setPanchayat(d.panchayat);
+        if (typeof d.talukaTehsil === 'string') setTalukaTehsil(d.talukaTehsil);
+        if (typeof d.block === 'string') setBlock(d.block);
+        if (typeof d.stayingFromYears === 'string') setStayingFromYears(d.stayingFromYears);
+        if (typeof d.educationalQualification === 'string') setEducationalQualification(d.educationalQualification);
+        if (typeof d.monthlyIncome === 'string') setMonthlyIncome(d.monthlyIncome);
+        if (typeof d.primaryOccupation === 'string') setPrimaryOccupation(d.primaryOccupation);
+        if (typeof d.workExperienceYears === 'string') setWorkExperienceYears(d.workExperienceYears);
+        if (typeof d.bankAccountNumber === 'string') setBankAccountNumber(d.bankAccountNumber);
+        if (typeof d.ifscCode === 'string') setIfscCode(d.ifscCode);
+        if (typeof d.workingPlatforms === 'string') setWorkingPlatforms(d.workingPlatforms);
+        if (d.dynamicFieldValues && typeof d.dynamicFieldValues === 'object') {
+          setDynamicFieldValues(d.dynamicFieldValues);
+        }
+        // Step 3 — uploaded documents (metadata; files already on server)
+        if (Array.isArray(d.uploadedDocuments)) setUploadedDocuments(d.uploadedDocuments);
+        // Step 4 — schedule
+        if (typeof d.selectedDate === 'string') setSelectedDate(new Date(d.selectedDate));
+        if (d.selectedTimeSlot != null) setSelectedTimeSlot(d.selectedTimeSlot);
+        if (typeof d.serviceMode === 'string') setServiceMode(d.serviceMode);
+        if (d.deliveryMode === 'offline' || d.deliveryMode === 'online') setDeliveryMode(d.deliveryMode);
+        // Step 5 — payment / options / referral
+        if (typeof d.paymentMethod === 'string') setPaymentMethod(d.paymentMethod);
+        if (typeof d.optProcessing === 'boolean') setOptProcessing(d.optProcessing);
+        if (typeof d.optConsultancy === 'boolean') setOptConsultancy(d.optConsultancy);
+        if (typeof d.optTaxes === 'boolean') setOptTaxes(d.optTaxes);
+        if (typeof d.optFastTrack === 'boolean') setOptFastTrack(d.optFastTrack);
+        if (typeof d.useRewardPoints === 'boolean') setUseRewardPoints(d.useRewardPoints);
+        if (typeof d.useRefundWallet === 'boolean') setUseRefundWallet(d.useRefundWallet);
+        if (typeof d.referralCodeInput === 'string') setReferralCodeInput(d.referralCodeInput);
+        if (typeof d.referralDiscount === 'number') setReferralDiscount(d.referralDiscount);
+        if (typeof d.acceptedTerms === 'boolean') setAcceptedTerms(d.acceptedTerms);
+      } catch (e: any) {
+        console.log('[booking-draft] restore failed:', e?.message);
+        draftHydratedRef.current = true; // unblock save even on parse error
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [draftKey]);
+
+  // Save — debounced. Skips writes until restore has finished (so a
+  // first-tick save can't clobber a real draft with defaults). Clears
+  // the draft once the user crosses into step 6 (confirmation) or the
+  // booking is confirmed — no resume into a completed transaction.
+  useEffect(() => {
+    if (!draftKey || !draftHydratedRef.current) return;
+    if (currentStep >= 6 || bookingConfirmed) {
+      AsyncStorage.removeItem(draftKey).catch(() => {});
+      return;
+    }
+    const handle = setTimeout(() => {
+      const draft = {
+        savedAt: Date.now(),
+        currentStep,
+        address, latitude, longitude, useCurrentLocation,
+        fullName, applicantName, aadhaarNumber,
+        dateOfBirth: dateOfBirth ? dateOfBirth.toISOString() : null,
+        gender, email,
+        maritalStatus, relationshipType, relativeName,
+        socialCategory, disability,
+        state, district, subdivision,
+        addressLine1, addressLine2, pincode,
+        mobile,
+        fatherName, husbandName, motherName,
+        disabilityType, assemblyConstituency, parliamentaryConstituency,
+        headOfFamily, hofMobile, rationDealerName,
+        houseNo, streetArea, wardName, townVillage, postOffice,
+        panchayat, talukaTehsil, block,
+        stayingFromYears, educationalQualification, monthlyIncome,
+        primaryOccupation, workExperienceYears,
+        bankAccountNumber, ifscCode, workingPlatforms,
+        dynamicFieldValues,
+        uploadedDocuments,
+        selectedDate: selectedDate instanceof Date
+          ? selectedDate.toISOString()
+          : selectedDate,
+        selectedTimeSlot,
+        serviceMode, deliveryMode,
+        paymentMethod,
+        optProcessing, optConsultancy, optTaxes, optFastTrack,
+        useRewardPoints, useRefundWallet,
+        referralCodeInput, referralDiscount,
+        acceptedTerms,
+      };
+      AsyncStorage.setItem(draftKey, JSON.stringify(draft)).catch(() => {});
+    }, 500);
+    return () => clearTimeout(handle);
+  // Long dep list — every field saved must also trigger a save when it
+  // changes. eslint-react-hooks would complain about the breadth here
+  // but we genuinely want all of them. Easier to maintain as one block.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    draftKey, bookingConfirmed,
+    currentStep,
+    address, latitude, longitude, useCurrentLocation,
+    fullName, applicantName, aadhaarNumber, dateOfBirth, gender, email,
+    maritalStatus, relationshipType, relativeName, socialCategory, disability,
+    state, district, subdivision, addressLine1, addressLine2, pincode, mobile,
+    fatherName, husbandName, motherName,
+    disabilityType, assemblyConstituency, parliamentaryConstituency,
+    headOfFamily, hofMobile, rationDealerName,
+    houseNo, streetArea, wardName, townVillage, postOffice,
+    panchayat, talukaTehsil, block,
+    stayingFromYears, educationalQualification, monthlyIncome,
+    primaryOccupation, workExperienceYears,
+    bankAccountNumber, ifscCode, workingPlatforms,
+    dynamicFieldValues, uploadedDocuments,
+    selectedDate, selectedTimeSlot,
+    serviceMode, deliveryMode,
+    paymentMethod,
+    optProcessing, optConsultancy, optTaxes, optFastTrack,
+    useRewardPoints, useRefundWallet,
+    referralCodeInput, referralDiscount,
+    acceptedTerms,
+  ]);
 
   // Fetch active flash-notification discounts and pick the highest one
   // that matches THIS service. Matched by case-insensitive substring
@@ -2141,7 +2353,18 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       });
     } catch (e: any) {
       console.error('file pick error:', e);
-      showToast('File picker error', e?.message || 'Could not open file picker', 'error');
+      // Some OEMs (Realme/Oppo/Vivo/Xiaomi) recreate the host Activity
+      // while the system file picker opens, leaving expo's
+      // ActivityResultLauncher unregistered. The Files path can't
+      // recover — but Camera/Gallery (react-native-image-crop-picker)
+      // always can, so steer the user there instead of a dead-end error.
+      showToast(
+        'File picker unavailable',
+        isActivityLauncherError(e)
+          ? 'This device blocked the file picker. Please use Camera or Gallery to photograph the document instead.'
+          : e?.message || 'Could not open file picker',
+        'error',
+      );
     }
   };
 
@@ -2701,6 +2924,13 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
       const isFatherHusbandUpdate =
         isAadhaar && hasUpdateVerb && /(father|husband|guardian|relation)/.test(haystack);
       const isAddressUpdate = isAadhaar && hasUpdateVerb && /address/.test(haystack);
+      // MUST mirror every branch the render path applies (see ~line 3411).
+      // The Email-ID branch was previously missing here, so the validator
+      // fell back to the backend's seed list (which still includes an
+      // "Email ID" doc) — leaving the user with no upload row to satisfy
+      // it. Same regex as the render path so both stay in sync.
+      const isEmailUpdate =
+        isAadhaar && hasUpdateVerb && /e-?mail/.test(haystack);
 
       if (isAddressUpdate) {
         requiredDocs = [
@@ -2728,6 +2958,20 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
           { type: 'aadhaar_back', label: 'Aadhaar Back', required: true },
           { type: 'voter_id', label: 'Voter ID', required: true },
           { type: 'matric_certificate', label: 'Matric Certificate', required: true },
+        ];
+      } else if (isEmailUpdate) {
+        // Aadhaar identity (front + back) PLUS a current electricity /
+        // light bill as the supporting proof. The Aadhaar pair IS the
+        // identity proof — UIDAI never asked for a separate "email proof"
+        // (the email itself is OTP-verified online), so no such row exists.
+        // A separate `identity_proof` row is also collected as a
+        // secondary ID (PAN / Voter ID / Passport / Driving Licence) to
+        // strengthen the verification.
+        requiredDocs = [
+          { type: 'aadhaar_front',    label: 'Aadhaar Front',                                  required: true },
+          { type: 'aadhaar_back',     label: 'Aadhaar Back',                                   required: true },
+          { type: 'electricity_bill', label: 'Electricity Bill / Light Bill',                  required: true },
+          { type: 'identity_proof',   label: 'Identity Proof (PAN / Voter ID / Passport / DL)', required: true },
         ];
       }
 
@@ -3380,6 +3624,11 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         // additional "New Address Proof".
         const isAddressUpdate =
           isAadhaar && hasUpdateVerb && /address/.test(haystack);
+        // Email-ID update — the supporting document is an electricity /
+        // light bill, NOT an "email proof" (no such document exists; an
+        // email is just an OTP-verified value).
+        const isEmailUpdate =
+          isAadhaar && hasUpdateVerb && /e-?mail/.test(haystack);
 
         // Order matters: more-specific update types first so a service
         // titled "Aadhaar Address Update" doesn't accidentally hit the
@@ -3411,6 +3660,17 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
             { type: 'voter_id',           label: 'Voter ID',           required: true },
             { type: 'matric_certificate', label: 'Matric Certificate', required: true },
           ];
+        } else if (isEmailUpdate) {
+          // Email-ID update: Aadhaar + an electricity / light bill as the
+          // supporting proof + a secondary identity proof. Replaces the
+          // misleading "Email ID Proof" the backend seed produced —
+          // there is no such document.
+          requiredDocs = [
+            { type: 'aadhaar_front',    label: 'Aadhaar Front',                                  required: true },
+            { type: 'aadhaar_back',     label: 'Aadhaar Back',                                   required: true },
+            { type: 'electricity_bill', label: 'Electricity Bill / Light Bill',                  required: true },
+            { type: 'identity_proof',   label: 'Identity Proof (PAN / Voter ID / Passport / DL)', required: true },
+          ];
         }
 
         return (
@@ -3421,16 +3681,15 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               requiredDocs.map((doc: any, index: number) => {
                 const type = doc?.type || `doc_${index}`;
                 const rawLabel = doc?.label || doc?.type || `Document ${index + 1}`;
-                // Friendly-label rewrite. Backend seeds some services with
-                // bare "Email ID" / "Mobile Number" labels which sound
-                // like the user has to upload an email address rather
-                // than a proof document. Append " Proof" so the user
-                // knows we want a document scan, not the value itself.
-                const label = /^email\s*id$/i.test(rawLabel)
-                  ? 'Email ID Proof'
-                  : /^mobile\s*(no\.?|number)?$/i.test(rawLabel)
-                    ? 'Mobile Number Proof'
-                    : rawLabel;
+                // Friendly-label rewrite. The backend seeds some services
+                // with a bare "Mobile Number" label which sounds like the
+                // user must upload a number rather than a proof document —
+                // append " Proof" so it's clear we want a document scan.
+                // (Aadhaar email-update no longer yields an "Email ID" doc
+                // — see the isEmailUpdate override above.)
+                const label = /^mobile\s*(no\.?|number)?$/i.test(rawLabel)
+                  ? 'Mobile Number Proof'
+                  : rawLabel;
                 const uploaded = uploadedDocuments.find((d: any) => d.type === type);
                 const isUploading = uploadProgress[type];
                 const isImage =
@@ -4123,7 +4382,12 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               </View>
             </TouchableOpacity>
 
-            {/* ── Option 2: Pay Cash on Service ── */}
+            {/* ── Option 2: Pay After Service ──
+                Settled ONLINE through the company gateway after the work
+                is done. The customer may hand cash to the representative,
+                who then completes that online payment on the customer's
+                behalf — the company never takes cash directly, so this
+                option is NOT labelled "Pay Cash". */}
             <TouchableOpacity
               style={[
                 styles.payOptionCard,
@@ -4133,13 +4397,15 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
               activeOpacity={0.85}
             >
               <View style={[styles.payOptionIcon, { backgroundColor: '#E8F5E9' }]}>
-                <Text style={styles.payOptionEmoji}>💵</Text>
+                <Text style={styles.payOptionEmoji}>⏳</Text>
               </View>
               <View style={{ flex: 1 }}>
-                <Text style={styles.payOptionTitle}>Pay Cash on Service</Text>
+                <Text style={styles.payOptionTitle}>Pay After Service</Text>
                 <Text style={styles.payOptionSubtitle}>
-                  Pay the representative in cash when they arrive to deliver
-                  the service. Get a receipt after the work is verified.
+                  Pay online through the company's secure payment gateway
+                  once the service is completed and verified. Prefer to pay
+                  by cash? Hand it to the representative — they will complete
+                  the online payment to the company on your behalf.
                 </Text>
               </View>
               <View style={[styles.payRadio, paymentMethod === 'pay_cash' && styles.payRadioActive]}>
@@ -4321,16 +4587,17 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
                   // States:
                   //   pay_online + completed       → green ✓ Paid Online
                   //   pay_online + not completed   → amber ⏳ Pending
-                  //   pay_cash                     → neutral 💵 Pay Cash on Service
-                  //   pay_after (legacy)           → neutral 💵 Pay After Service
+                  //   pay_cash / pay_after         → neutral ⏳ Pay After Service
+                  // "Pay After Service" is always settled ONLINE through the
+                  // company payment gateway — the representative may collect
+                  // cash from the customer and complete that online payment
+                  // on their behalf. There is no cash-to-company channel, so
+                  // the badge never says "Cash".
                   const isOnline = paymentMethod === 'pay_online';
-                  const isCash = paymentMethod === 'pay_cash';
                   const showPaid = isOnline && paymentCompleted;
                   const label = isOnline
                     ? paymentCompleted ? '✓ Paid Online' : '⏳ Payment Pending'
-                    : isCash
-                      ? '💵 Pay Cash on Service'
-                      : '💵 Pay After Service';
+                    : '⏳ Pay After Service';
                   return (
                     <View style={[
                       styles.paymentBadge,
@@ -4426,7 +4693,13 @@ const BookingScreen: React.FC<Props> = ({ navigation, route }) => {
         <Text style={styles.serviceName} numberOfLines={1}>
           {serviceData?.name || 'Service'}
         </Text>
-        <Text style={styles.servicePrice}>₹{totalAmount}</Text>
+        {/* Top bar shows the service's STANDARD price — never the
+            flash-discounted / credit-adjusted total. A flash offer is
+            applied and revealed only in the Payment Summary (the
+            "🎉 Flash Offer" line), so the header doesn't pre-display a
+            discounted figure for offer services. subtotalBeforeCredits
+            = base price + opted add-ons, before any discount/credit. */}
+        <Text style={styles.servicePrice}>₹{subtotalBeforeCredits}</Text>
       </View>
 
       {renderStepper()}

@@ -1,4 +1,8 @@
 import * as Location from 'expo-location';
+import {
+  locationAsker,
+  requestPermissionWithRationale,
+} from '../permissions';
 
 export interface LatLng {
   latitude: number;
@@ -24,11 +28,8 @@ export const getAgentPosition = async (): Promise<LatLng | null> => {
   if (agentPos && now - agentPosFetchedAt < AGENT_POS_TTL_MS) return agentPos;
 
   try {
-    let perm = await Location.getForegroundPermissionsAsync();
-    if (perm.status !== 'granted') {
-      perm = await Location.requestForegroundPermissionsAsync();
-    }
-    if (perm.status !== 'granted') {
+    const perm = await requestPermissionWithRationale('location', locationAsker);
+    if (!perm.granted) {
       agentPermissionDenied = true;
       return null;
     }

@@ -32,7 +32,7 @@ const FAQS: FAQItem[] = [
   },
   {
     q: 'Which payment modes are accepted?',
-    a: 'Customers can pay via UPI, wallet, card, or cash on completion (Pay After Service). Representative commissions are paid to the bank account in Profile → Bank Details.',
+    a: 'All payments are made online through the company payment gateway — UPI, wallet, card or netbanking. Customers can pay upfront or choose "Pay After Service", where the payment is made online once the work is verified. If a customer prefers cash, the representative may collect it and complete the online payment to the company on the customer\'s behalf. Representative commissions are paid to the bank account in Profile → Bank Details.',
   },
   {
     q: 'Is my payment secure?',

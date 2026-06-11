@@ -20,6 +20,7 @@ import { COLORS } from '../../constants/agent/colors';
 import { LinearGradient } from 'expo-linear-gradient';
 import { computeDistanceToAddress, formatDistance } from '../../utils/agent/distance';
 import { formatBookingAddress } from '../../utils/addressFormat';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 // ─── Status helpers (module-scope, no hooks) ────────────────────────────────
 // Explicit emerald green for completed/work_completed — COLORS.success
@@ -194,6 +195,7 @@ interface TaskListScreenProps {
 }
 
 const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) => {
+  const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
   const isFocused = useIsFocused();
   const [filter, setFilter] = useState<FilterId>(route?.params?.initialFilter || 'all');
@@ -221,7 +223,11 @@ const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) =>
   // Thin wrapper so the existing loadTasks({ silent }) call sites
   // (after accept / reject) keep working — the arg is now ignored.
   const loadTasks = (_opts?: { silent?: boolean }): void => {
-    refetchTasks();
+    // Invalidate the whole agentTasks family — refetches the current
+    // filter AND the ['agentTasks','new'] query the Tasks-tab badge
+    // shares, so the badge count drops the instant a task is accepted
+    // or rejected, not a poll-interval later.
+    queryClient.invalidateQueries({ queryKey: ['agentTasks'] });
   };
   const [selectedTask, setSelectedTask] = useState<AgentTask | null>(null);
   const [detailModalVisible, setDetailModalVisible] = useState<boolean>(false);
@@ -322,7 +328,7 @@ const TaskListScreen: React.FC<TaskListScreenProps> = ({ navigation, route }) =>
 
       {/* Sticky branded header + filter chips */}
       <View style={styles.stickyTop}>
-        <View style={styles.header}>
+        <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
           <Text style={styles.headerTitle}>Tasks</Text>
           <Text style={styles.headerSubtitle}>
             {tasks.length} {tasks.length === 1 ? 'job' : 'jobs'} in{' '}
@@ -516,7 +522,9 @@ const styles = StyleSheet.create({
     zIndex: 2,
   },
 
-  header: { paddingHorizontal: 16, paddingTop: 56, paddingBottom: 10 },
+  // paddingTop applied inline as insets.top + 12 so the header clears
+  // the status bar / notch on every device (was a hardcoded 56).
+  header: { paddingHorizontal: 16, paddingBottom: 10 },
   headerTitle: { fontSize: 26, fontWeight: '900', color: '#0F172A', letterSpacing: 0.3 },
   headerSubtitle: { fontSize: 12, color: '#64748B', marginTop: 2, fontWeight: '600' },
   headerAccent: { color: '#F4A100', fontWeight: '800' },

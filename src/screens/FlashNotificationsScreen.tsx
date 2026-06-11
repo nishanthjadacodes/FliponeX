@@ -20,16 +20,22 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
-  Image,
   ScrollView,
   Dimensions,
   Linking,
   ActivityIndicator,
   StatusBar,
 } from 'react-native';
+// expo-image — banner images are remote; native disk caching keeps
+// them from re-downloading every app launch.
+import { Image as ExpoImage } from 'expo-image';
 import { API_BASE_URL } from '../config';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
+// The festival pop-up is a CENTERED card over a dim backdrop — not a
+// full-screen takeover. POPUP_W is the card width; the carousel pages
+// by this width too.
+const POPUP_W = Math.min(Math.round(SCREEN_WIDTH * 0.84), 310);
 
 interface FlashNotification {
   id: string;
@@ -174,44 +180,51 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
   }
 
   return (
-    <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0D3B66" />
+    <View style={styles.backdrop}>
+      <StatusBar barStyle="light-content" backgroundColor="rgba(0,0,0,0.6)" />
 
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>FliponeX</Text>
-        <TouchableOpacity onPress={markAllSeenAndContinue} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-          <Text style={styles.skipText}>Skip ✕</Text>
-        </TouchableOpacity>
-      </View>
+      {/* Centered pop-up card — sits on a dim backdrop instead of
+          taking over the whole screen. */}
+      <View style={[styles.popupCard, { width: POPUP_W }]}>
+        <View style={styles.header}>
+          <Text style={styles.headerTitle}>FliponeX</Text>
+          <TouchableOpacity onPress={markAllSeenAndContinue} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+            <Text style={styles.skipText}>Skip ✕</Text>
+          </TouchableOpacity>
+        </View>
 
-      <ScrollView
-        ref={scrollRef}
-        horizontal
-        pagingEnabled
-        showsHorizontalScrollIndicator={false}
-        onMomentumScrollEnd={(e) => {
-          const idx = Math.round(e.nativeEvent.contentOffset.x / SCREEN_WIDTH);
-          setActiveIdx(idx);
-        }}
-      >
-        {items.map((item) => (
-          <View key={item.id} style={[styles.card, { width: SCREEN_WIDTH }]}>
+        <ScrollView
+          ref={scrollRef}
+          style={styles.carousel}
+          horizontal
+          pagingEnabled
+          showsHorizontalScrollIndicator={false}
+          onMomentumScrollEnd={(e) => {
+            const idx = Math.round(e.nativeEvent.contentOffset.x / POPUP_W);
+            setActiveIdx(idx);
+          }}
+        >
+          {items.map((item) => (
+            <View key={item.id} style={[styles.card, { width: POPUP_W }]}>
             {item.image_url && !imgFailed.has(item.id) ? (
-              <Image
+              <ExpoImage
                 source={{ uri: item.image_url }}
                 style={styles.image}
-                resizeMode="cover"
+                contentFit="contain"
+                cachePolicy="memory-disk"
+                transition={200}
                 // If the URL fails to load (Google-search redirect,
                 // hotlink-protected CDN, http-only host blocked by
                 // Android's cleartext policy, expired link, etc.),
                 // swap to the emoji fallback instead of leaving a
                 // blank navy box. Logged so devs can see in adb
-                // logcat which URL broke.
+                // logcat which URL broke. expo-image's onError gives
+                // { error } directly (no nativeEvent wrapper).
                 onError={(e) => {
                   console.log(
                     '[flash] image failed to load:',
                     item.image_url,
-                    e?.nativeEvent?.error,
+                    e?.error,
                   );
                   setImgFailed((prev) => {
                     const next = new Set(prev);
@@ -255,29 +268,55 @@ const FlashNotificationsScreen: React.FC<Props> = ({ navigation, route }) => {
             </View>
           </View>
         ))}
-      </ScrollView>
+        </ScrollView>
 
-      {/* Page dots — only when more than one notification */}
-      {items.length > 1 && (
-        <View style={styles.dotsRow}>
-          {items.map((_, i) => (
-            <View
-              key={i}
-              style={[styles.dot, i === activeIdx && styles.dotActive]}
-            />
-          ))}
-        </View>
-      )}
+        {/* Page dots — only when more than one notification */}
+        {items.length > 1 && (
+          <View style={styles.dotsRow}>
+            {items.map((_, i) => (
+              <View
+                key={i}
+                style={[styles.dot, i === activeIdx && styles.dotActive]}
+              />
+            ))}
+          </View>
+        )}
 
-      <TouchableOpacity style={styles.continueBtn} onPress={markAllSeenAndContinue}>
-        <Text style={styles.continueBtnText}>Continue to FliponeX →</Text>
-      </TouchableOpacity>
+        <TouchableOpacity style={styles.continueBtn} onPress={markAllSeenAndContinue}>
+          <Text style={styles.continueBtnText}>Continue to FliponeX →</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0D3B66' },
+  // Dim full-screen backdrop that centers the pop-up card.
+  backdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  // The centered festival pop-up card itself.
+  popupCard: {
+    backgroundColor: '#0D3B66',
+    borderRadius: 22,
+    maxHeight: '80%',
+    overflow: 'hidden',
+    paddingBottom: 12,
+    elevation: 14,
+    shadowColor: '#000',
+    shadowOpacity: 0.4,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+  },
+  // The horizontal paging carousel. flexShrink lets it give up height
+  // if the card content would otherwise push the Continue button off
+  // the bottom — the button + dots stay visible no matter what.
+  carousel: {
+    flexShrink: 1,
+  },
   loadingWrap: {
     flex: 1,
     backgroundColor: '#0D3B66',
@@ -285,16 +324,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   header: {
-    paddingTop: 48,
-    paddingHorizontal: 20,
-    paddingBottom: 12,
+    paddingTop: 12,
+    paddingHorizontal: 18,
+    paddingBottom: 8,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
   },
   headerTitle: {
     color: '#FFFFFF',
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '900',
     letterSpacing: 0.5,
   },
@@ -304,15 +343,22 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   card: {
-    flex: 1,
-    paddingHorizontal: 20,
-    paddingTop: 12,
+    // No flex:1 — the card now sizes to its content (image + body)
+    // inside the height-capped pop-up, instead of filling a full
+    // screen. paddingBottom keeps the validity text clear of the
+    // Continue button below.
+    paddingHorizontal: 16,
+    paddingTop: 4,
+    paddingBottom: 8,
     alignItems: 'center',
   },
   image: {
+    // Compact banner. contentFit:'contain' (set on the component)
+    // shows the WHOLE uploaded image — no cropping — inside this
+    // white rounded frame, so promo artwork isn't cut off.
     width: '100%',
-    aspectRatio: 1,
-    borderRadius: 18,
+    height: 130,
+    borderRadius: 16,
     backgroundColor: '#FFFFFF',
   },
   imageFallback: {
@@ -320,51 +366,53 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  imageFallbackEmoji: { fontSize: 140 },
+  // Sized to sit INSIDE the 150-tall image box — the old 140px emoji
+  // overflowed the box and overlapped the title text below it.
+  imageFallbackEmoji: { fontSize: 52 },
   body: {
-    marginTop: 22,
+    marginTop: 10,
     alignItems: 'center',
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
   },
   title: {
     color: '#FFFFFF',
-    fontSize: 22,
+    fontSize: 16,
     fontWeight: '900',
     textAlign: 'center',
-    lineHeight: 28,
+    lineHeight: 20,
   },
   discountPill: {
-    marginTop: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 7,
+    marginTop: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
     borderRadius: 20,
     backgroundColor: '#10B981',
   },
   discountPillText: {
     color: '#FFFFFF',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '900',
-    letterSpacing: 0.4,
+    letterSpacing: 0.3,
   },
   bodyText: {
-    marginTop: 10,
+    marginTop: 6,
     color: 'rgba(255,255,255,0.85)',
-    fontSize: 14,
+    fontSize: 12,
     textAlign: 'center',
-    lineHeight: 20,
+    lineHeight: 16,
   },
   validityText: {
-    marginTop: 14,
+    marginTop: 8,
     color: '#FCD34D',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '700',
     letterSpacing: 0.3,
   },
   ctaBtn: {
-    marginTop: 22,
-    paddingHorizontal: 22,
-    paddingVertical: 12,
-    borderRadius: 24,
+    marginTop: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 22,
     backgroundColor: '#F5B301',
   },
   ctaBtnText: {
@@ -376,7 +424,7 @@ const styles = StyleSheet.create({
   dotsRow: {
     flexDirection: 'row',
     justifyContent: 'center',
-    paddingVertical: 16,
+    paddingVertical: 10,
     gap: 6,
   },
   dot: {
@@ -390,9 +438,12 @@ const styles = StyleSheet.create({
     width: 18,
   },
   continueBtn: {
+    // marginTop guarantees a clear gap between the validity line above
+    // and this button — they were running into each other before.
+    marginTop: 8,
     marginHorizontal: 20,
-    marginBottom: 30,
-    paddingVertical: 14,
+    marginBottom: 16,
+    paddingVertical: 12,
     borderRadius: 12,
     backgroundColor: '#FFFFFF',
     alignItems: 'center',
@@ -400,7 +451,7 @@ const styles = StyleSheet.create({
   continueBtnText: {
     color: '#0D3B66',
     fontWeight: '900',
-    fontSize: 15,
+    fontSize: 14,
     letterSpacing: 0.3,
   },
 });

@@ -21,6 +21,7 @@ import {
   uploadDocument,
 } from '../services/api';
 import { getToken } from '../utils/storage';
+import { isActivityLauncherError } from '../utils/cropPicker';
 
 // Defensive load for expo-file-system + expo-sharing — both are native
 // modules and need a dev-client rebuild to show up. Until then, the vault
@@ -338,7 +339,15 @@ const EnquiryDetailsScreen: FC<Props> = ({ route, navigation }) => {
       await persistDocs([saved, ...uploadedDocs]);
       Alert.alert('Uploaded', `${name} attached to this enquiry.`);
     } catch (e: any) {
-      Alert.alert('Upload failed', e?.message || 'Could not upload document.');
+      // The host Activity can be recreated mid-pick on aggressive-memory
+      // OEMs, leaving expo's file-picker launcher unregistered. Tell the
+      // user plainly so they retry rather than think the upload broke.
+      Alert.alert(
+        'Upload failed',
+        isActivityLauncherError(e)
+          ? 'This device blocked the file picker. Please try again — if it keeps failing, upload the document from the booking flow using Camera or Gallery.'
+          : e?.message || 'Could not upload document.',
+      );
     } finally {
       setBusy(false);
     }

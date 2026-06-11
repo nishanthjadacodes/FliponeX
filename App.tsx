@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
-import { NavigationContainer, NavigationContainerRef } from '@react-navigation/native';
+import {
+  NavigationContainer,
+  NavigationContainerRef,
+  type NavigationState,
+} from '@react-navigation/native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 import { QueryClientProvider } from '@tanstack/react-query';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { queryClient } from './src/lib/queryClient';
 import { useAppStore } from './src/store/useAppStore';
+import { NAV_STATE_KEY } from './src/utils/storage';
 import AppNavigator from './AppNavigator';
 import {
   registerForPushNotifications,
@@ -14,25 +21,41 @@ import type { RootStackParamList } from './src/types';
 import { loadAppLanguage } from './src/i18n';
 import NotificationBanner from './src/components/NotificationBanner';
 import ErrorBoundary from './src/components/ErrorBoundary';
+import PermissionRationaleModal from './src/components/PermissionRationaleModal';
 import { API_BASE_URL } from './src/config';
 
-// Navigation lifecycle in this app:
-//   • Cold start (fresh launch after a full process kill — swiped from recents,
-//     phone reboot, first install): NavigationContainer uses AppNavigator's
-//     `initialRouteName="Splash"`. User sees the logo page first every time,
-//     then it routes to HomeTabs.
-//   • Warm resume (app backgrounded, user opens another app, returns): React
-//     Navigation keeps the stack in memory. The user lands back on whatever
-//     screen they left — no splash shown, no persistence layer needed.
+// Navigation lifecycle:
+//   Every app open starts at AppNavigator's `initialRouteName="Splash"`,
+//   so the splash video ALWAYS plays in full on each launch.
 //
-// No nav-state persistence layer: we deliberately don't save the stack to
-// AsyncStorage. Skipping it means process-killed resumes correctly restart at
-// Splash, exactly matching the intended flow.
+//   RESUME: the navigation stack is persisted on every change (see
+//   persistNavState below). When the user switches away mid-task and
+//   comes back, SplashScreen — AFTER the splash video finishes —
+//   restores that saved stack, so they land exactly where they left off
+//   instead of being sent through ModeSelect / Login again. If there is
+//   no fresh saved state (first launch, or away longer than the resume
+//   window) SplashScreen falls back to its normal first-launch routing.
+//   The Splash route itself is never persisted, so resume can't loop
+//   back into the splash.
+
 export default function App() {
   const navRef = useRef<NavigationContainerRef<RootStackParamList>>(null);
   // Gate the first render until the persisted i18n locale is loaded so
   // every screen reads strings in the correct language from frame 1.
   const [i18nReady, setI18nReady] = useState(false);
+
+  // Persist the navigation stack on every change so SplashScreen can
+  // resume the user where they left off after the splash video. The
+  // Splash route is never saved — resuming TO Splash would loop.
+  const persistNavState = (state: NavigationState | undefined): void => {
+    if (!state) return;
+    const current = state.routes?.[state.index]?.name;
+    if (current === 'Splash') return;
+    AsyncStorage.setItem(
+      NAV_STATE_KEY,
+      JSON.stringify({ state, savedAt: Date.now() }),
+    ).catch(() => {});
+  };
 
   useEffect(() => {
     loadAppLanguage().finally(() => setI18nReady(true));
@@ -73,19 +96,33 @@ export default function App() {
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <QueryClientProvider client={queryClient}>
-        <ErrorBoundary>
-          <NavigationContainer ref={navRef}>
-            <AppNavigator />
-            {/* Top-down banner for in-app notifications. Renders ABOVE the
-                stack screens (zIndex 9999) so it's visible on every screen.
-                Polls the backend's /notifications/inbox on app focus and
-                shows the topmost unseen notification with a tap-to-deep-link
-                CTA. Handles both customer and agent surfaces. */}
-            <NotificationBanner navigationRef={navRef} apiBase={API_BASE_URL} />
-          </NavigationContainer>
-        </ErrorBoundary>
-      </QueryClientProvider>
+      {/* SafeAreaProvider supplies real status-bar / nav-bar insets to
+          every screen's useSafeAreaInsets(); initialWindowMetrics makes
+          those values correct on the very FIRST frame, so headers and
+          bottom buttons never flash under the system bars on any device. */}
+      <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+        <QueryClientProvider client={queryClient}>
+          <ErrorBoundary>
+            <NavigationContainer ref={navRef} onStateChange={persistNavState}>
+              <AppNavigator />
+              {/* Top-down banner for in-app notifications. Renders ABOVE the
+                  stack screens (zIndex 9999) so it's visible on every screen.
+                  Polls the backend's /notifications/inbox on app focus and
+                  shows the topmost unseen notification with a tap-to-deep-link
+                  CTA. Handles both customer and agent surfaces. */}
+              <NotificationBanner navigationRef={navRef} apiBase={API_BASE_URL} />
+              {/* Root-mounted bottom-sheet that explains WHY before any
+                  runtime permission ask (camera, gallery, location,
+                  notifications). Visibility is driven by
+                  usePermissionRationaleStore — every util that calls
+                  requestPermissionWithRationale() flips it on, the
+                  user's tap resolves the awaiting Promise, and the
+                  modal flips off. No per-screen wiring needed. */}
+              <PermissionRationaleModal />
+            </NavigationContainer>
+          </ErrorBoundary>
+        </QueryClientProvider>
+      </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }

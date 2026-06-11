@@ -1,6 +1,10 @@
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { registerPushToken } from '../services/api';
+import {
+  notificationsAsker,
+  requestPermissionWithRationale,
+} from './permissions';
 
 // Defensive loading — expo-notifications and expo-device are native modules.
 // If the installed APK predates `npm install`, calls fail. We short-circuit
@@ -66,14 +70,12 @@ export const registerForPushNotifications = async (): Promise<string | null> => 
     configureHandler();
     await ensureAndroidChannel();
 
-    // Permission — returns { status: 'granted' | 'denied' | 'undetermined' }
-    const existing = await Notifications.getPermissionsAsync();
-    let status: string = existing.status;
-    if (status !== 'granted') {
-      const req = await Notifications.requestPermissionsAsync();
-      status = req.status;
-    }
-    if (status !== 'granted') {
+    // Permission flow goes through requestPermissionWithRationale so the
+    // user sees an in-app explanation before the OS dialog fires. The
+    // helper short-circuits when permission is already granted (no
+    // modal flash on repeat launches).
+    const perm = await requestPermissionWithRationale('notifications', notificationsAsker);
+    if (!perm.granted) {
       console.log('[push] permission not granted by user');
       return null;
     }
