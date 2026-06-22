@@ -395,6 +395,23 @@ export const getProfile = async (): Promise<ApiResponse<User> | User> => {
   }
 };
 
+// Account deletion — Google Play 2024+ policy. ProfileScreen triggers this
+// from the "Delete account" row. Backend anonymises the user row + frees
+// the mobile UNIQUE slot, so the same number can sign up fresh later.
+// On success the caller MUST clear local auth storage and navigate the
+// user back to ModeSelect — the JWT is still valid until expiry but the
+// backend's deactivation check (auth middleware) will reject it on the
+// next request.
+export const deleteAccount = async (): Promise<ApiResponse<null>> => {
+  try {
+    const response = await api.post<ApiResponse<null>>('/auth/delete-account', {});
+    return response.data;
+  } catch (error: any) {
+    const serverMsg = error?.response?.data?.message;
+    throw new Error(serverMsg || 'Failed to delete account. Please try again.');
+  }
+};
+
 export const updateProfile = async (
   profileData: Partial<User>,
 ): Promise<ApiResponse<User>> => {

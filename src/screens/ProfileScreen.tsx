@@ -11,7 +11,7 @@ import * as Clipboard from 'expo-clipboard';
 import { captureWithCrop, pickWithCrop, isPermissionDeniedError } from '../utils/cropPicker';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { clearAuthSession } from '../utils/storage';
-import { getProfile, updateProfile, getMyBookings, getMyDocuments, uploadAvatar, deleteAvatar } from '../services/api';
+import { getProfile, updateProfile, getMyBookings, getMyDocuments, uploadAvatar, deleteAvatar, deleteAccount } from '../services/api';
 import * as api from '../services/api';
 import { useAppStore } from '../store/useAppStore';
 import { useRefetchOnFocus } from '../lib/useRefetchOnFocus';
@@ -547,6 +547,67 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
     );
   };
 
+  // Permanent account deletion — required by Google Play 2024+ policy.
+  // Two-step confirmation so accidental taps don't wipe a customer's data.
+  // Backend anonymises the user row + frees the mobile UNIQUE slot, so the
+  // same number can sign up as a fresh account later.
+  const handleDeleteAccount = (): void => {
+    Alert.alert(
+      'Delete Account?',
+      'This will permanently delete your account. Your name, email, address, and profile picture will be removed. Past bookings stay on file for legal records but are no longer linked to a personal profile. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete Account',
+          style: 'destructive',
+          onPress: () => {
+            // Second confirmation — last chance before the irreversible call.
+            Alert.alert(
+              'Are you absolutely sure?',
+              'Tap Delete to permanently remove your account. You can sign up again with the same mobile number later, but it will be a fresh account with no history.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Delete',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      const res = await deleteAccount();
+                      if (res?.success === false) {
+                        throw new Error(res?.message || 'Failed to delete account');
+                      }
+                      await clearAuthSession();
+                      Alert.alert(
+                        'Account deleted',
+                        'Your account has been removed.',
+                        [
+                          {
+                            text: 'OK',
+                            onPress: () =>
+                              navigation.reset({
+                                index: 0,
+                                routes: [{ name: 'ModeSelect' }],
+                              }),
+                          },
+                        ],
+                      );
+                    } catch (e: any) {
+                      Alert.alert(
+                        'Could not delete account',
+                        e?.message ||
+                          'Something went wrong. Check your connection and try again.',
+                      );
+                    }
+                  },
+                },
+              ],
+            );
+          },
+        },
+      ],
+    );
+  };
+
   const handleSwitchToAgent = (): void => {
     Alert.alert(
       'Switch to Representative Mode?',
@@ -788,6 +849,14 @@ const ProfileScreen: React.FC<Props> = ({ navigation }) => {
         {/* Logout */}
         <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
           <Text style={styles.logoutText}>Logout</Text>
+        </TouchableOpacity>
+
+        {/* Delete Account — Google Play 2024+ policy requirement. Sits
+            below Logout because it's the more destructive of the two; the
+            handler runs a two-step Alert so a single mis-tap can't wipe
+            the account. */}
+        <TouchableOpacity style={styles.deleteAccountBtn} onPress={handleDeleteAccount}>
+          <Text style={styles.deleteAccountText}>Delete Account</Text>
         </TouchableOpacity>
 
         <Text style={styles.version}>FlipOn Digital v1.0.0</Text>
@@ -1540,6 +1609,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   logoutText: { color: '#E63946', fontWeight: '800', fontSize: 15, letterSpacing: 0.5 },
+  // Delete account — visually subordinate to Logout: lighter weight, no
+  // border. We don't want it to look like a primary action because it's
+  // irreversible. The two-step confirm Alert is the real gate.
+  deleteAccountBtn: {
+    marginHorizontal: 16,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  deleteAccountText: {
+    color: '#9E9E9E',
+    fontWeight: '600',
+    fontSize: 13,
+    textDecorationLine: 'underline',
+  },
   version: { textAlign: 'center', color: '#9E9E9E', fontSize: 11, marginTop: 4 },
 
   // Edit modal
