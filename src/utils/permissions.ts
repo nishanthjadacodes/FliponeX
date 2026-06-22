@@ -27,13 +27,16 @@ export const cameraAsker: PermissionAsker = {
   }),
 };
 
+// Photo library is gated via the Android Photo Picker (API 33+) which
+// needs no permission at all — Google Play 2024+ policy explicitly
+// requires this pattern for apps with infrequent photo access (our case:
+// occasional document + avatar uploads). We therefore short-circuit the
+// asker to always-granted: launchImageLibraryAsync / openPicker resolve
+// to the system Photo Picker dialog and the user selects what they want
+// to share, no system-level permission grant required.
 export const galleryAsker: PermissionAsker = {
-  check: async () => ({
-    granted: (await ExpoImagePicker.getMediaLibraryPermissionsAsync()).granted,
-  }),
-  request: async () => ({
-    granted: (await ExpoImagePicker.requestMediaLibraryPermissionsAsync()).granted,
-  }),
+  check: async () => ({ granted: true }),
+  request: async () => ({ granted: true }),
 };
 
 export const locationAsker: PermissionAsker = {

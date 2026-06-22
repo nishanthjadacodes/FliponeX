@@ -209,8 +209,12 @@ export async function pickWithCrop(
     }
   }
 
-  const perm = await ExpoImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!perm.granted) throw makePermissionError('Photo access denied');
+  // Skip requestMediaLibraryPermissionsAsync — Google Play 2024+ policy
+  // forbids requesting READ_MEDIA_IMAGES for "infrequent" photo access
+  // like ours. On Android 13+ launchImageLibraryAsync transparently uses
+  // the system Photo Picker (which needs no permission); on older API
+  // levels the OS falls back to the legacy gallery flow which doesn't
+  // need the permission either when launched via SAF.
   const result: any = await ExpoImagePicker.launchImageLibraryAsync({
     mediaTypes: 'images' as any,
     allowsEditing: true,
