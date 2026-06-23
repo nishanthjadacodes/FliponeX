@@ -22,16 +22,26 @@ const MAX_SDK = '28';
 const withCapStorageWrite = (config) =>
   withAndroidManifest(config, (cfg) => {
     const manifest = cfg.modResults.manifest;
+    manifest.$ = manifest.$ || {};
+    if (!manifest.$['xmlns:tools']) {
+      manifest.$['xmlns:tools'] = 'http://schemas.android.com/tools';
+    }
     manifest['uses-permission'] = manifest['uses-permission'] || [];
     const list = manifest['uses-permission'];
     const existing = list.find((p) => p?.$?.['android:name'] === PERMISSION);
+    // tools:replace tells the manifest merger to use OUR maxSdkVersion
+    // (28) when a library manifest declares the same permission with a
+    // different cap. react-native-image-crop-picker's manifest sets it
+    // to 29; without tools:replace the merger fails the build.
     if (existing) {
       existing.$['android:maxSdkVersion'] = MAX_SDK;
+      existing.$['tools:replace'] = 'android:maxSdkVersion';
     } else {
       list.push({
         $: {
           'android:name': PERMISSION,
           'android:maxSdkVersion': MAX_SDK,
+          'tools:replace': 'android:maxSdkVersion',
         },
       });
     }
